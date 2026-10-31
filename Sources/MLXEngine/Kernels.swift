@@ -686,10 +686,10 @@ kernel void add_rms_norm(device float*       hbuf [[buffer(0)]],
 // Causal attention over the KV cache with grouped-query heads.
 // One threadgroup per (head, query token); ANSG simdgroups split the keys
 // (simdgroup s takes keys s, s+ANSG, ...) and keep an online softmax, then
-// merge their partial results in simdgroup order. K/V rows for AU keys are
-// loaded up front so several reads are in flight; the arithmetic order is the
-// same as processing one key at a time.
-#define AU 4
+// merge their partial results in simdgroup order. AU keys' K/V rows can be
+// loaded up front (same arithmetic order as one key at a time); measured on an
+// M2 Pro, AU = 4 was no faster than 1 at 16 tokens of context, so it stays 1.
+#define AU 1
 
 // One online-softmax step for one key: k/v are this lane's E elements.
 template <int E>
