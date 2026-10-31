@@ -235,6 +235,8 @@ struct ServerView: View {
 
 struct SettingsView: View {
     @Environment(AppState.self) private var state
+    @Environment(UpdateController.self) private var updates
+    @AppStorage(UpdateController.autoCheckKey) private var autoUpdateCheck = true
     /// Edited locally; persisted to the Keychain (never UserDefaults).
     @State private var hfToken = ""
     @State private var tokenSaveFailed = false
@@ -263,6 +265,13 @@ struct SettingsView: View {
             Section("Chats") {
                 Button("Delete all chats", role: .destructive) { state.clearAllChats() }
             }
+            Section("Updates") {
+                Toggle("Check for updates automatically", isOn: $autoUpdateCheck)
+                    .onChange(of: autoUpdateCheck) { updates.autoCheckChanged() }
+                Text("Checks GitHub at launch and every 6 hours. Updates are only installed when you choose to, and only if their Ed25519 signature and checksum verify.")
+                    .font(.caption).foregroundStyle(.secondary)
+                LabeledContent("Version", value: MLXRunnerVersion.current)
+            }
             Section("About") {
                 LabeledContent("Engine", value: "Native Swift + Metal (no third-party dependencies)")
                 LabeledContent("GPU", value: GPU.shared.device.name)
@@ -270,7 +279,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 520, height: 460)
+        .frame(width: 520, height: 560)
         .onAppear { hfToken = HFToken.stored ?? "" }
     }
 

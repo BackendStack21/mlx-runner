@@ -8,20 +8,29 @@ MLXRunnerApp.main()
 
 struct MLXRunnerApp: App {
     @State private var state = AppState()
+    @State private var updates = UpdateController()
 
     var body: some Scene {
         WindowGroup("MLX Runner", id: "main") {
             RootView()
                 .environment(state)
+                .environment(updates)
                 .frame(minWidth: 980, minHeight: 640)
                 .onAppear {
                     NSApp.activate(ignoringOtherApps: true)
                     DevSnapshot.runIfRequested(state)
+                    updates.start()  // no-op in DevSnapshot mode or when already started
                 }
         }
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unified)
         .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("About MLX Runner") { showAboutPanel() }
+            }
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesButton(updates: updates)
+            }
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") { state.newChat() }.keyboardShortcut("n")
             }
@@ -38,8 +47,18 @@ struct MLXRunnerApp: App {
             }
         }
 
+        Window("Software Update", id: UpdateController.windowID) {
+            UpdateView()
+                .environment(state)
+                .environment(updates)
+                // Release notes come from the network: their links go through LinkPolicy.
+                .modifier(SafeLinkHandling())
+        }
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
+
         Settings {
-            SettingsView().environment(state)
+            SettingsView().environment(state).environment(updates)
         }
     }
 }

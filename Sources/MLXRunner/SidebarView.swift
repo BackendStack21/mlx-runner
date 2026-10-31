@@ -123,6 +123,7 @@ struct ModelStatusFooter: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            UpdatePill()
             switch state.loadState {
             case .loaded(let info):
                 HStack(spacing: 6) {
