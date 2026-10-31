@@ -9,13 +9,53 @@ final class ServerController {
     var running = false
     var port: Int = UserDefaults.standard.object(forKey: "serverPort") as? Int ?? 1234
     var allowLAN = false
+    /// Require `Authorization: Bearer <apiKey>` even on localhost (always required in LAN mode).
+    var requireAPIKey: Bool = UserDefaults.standard.bool(forKey: "serverRequireAPIKey") {
+        didSet { UserDefaults.standard.set(requireAPIKey, forKey: "serverRequireAPIKey") }
+    }
+    /// Random key generated once with the system CSPRNG and kept in UserDefaults.
+    private(set) var apiKey: String = ServerController.storedOrNewKey()
+    /// Browser origins allowed to call the server, comma- or newline-separated.
+    var allowedOrigins: String = UserDefaults.standard.string(forKey: "serverAllowedOrigins")
+        ?? OpenAIServer.defaultAllowedOrigins.joined(separator: ", ") {
+        didSet { UserDefaults.standard.set(allowedOrigins, forKey: "serverAllowedOrigins") }
+    }
     var log: [String] = []
     var error: String?
     @ObservationIgnored private var server: OpenAIServer?
 
+    /// The key clients must send, or nil when no key is enforced.
+    var effectiveAPIKey: String? { (allowLAN || requireAPIKey) ? apiKey : nil }
+
+    private static func storedOrNewKey() -> String {
+        if let k = UserDefaults.standard.string(forKey: "serverAPIKey"), !k.isEmpty { return k }
+        let k = OpenAIServer.generateAPIKey()
+        UserDefaults.standard.set(k, forKey: "serverAPIKey")
+        return k
+    }
+
+    /// Replaces the API key; a running server restarts so the old key stops working immediately.
+    func regenerateAPIKey() {
+        apiKey = OpenAIServer.generateAPIKey()
+        UserDefaults.standard.set(apiKey, forKey: "serverAPIKey")
+        if running { start() }
+    }
+
+    func copyAPIKey() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(apiKey, forType: .string)
+    }
+
     func start() {
         stop()
-        let s = OpenAIServer(port: UInt16(clamping: port), allowLAN: allowLAN)
+        guard (1...65535).contains(port) else {
+            error = "Port must be between 1 and 65535"
+            return
+        }
+        let s = OpenAIServer(port: UInt16(port), allowLAN: allowLAN, apiKey: effectiveAPIKey)
+        let origins = allowedOrigins.split(whereSeparator: { $0 == "," || $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        s.allowedOrigins = origins
         s.onLog = { line in
             Task { @MainActor in
                 let ts = Date().formatted(date: .omitted, time: .standard)
@@ -96,14 +136,50 @@ struct ServerView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
+                    Text("Security").font(.headline)
+                    Toggle("Require API key", isOn: Binding(
+                        get: { server.requireAPIKey || server.allowLAN },
+                        set: { server.requireAPIKey = $0 }))
+                        .disabled(server.running || server.allowLAN)
+                    if server.allowLAN {
+                        Text("An API key is always required when serving on the local network.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 8) {
+                        Text(server.apiKey)
+                            .font(.system(size: 12, design: .monospaced))
+                            .lineLimit(1).truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 8).padding(.vertical, 5)
+                            .background(Color(nsColor: .textBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+                        Button { server.copyAPIKey() } label: { Label("Copy", systemImage: "doc.on.doc") }
+                            .controlSize(.small)
+                        Button { server.regenerateAPIKey() } label: { Label("Regenerate", systemImage: "arrow.clockwise") }
+                            .controlSize(.small)
+                            .help("Creates a new key; the old one stops working (the server restarts if running).")
+                    }
+                    .opacity(server.effectiveAPIKey == nil ? 0.5 : 1)
+                    LabeledContent("Allowed browser origins") {
+                        TextField("http://localhost:*, http://127.0.0.1:*", text: $server.allowedOrigins)
+                            .font(.system(size: 12, design: .monospaced))
+                            .disabled(server.running)
+                    }
+                    Text("Web pages from other origins cannot call the server. Use scheme://host:* for any port, or * to allow all.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(16)
+                .glassCard()
+
+                VStack(alignment: .leading, spacing: 10) {
                     Text("Endpoints").font(.headline)
                     endpoint("GET", "/v1/models")
                     endpoint("POST", "/v1/chat/completions")
+                    endpoint("POST", "/v1/responses")
                     endpoint("POST", "/v1/completions")
                     Text("Example").font(.subheadline.weight(.semibold)).padding(.top, 6)
                     CodeBlock(language: "bash", code: """
                     curl http://localhost:\(server.port)/v1/chat/completions \\
-                      -H "Content-Type: application/json" \\
+                      -H "Content-Type: application/json" \\\(server.effectiveAPIKey.map { "\n  -H \"Authorization: Bearer \($0)\" \\" } ?? "")
                       -d '{"model": "\(state.loadedInfo?.name ?? "local")", "stream": true,
                            "messages": [{"role": "user", "content": "Hello!"}]}'
                     """)
@@ -159,13 +235,24 @@ struct ServerView: View {
 
 struct SettingsView: View {
     @Environment(AppState.self) private var state
-    @AppStorage("hfToken") private var hfToken = ""
+    /// Edited locally; persisted to the Keychain (never UserDefaults).
+    @State private var hfToken = ""
+    @State private var tokenSaveFailed = false
 
     var body: some View {
         Form {
             Section("Hugging Face") {
                 SecureField("Access token (for gated models)", text: $hfToken)
-                Text("Optional. Create one at huggingface.co/settings/tokens.").font(.caption).foregroundStyle(.secondary)
+                    .onSubmit(saveToken)
+                    .onChange(of: hfToken) { saveToken() }
+                Text("Optional. Create one at huggingface.co/settings/tokens. Stored in your Keychain.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if HFToken.isFromEnvironment {
+                    Text("HF_TOKEN is set in the environment and takes precedence.").font(.caption).foregroundStyle(.orange)
+                }
+                if tokenSaveFailed {
+                    Text("Could not save the token to the Keychain.").font(.caption).foregroundStyle(.red)
+                }
             }
             Section("Storage") {
                 LabeledContent("Models folder") {
@@ -184,5 +271,12 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 520, height: 460)
+        .onAppear { hfToken = HFToken.stored ?? "" }
+    }
+
+    private func saveToken() {
+        let t = hfToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t != (HFToken.stored ?? "") else { return }
+        tokenSaveFailed = !HFToken.save(t)
     }
 }
