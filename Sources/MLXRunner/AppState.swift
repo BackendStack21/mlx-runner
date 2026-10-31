@@ -437,11 +437,8 @@ final class AppState {
 
     private func loadChats() {
         if DevSnapshot.isActive {
-            // Snapshot runs never touch the user's files, not even to quarantine a bad one.
-            if let data = try? Data(contentsOf: chatsURL),
-               let c = try? JSONDecoder().decode([Conversation].self, from: data) {
-                conversations = c.sorted { $0.updated > $1.updated }
-            }
+            // Snapshot and tour runs never read or touch the user's chats: they show sample ones.
+            conversations = DevSnapshot.sampleConversations()
             return
         }
         switch SafeJSONFile.load([Conversation].self, from: chatsURL) {
