@@ -16,6 +16,8 @@ let repo = "BackendStack21/mlx-runner"
 let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
 
 let key = Curve25519.Signing.PrivateKey()
+// Fail on file-system problems before the secret is touched, so the two halves never diverge.
+try FileManager.default.createDirectory(at: root.appendingPathComponent("packaging"), withIntermediateDirectories: true)
 let gh = Process()
 gh.executableURL = URL(fileURLWithPath: "/usr/bin/env")
 gh.arguments = ["gh", "secret", "set", "MLXRUNNER_UPDATE_KEY", "--repo", repo]
