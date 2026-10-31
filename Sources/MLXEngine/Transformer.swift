@@ -22,17 +22,23 @@ final class Linear {
     private var biasPSO: MTLComputePipelineState?
     let description: String
 
-    init(_ store: WeightStore, _ prefix: String, inDim: Int) throws {
+    convenience init(_ store: WeightStore, _ prefix: String, inDim: Int) throws {
+        let s = store.get(prefix + ".scales")
+        let b = store.get(prefix + ".biases")
+        if s != nil && b == nil { throw EngineError.missingTensor(prefix + ".biases") }
+        try self.init(weight: try store.require(prefix + ".weight"), scales: s, biases: b,
+                      bias: store.get(prefix + ".bias"), inDim: inDim, name: prefix)
+    }
+
+    init(weight: Tensor, scales: Tensor?, biases: Tensor?, bias: Tensor?, inDim: Int, name prefix: String) throws {
         let gpu = GPU.shared
-        weight = try store.require(prefix + ".weight")
+        self.weight = weight
         self.inDim = inDim
         outDim = weight.shape[0]
-        let bias = store.get(prefix + ".bias")
         self.bias = bias
-        if let s = store.get(prefix + ".scales") {
-            guard let b = store.get(prefix + ".biases") else { throw EngineError.missingTensor(prefix + ".biases") }
-            scales = s
-            biases = b
+        if let s = scales, let b = biases {
+            self.scales = s
+            self.biases = b
             let packedBytes = weight.shape[1] * weight.dtype.size
             bits = packedBytes * 8 / inDim
             groupSize = inDim / s.shape[1]

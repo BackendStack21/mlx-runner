@@ -107,6 +107,9 @@ public enum DType: String {
 
 /// A view into a Metal buffer (usually a memory-mapped safetensors file).
 public struct Tensor {
+    init(buffer: MTLBuffer, offset: Int, dtype: DType, shape: [Int]) {
+        self.buffer = buffer; self.offset = offset; self.dtype = dtype; self.shape = shape
+    }
     let buffer: MTLBuffer
     let offset: Int
     let dtype: DType
