@@ -1,7 +1,7 @@
 import Foundation
 import Metal
 
-/// Tokens per simdgroup in the batched (prefill) matmul kernels.
+/// Tokens per simdgroup in the small-batch matmul kernels.
 private let prefillTT = 8
 private let rowsPerThreadgroup = 8 // QROWS * QNSG
 
@@ -9,14 +9,16 @@ private let rowsPerThreadgroup = 8 // QROWS * QNSG
 final class Linear {
     let inDim: Int
     let outDim: Int
-    private let weight: Tensor
-    private var scales: Tensor?
-    private var biases: Tensor?
-    private var bias: Tensor?
-    private var bits = 0
-    private var groupSize = 0
-    private let pso1: MTLComputePipelineState
-    private let psoN: MTLComputePipelineState
+    let weight: Tensor
+    private(set) var scales: Tensor?
+    private(set) var biases: Tensor?
+    private(set) var bias: Tensor?
+    private(set) var bits = 0
+    private(set) var groupSize = 0
+    private let pso1: MTLComputePipelineState          // decode (T == 1)
+    private let psoN: MTLComputePipelineState          // small batches (2..<16 tokens)
+    private var gemmPSO: MTLComputePipelineState?      // prefill tiles (simdgroup matrices)
+    private(set) var qmvPSO: MTLComputePipelineState?  // fused decode kernel (bias folded in)
     private var biasPSO: MTLComputePipelineState?
     let description: String
 
@@ -25,6 +27,8 @@ final class Linear {
         weight = try store.require(prefix + ".weight")
         self.inDim = inDim
         outDim = weight.shape[0]
+        let bias = store.get(prefix + ".bias")
+        self.bias = bias
         if let s = store.get(prefix + ".scales") {
             guard let b = store.get(prefix + ".biases") else { throw EngineError.missingTensor(prefix + ".biases") }
             scales = s
@@ -37,6 +41,10 @@ final class Linear {
             }
             guard let sfx = s.dtype.suffix else { throw EngineError.unsupported("\(prefix): scales dtype \(s.dtype)") }
             pso1 = try gpu.pipeline("qmm_\(bits)_\(sfx)_1")
+            if inDim % 16 == 0 && groupSize % 16 == 0 && (bias == nil || bias?.dtype == s.dtype) {
+                qmvPSO = try gpu.pipeline("qmv_\(bits)_\(sfx)")
+            }
+            if inDim % 32 == 0 { gemmPSO = try gpu.pipeline("qgemm_\(bits)_\(sfx)") }
             psoN = try gpu.pipeline("qmm_\(bits)_\(sfx)_\(prefillTT)")
             description = "q\(bits)g\(groupSize)"
         } else {
@@ -45,20 +53,58 @@ final class Linear {
             }
             guard inDim % 4 == 0 else { throw EngineError.unsupported("\(prefix): input dim \(inDim)") }
             pso1 = try gpu.pipeline("dmm_\(sfx)_1")
+            if inDim % 32 == 0 { gemmPSO = try gpu.pipeline("dgemm_\(sfx)") }
             psoN = try gpu.pipeline("dmm_\(sfx)_\(prefillTT)")
             description = weight.dtype.rawValue.lowercased()
         }
-        if let b = store.get(prefix + ".bias"), let sfx = b.dtype.suffix {
-            bias = b
+        if let b = bias, let sfx = b.dtype.suffix {
             biasPSO = try gpu.pipeline("add_bias_\(sfx)")
         }
     }
 
-    /// y[t, :outDim] (row stride yStride, starting at yOffset bytes) = x[t] · Wᵀ
+    /// Can these layers be computed by one fused decode dispatch?
+    static func fusable(_ parts: [Linear]) -> Bool {
+        guard let f = parts.first, parts.count <= 3, let s0 = f.scales else { return false }
+        let hasBias = f.bias != nil
+        return parts.allSatisfy { p in
+            p.qmvPSO != nil && p.bits == f.bits && p.groupSize == f.groupSize && p.inDim == f.inDim
+                && p.scales?.dtype == s0.dtype && p.outDim % rowsPerThreadgroup == 0 && (p.bias != nil) == hasBias
+        }
+    }
+
+    /// One dispatch computing [A | B | C] rows for a single token (T == 1).
+    static func encodeFusedDecode(_ enc: MTLComputeCommandEncoder, _ parts: [Linear], x: MTLBuffer, xOffset: Int = 0,
+                                  y: MTLBuffer, yOffset: Int = 0) {
+        let f = parts[0]
+        enc.setComputePipelineState(f.qmvPSO!)
+        for slot in 0..<3 {
+            let p = parts[min(slot, parts.count - 1)]
+            let base = slot == 0 ? 0 : 3 + slot * 3   // 0, 6, 9
+            enc.set(p.weight, base)
+            enc.set(p.scales!, base + 1)
+            enc.set(p.biases!, base + 2)
+            enc.set(p.bias ?? p.scales!, 12 + slot)
+        }
+        enc.set(x, xOffset, 3)
+        enc.set(y, yOffset, 4)
+        let total = parts.reduce(0) { $0 + $1.outDim }
+        enc.params(MMParams(K: Int32(f.inDim), O: Int32(total), T: 1, gs: Int32(f.groupSize), xStride: 0, yStride: 0,
+                            o1: Int32(parts[0].outDim), o2: Int32(parts.count > 1 ? parts[1].outDim : 0),
+                            hasBias: f.bias != nil ? 1 : 0), 5)
+        enc.dispatchThreadgroups(MTLSize(width: (total + rowsPerThreadgroup - 1) / rowsPerThreadgroup, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+    }
+
+    /// y[t, :outDim] (row stride yStride, starting at yOffset bytes) = x[t] · Wᵀ (+ bias)
     func encode(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, xOffset: Int = 0, xStride: Int,
                 y: MTLBuffer, yOffset: Int = 0, yStride: Int, T: Int) {
+        if T == 1, qmvPSO != nil {
+            Linear.encodeFusedDecode(enc, [self], x: x, xOffset: xOffset, y: y, yOffset: yOffset)
+            return
+        }
+        let gemm = T >= 16 ? gemmPSO : nil
         let tt = T == 1 ? 1 : prefillTT
-        enc.setComputePipelineState(T == 1 ? pso1 : psoN)
+        enc.setComputePipelineState(gemm ?? (T == 1 ? pso1 : psoN))
         enc.set(weight, 0)
         if let s = scales, let b = biases {
             enc.set(s, 1)
@@ -68,9 +114,14 @@ final class Linear {
         enc.set(y, yOffset, 4)
         enc.params(MMParams(K: Int32(inDim), O: Int32(outDim), T: Int32(T), gs: Int32(groupSize),
                             xStride: Int32(xStride), yStride: Int32(yStride)), 5)
-        enc.dispatchThreadgroups(MTLSize(width: (outDim + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
-                                         height: (T + tt - 1) / tt, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        if gemm != nil {
+            enc.dispatchThreadgroups(MTLSize(width: (outDim + 31) / 32, height: (T + 31) / 32, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        } else {
+            enc.dispatchThreadgroups(MTLSize(width: (outDim + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
+                                             height: (T + tt - 1) / tt, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        }
         if let bias, let biasPSO {
             enc.setComputePipelineState(biasPSO)
             enc.set(y, yOffset, 0)
@@ -103,12 +154,14 @@ final class Linear {
 final class RMSNorm {
     let weight: Tensor
     let pso: MTLComputePipelineState
+    let addPSO: MTLComputePipelineState
     let eps: Float
 
     init(_ store: WeightStore, _ name: String, eps: Float) throws {
         weight = try store.require(name)
         guard let sfx = weight.dtype.suffix else { throw EngineError.unsupported("\(name) dtype") }
         pso = try GPU.shared.pipeline("rms_norm_\(sfx)")
+        addPSO = try GPU.shared.pipeline("add_rms_norm_\(sfx)")
         self.eps = eps
     }
 
@@ -127,6 +180,9 @@ final class RMSNorm {
 }
 
 final class TransformerLayer {
+    let qkvFusable: Bool
+    let gateUpFusable: Bool
+    let qkvPostPSO: MTLComputePipelineState
     let inputNorm: RMSNorm
     let postNorm: RMSNorm
     let qNorm: RMSNorm?
@@ -156,6 +212,9 @@ final class TransformerLayer {
             gateUp = try ["gate_proj", "up_proj"].map { try Linear(s, "\(p).mlp.\($0)", inDim: c.hiddenSize) }
         }
         down = try Linear(s, "\(p).mlp.down_proj", inDim: c.intermediateSize)
+        qkvFusable = qkv.count > 1 && Linear.fusable(qkv)
+        gateUpFusable = gateUp.count > 1 && Linear.fusable(gateUp)
+        qkvPostPSO = try GPU.shared.pipeline("qkv_post_\(qNorm?.weight.dtype.suffix ?? "f32")")
         let cacheBytes = c.numKVHeads * maxSeq * c.headDim * 2
         kCache = GPU.shared.buffer(cacheBytes)
         vCache = GPU.shared.buffer(cacheBytes)
@@ -177,22 +236,22 @@ public final class Transformer {
     let maxBatch = 512
     private let ids: MTLBuffer
     private let h: MTLBuffer
-    private let xn: MTLBuffer
+    let xn: MTLBuffer
     private let qkvBuf: MTLBuffer
     private let attnBuf: MTLBuffer
     private let guBuf: MTLBuffer
-    private let mlpBuf: MTLBuffer
-    private let tmp: MTLBuffer
+    let mlpBuf: MTLBuffer
+    let tmp: MTLBuffer
     let logits: MTLBuffer
     private let invFreq: MTLBuffer
 
-    private let ropePSO: MTLComputePipelineState
-    private let kvPSO: MTLComputePipelineState
-    private let attnPSO: MTLComputePipelineState
+    private let attnDecodePSO: (MTLComputePipelineState, Int)
+    private let attnPrefillPSO: (MTLComputePipelineState, Int)
     private let siluPSO: MTLComputePipelineState
     private let addPSO: MTLComputePipelineState
 
     private let qkvCols: Int
+    public private(set) var lastGPUTime: Double = 0
     public var vocabSize: Int { lmHead.outDim }
     public var weightBytes: Int { store.totalBytes }
 
@@ -231,9 +290,10 @@ public final class Transformer {
         let f = c.inverseFrequencies()
         invFreq = gpu.device.makeBuffer(bytes: f, length: max(16, f.count * 4), options: .storageModeShared)!
 
-        ropePSO = try gpu.pipeline("rope")
-        kvPSO = try gpu.pipeline("kv_store")
-        attnPSO = try gpu.pipeline("attention_\(c.headDim / 32)")
+        let e = c.headDim / 32
+        let decodeSG = e >= 8 ? 16 : 32
+        attnDecodePSO = (try gpu.pipeline("attention_\(e)_\(decodeSG)"), decodeSG * 32)
+        attnPrefillPSO = (try gpu.pipeline("attention_\(e)_8"), 256)
         siluPSO = try gpu.pipeline("silu_mul")
         addPSO = try gpu.pipeline("add_inplace")
     }
@@ -264,42 +324,40 @@ public final class Transformer {
             throw EngineError.noMetalDevice
         }
         try embed.encodeLookup(enc, ids: ids, out: h, T: T)
+        layers[0].inputNorm.encode(enc, x: h, y: xn, dim: H, rows: T, rowStride: H)
 
         let kCol = nH * D, vCol = (nH + nKV) * D
-        for layer in layers {
-            layer.inputNorm.encode(enc, x: h, y: xn, dim: H, rows: T, rowStride: H)
-
-            if layer.qkv.count == 1 {
+        let decode = T == 1
+        let (attn, attnThreads) = decode ? attnDecodePSO : attnPrefillPSO
+        for (li, layer) in layers.enumerated() {
+            // Attention block: [q|k|v] projection → norm/rope/cache → attention → o_proj
+            if decode && layer.qkvFusable {
+                Linear.encodeFusedDecode(enc, layer.qkv, x: xn, y: qkvBuf)
+            } else if layer.qkv.count == 1 {
                 layer.qkv[0].encode(enc, x: xn, xStride: H, y: qkvBuf, yStride: qkvCols, T: T)
             } else {
                 layer.qkv[0].encode(enc, x: xn, xStride: H, y: qkvBuf, yOffset: 0, yStride: qkvCols, T: T)
                 layer.qkv[1].encode(enc, x: xn, xStride: H, y: qkvBuf, yOffset: kCol * 4, yStride: qkvCols, T: T)
                 layer.qkv[2].encode(enc, x: xn, xStride: H, y: qkvBuf, yOffset: vCol * 4, yStride: qkvCols, T: T)
             }
-            if let qn = layer.qNorm, let kn = layer.kNorm {
-                qn.encode(enc, x: qkvBuf, y: qkvBuf, dim: D, rows: T * nH, headsPerRow: nH, rowStride: qkvCols)
-                kn.encode(enc, x: qkvBuf, xOffset: kCol * 4, y: qkvBuf, yOffset: kCol * 4,
-                          dim: D, rows: T * nKV, headsPerRow: nKV, rowStride: qkvCols)
-            }
 
-            enc.setComputePipelineState(ropePSO)
+            enc.setComputePipelineState(layer.qkvPostPSO)
             enc.set(qkvBuf, 0, 0)
             enc.set(invFreq, 0, 1)
-            enc.params(RopeParams(D: Int32(D), rowStride: Int32(qkvCols), offset: Int32(offset),
-                                  traditional: c.ropeTraditional ? 1 : 0, rotDim: Int32(c.rotaryDim)), 2)
-            enc.dispatchThreads(MTLSize(width: c.rotaryDim / 2, height: nH + nKV, depth: T),
-                                threadsPerThreadgroup: MTLSize(width: min(64, c.rotaryDim / 2), height: 1, depth: 1))
+            enc.set(layer.kCache, 0, 2)
+            enc.set(layer.vCache, 0, 3)
+            if let qn = layer.qNorm, let kn = layer.kNorm {
+                enc.set(qn.weight, 4); enc.set(kn.weight, 5)
+            } else {
+                enc.set(invFreq, 0, 4); enc.set(invFreq, 0, 5)
+            }
+            enc.params(QKVPostParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), rowStride: Int32(qkvCols),
+                                     offset: Int32(offset), maxSeq: Int32(maxSeq), traditional: c.ropeTraditional ? 1 : 0,
+                                     rotDim: Int32(c.rotaryDim), eps: c.rmsNormEps, hasNorm: layer.qNorm != nil ? 1 : 0), 6)
+            enc.dispatchThreadgroups(MTLSize(width: nH + 2 * nKV, height: T, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: D, height: 1, depth: 1))
 
-            enc.setComputePipelineState(kvPSO)
-            enc.set(qkvBuf, 0, 0)
-            enc.set(layer.kCache, 0, 1)
-            enc.set(layer.vCache, 0, 2)
-            enc.params(KVParams(D: Int32(D), nKV: Int32(nKV), rowStride: Int32(qkvCols), kCol: Int32(kCol),
-                                vCol: Int32(vCol), offset: Int32(offset), maxSeq: Int32(maxSeq)), 3)
-            enc.dispatchThreads(MTLSize(width: D, height: nKV, depth: T),
-                                threadsPerThreadgroup: MTLSize(width: min(128, D), height: 1, depth: 1))
-
-            enc.setComputePipelineState(attnPSO)
+            enc.setComputePipelineState(attn)
             enc.set(qkvBuf, 0, 0)
             enc.set(layer.kCache, 0, 1)
             enc.set(layer.vCache, 0, 2)
@@ -308,13 +366,15 @@ public final class Transformer {
                                   maxSeq: Int32(maxSeq), offset: Int32(offset), scale: 1 / Float(D).squareRoot(),
                                   outStride: Int32(nH * D)), 4)
             enc.dispatchThreadgroups(MTLSize(width: nH, height: T, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                                     threadsPerThreadgroup: MTLSize(width: attnThreads, height: 1, depth: 1))
 
             layer.o.encode(enc, x: attnBuf, xStride: nH * D, y: tmp, yStride: H, T: T)
-            add(enc, h, tmp, T * H)
+            layer.postNorm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T)
 
-            layer.postNorm.encode(enc, x: h, y: xn, dim: H, rows: T, rowStride: H)
-            if layer.gateUp.count == 1 {
+            // MLP block: [gate|up] → SiLU(gate)·up → down_proj
+            if decode && layer.gateUpFusable {
+                Linear.encodeFusedDecode(enc, layer.gateUp, x: xn, y: guBuf)
+            } else if layer.gateUp.count == 1 {
                 layer.gateUp[0].encode(enc, x: xn, xStride: H, y: guBuf, yStride: 2 * I, T: T)
             } else {
                 layer.gateUp[0].encode(enc, x: xn, xStride: H, y: guBuf, yOffset: 0, yStride: 2 * I, T: T)
@@ -327,24 +387,71 @@ public final class Transformer {
             enc.dispatchThreads(MTLSize(width: I, height: T, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             layer.down.encode(enc, x: mlpBuf, xStride: I, y: tmp, yStride: H, T: T)
-            add(enc, h, tmp, T * H)
+
+            // Residual add fused with the next norm (next layer's input norm, or the final norm).
+            if li + 1 < layers.count {
+                layers[li + 1].inputNorm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T)
+            } else if computeLogits {
+                norm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T)
+            }
         }
 
         if computeLogits {
-            norm.encode(enc, x: h, xOffset: (T - 1) * H * 4, y: xn, dim: H, rows: 1, rowStride: H)
-            lmHead.encode(enc, x: xn, xStride: H, y: logits, yStride: lmHead.outDim, T: 1)
+            lmHead.encode(enc, x: xn, xOffset: (T - 1) * H * 4, xStride: H, y: logits, yStride: lmHead.outDim, T: 1)
         }
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
+        lastGPUTime = cb.gpuEndTime - cb.gpuStartTime
         if let err = cb.error { throw EngineError.kernelCompile("GPU error: \(err.localizedDescription)") }
     }
 
-    private func add(_ enc: MTLComputeCommandEncoder, _ a: MTLBuffer, _ b: MTLBuffer, _ n: Int) {
+    func add(_ enc: MTLComputeCommandEncoder, _ a: MTLBuffer, _ b: MTLBuffer, _ n: Int) {
         enc.setComputePipelineState(addPSO)
         enc.set(a, 0, 0)
         enc.set(b, 0, 1)
         enc.params(EWParams(n: Int32(n), stride: 0, cols: 0), 2)
         enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+}
+
+extension Transformer {
+    /// Developer micro-benchmarks: matvec bandwidth and per-dispatch overhead.
+    public func profile() throws -> String {
+        let q = GPU.shared.queue
+        func time(_ n: Int, _ body: (MTLComputeCommandEncoder) -> Void) -> Double {
+            let cb = q.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder(dispatchType: .serial)!
+            for _ in 0..<n { body(enc) }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            return (cb.gpuEndTime - cb.gpuStartTime) / Double(n)
+        }
+        var out = ""
+        let H = config.hiddenSize
+        let lmBytes = Double(lmHead.outDim) * Double(H) * 0.5 * 1.125
+        let tLM = time(50) { lmHead.encode($0, x: xn, xStride: H, y: logits, yStride: lmHead.outDim, T: 1) }
+        out += String(format: "lm_head matvec: %.3f ms  (~%.0f GB/s)\n", tLM * 1000, lmBytes / tLM / 1e9)
+        let l0 = layers[0]
+        let tDown = time(200) { l0.down.encode($0, x: mlpBuf, xStride: config.intermediateSize, y: tmp, yStride: H, T: 1) }
+        let downBytes = Double(l0.down.outDim) * Double(l0.down.inDim) * 0.5 * 1.125
+        out += String(format: "down_proj matvec: %.1f us  (~%.0f GB/s)\n", tDown * 1e6, downBytes / tDown / 1e9)
+        let tAdd = time(500) { enc in self.add(enc, tmp, xn, H) }
+        out += String(format: "tiny dependent dispatch: %.1f us\n", tAdd * 1e6)
+        return out
+    }
+}
+
+extension RMSNorm {
+    /// h += residual; y = norm(h)  — one dispatch.
+    func encodeAdd(_ enc: MTLComputeCommandEncoder, h: MTLBuffer, residual: MTLBuffer, y: MTLBuffer, dim: Int, rows: Int) {
+        enc.setComputePipelineState(addPSO)
+        enc.set(h, 0, 0)
+        enc.set(residual, 0, 1)
+        enc.set(y, 0, 2)
+        enc.set(weight, 3)
+        enc.params(NormParams(dim: Int32(dim), headsPerRow: 1, rowStride: Int32(dim), eps: eps), 4)
+        let threads = dim >= 1024 ? 256 : (dim >= 256 ? 128 : 32)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
     }
 }

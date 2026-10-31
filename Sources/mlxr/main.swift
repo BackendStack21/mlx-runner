@@ -125,6 +125,29 @@ case "serve":
     print("OpenAI-compatible server on http://\(lan ? "0.0.0.0" : "127.0.0.1"):\(port)/v1  (Ctrl-C to stop)")
     while true { try await Task.sleep(nanoseconds: 3_600_000_000_000) }
 
+case "bench":
+    guard let model = args.first else { fail("usage: mlxr bench <model>") }
+    let dir = resolve(model)
+    let t = try Transformer(directory: dir, contextLength: 4096)
+    print("weights: \(formatBytes(t.weightBytes))")
+    print(try t.profile())
+    _ = try t.forward([1], offset: 0)
+    for n in [128, 512, 2048] {
+        let toks = (0..<n).map { Int32($0 % 1000 + 100) }
+        let s = Date()
+        _ = try t.forward(toks, offset: 0)
+        let dt = Date().timeIntervalSince(s)
+        print(String(format: "prefill %5d tokens: %7.1f tok/s", n, Double(n) / dt))
+    }
+    for ctx in [16, 1024] {
+        var gpu = 0.0
+        let steps = 128
+        let s = Date()
+        for i in 0..<steps { _ = try t.forward([Int32(500 + i)], offset: ctx + i); gpu += t.lastGPUTime }
+        let dt = Date().timeIntervalSince(s)
+        print(String(format: "decode @%4d: %6.1f tok/s  (wall %.2f ms, gpu %.2f ms per token)", ctx, Double(steps) / dt, dt / Double(steps) * 1000, gpu / Double(steps) * 1000))
+    }
+
 default:
     fail("unknown command \(cmd)")
 }

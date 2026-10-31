@@ -24,10 +24,12 @@ public enum EngineError: LocalizedError {
 }
 
 // Parameter blocks mirrored in Kernels.swift.
-struct MMParams { var K: Int32; var O: Int32; var T: Int32; var gs: Int32; var xStride: Int32; var yStride: Int32 }
+struct MMParams {
+    var K: Int32; var O: Int32; var T: Int32; var gs: Int32; var xStride: Int32; var yStride: Int32
+    var o1: Int32 = 0; var o2: Int32 = 0; var hasBias: Int32 = 0; var pad: Int32 = 0
+}
+struct QKVPostParams { var D: Int32; var nH: Int32; var nKV: Int32; var rowStride: Int32; var offset: Int32; var maxSeq: Int32; var traditional: Int32; var rotDim: Int32; var eps: Float; var hasNorm: Int32 }
 struct NormParams { var dim: Int32; var headsPerRow: Int32; var rowStride: Int32; var eps: Float }
-struct RopeParams { var D: Int32; var rowStride: Int32; var offset: Int32; var traditional: Int32; var rotDim: Int32 }
-struct KVParams { var D: Int32; var nKV: Int32; var rowStride: Int32; var kCol: Int32; var vCol: Int32; var offset: Int32; var maxSeq: Int32 }
 struct AttnParams { var D: Int32; var nH: Int32; var nKV: Int32; var qStride: Int32; var maxSeq: Int32; var offset: Int32; var scale: Float; var outStride: Int32 }
 struct EWParams { var n: Int32; var stride: Int32; var cols: Int32; var pad: Int32 = 0 }
 
