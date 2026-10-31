@@ -125,13 +125,17 @@ case "serve":
     let port = UInt16(option("--port") ?? "1234") ?? 1234
     let ctx = Int(option("--ctx") ?? "8192") ?? 8192
     let lan = flag("--lan")
-    guard let model = args.first else { fail("usage: mlxr serve <model> [--port 1234] [--ctx N] [--lan]") }
+    guard let model = args.first else { fail("usage: mlxr serve <model> [--port 1234] [--ctx N] [--lan] [--api-key KEY]") }
+    // LAN mode always needs a key: use --api-key / MLXR_API_KEY, or generate one.
+    var key = option("--api-key") ?? ProcessInfo.processInfo.environment["MLXR_API_KEY"]
+    if lan && key == nil { key = OpenAIServer.generateAPIKey() }
     let info = try await InferenceEngine.shared.load(directory: resolve(model), contextLength: ctx)
     print("Loaded \(info.name) in \(String(format: "%.2f", info.loadSeconds))s")
-    let server = OpenAIServer(port: port, allowLAN: lan)
+    let server = OpenAIServer(port: port, allowLAN: lan, apiKey: key)
     server.onLog = { print($0) }
-    try server.start()
+    do { try server.start() } catch { fail("cannot start server: \(error.localizedDescription)") }
     print("OpenAI-compatible server on http://\(lan ? "0.0.0.0" : "127.0.0.1"):\(port)/v1  (Ctrl-C to stop)")
+    if let key { print("API key (send as 'Authorization: Bearer <key>'): \(key)") }
     while true { try await Task.sleep(nanoseconds: 3_600_000_000_000) }
 
 case "bench":

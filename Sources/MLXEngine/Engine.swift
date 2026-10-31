@@ -320,16 +320,20 @@ public final class InferenceEngine: @unchecked Sendable {
     private func fitToContext(_ messages: [ChatMessage], template: ChatTemplate, tokenizer: Tokenizer,
                               reserve: Int, enableThinking: Bool, conversationID: String?) -> [Int] {
         let limit = (model?.maxSeq ?? Int.max) - reserve
-        let system = messages.filter { $0.role == .system }
-        let turns = messages.filter { $0.role != .system }
+        // Content is tokenized as plain text (see renderMarked), normalised up front if needed.
+        let msgs = tokenizer.usesNFC ? messages.map { ChatMessage(role: $0.role, content: $0.content.precomposedStringWithCanonicalMapping) } : messages
+        let system = msgs.filter { $0.role == .system }
+        let turns = msgs.filter { $0.role != .system }
         guard let first = turns.first else {
-            return tokenizer.encode(template.render(messages, enableThinking: enableThinking))
+            let r = template.renderMarked(msgs, enableThinking: enableThinking)
+            return tokenizer.encode(r.text, plainRanges: r.content)
         }
         let key = conversationID ?? (first.role.rawValue + "\u{0}" + first.content)
         if trimState.count > 256 { trimState = [:] }
 
         func render(_ d: Int) -> [Int] {
-            tokenizer.encode(template.render(system + turns[d...], enableThinking: enableThinking))
+            let r = template.renderMarked(system + turns[d...], enableThinking: enableThinking)
+            return tokenizer.encode(r.text, plainRanges: r.content)
         }
         /// Next cut index > d that keeps the history starting with a user turn.
         func advance(_ d: Int) -> Int? {

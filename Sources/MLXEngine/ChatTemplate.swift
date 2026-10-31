@@ -59,60 +59,76 @@ public struct ChatTemplate: Sendable {
 
     /// Renders messages as a prompt ending with the assistant turn opener.
     public func render(_ messages: [ChatMessage], enableThinking: Bool = true) -> String {
+        renderMarked(messages, enableThinking: enableThinking).text
+    }
+
+    /// Like `render`, plus the UTF-16 ranges holding message content. Those ranges must be
+    /// tokenized as plain text so a message cannot inject control tokens (forged turns).
+    public func renderMarked(_ messages: [ChatMessage], enableThinking: Bool = true) -> (text: String, content: [NSRange]) {
         var s = ""
+        var len = 0
+        var ranges: [NSRange] = []
+        func lit(_ x: String) { s += x; len += x.utf16.count }
+        func content(_ x: String) {
+            let n = x.utf16.count
+            if n > 0 { ranges.append(NSRange(location: len, length: n)) }
+            s += x; len += n
+        }
         switch format {
         case .chatML:
             if let d = defaultSystem, messages.first?.role != .system {
-                s += "<|im_start|>system\n\(d)<|im_end|>\n"
+                lit("<|im_start|>system\n\(d)<|im_end|>\n")
             }
             for m in messages {
-                s += "<|im_start|>\(m.role.rawValue)\n\(m.content)<|im_end|>\n"
+                lit("<|im_start|>\(m.role.rawValue)\n"); content(m.content); lit("<|im_end|>\n")
             }
-            s += "<|im_start|>assistant\n"
-            if supportsThinkingToggle && !enableThinking { s += "<think>\n\n</think>\n\n" }
+            lit("<|im_start|>assistant\n")
+            if supportsThinkingToggle && !enableThinking { lit("<think>\n\n</think>\n\n") }
         case .llama3:
-            s += "<|begin_of_text|>"
+            lit("<|begin_of_text|>")
             var rest = messages[...]
             if llamaDatePreamble {
                 var system = ""
                 if rest.first?.role == .system { system = rest.removeFirst().content.trimmingCharacters(in: .whitespacesAndNewlines) }
-                s += "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: \(Self.todayString())\n\n\(system)<|eot_id|>"
+                lit("<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: \(Self.todayString())\n\n")
+                content(system); lit("<|eot_id|>")
             }
             for m in rest {
-                s += "<|start_header_id|>\(m.role.rawValue)<|end_header_id|>\n\n\(m.content.trimmingCharacters(in: .whitespacesAndNewlines))<|eot_id|>"
+                lit("<|start_header_id|>\(m.role.rawValue)<|end_header_id|>\n\n")
+                content(m.content.trimmingCharacters(in: .whitespacesAndNewlines)); lit("<|eot_id|>")
             }
-            s += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            lit("<|start_header_id|>assistant<|end_header_id|>\n\n")
         case .mistral:
-            s += bos.isEmpty ? "<s>" : bos
+            lit(bos.isEmpty ? "<s>" : bos)
             let system = messages.first(where: { $0.role == .system })?.content
             let turns = messages.filter { $0.role != .system }
             let lastUser = turns.lastIndex(where: { $0.role == .user })
             for (i, m) in turns.enumerated() {
                 if m.role == .user {
-                    var content = m.content
-                    if let system, i == lastUser { content = system + "\n\n" + content }
-                    s += "[INST] \(content)[/INST]"  // mistral-common v3: [INST]▁content[/INST]
+                    var c = m.content
+                    if let system, i == lastUser { c = system + "\n\n" + c }
+                    lit("[INST] "); content(c); lit("[/INST]")  // mistral-common v3: [INST]▁content[/INST]
                 } else {
-                    s += " \(m.content)</s>"
+                    lit(" "); content(m.content); lit("</s>")
                 }
             }
         case .phi3:
             for m in messages {
-                s += "<|\(m.role.rawValue)|>\n\(m.content)<|end|>\n"
+                lit("<|\(m.role.rawValue)|>\n"); content(m.content); lit("<|end|>\n")
             }
-            s += "<|assistant|>\n"
+            lit("<|assistant|>\n")
         case .plain:
-            s += bos
+            lit(bos)
             for m in messages {
                 switch m.role {
-                case .system: s += m.content + "\n\n"
-                case .user: s += "User: \(m.content)\n"
-                case .assistant: s += "Assistant: \(m.content)\n"
+                case .system: content(m.content); lit("\n\n")
+                case .user: lit("User: "); content(m.content); lit("\n")
+                case .assistant: lit("Assistant: "); content(m.content); lit("\n")
                 }
             }
-            s += "Assistant:"
+            lit("Assistant:")
         }
-        return s
+        return (s, ranges)
     }
 
     /// Extra stop strings for the format (in addition to EOS ids).

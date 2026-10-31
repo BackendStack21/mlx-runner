@@ -25,6 +25,8 @@ public final class Tokenizer: @unchecked Sendable {
     private var addedStrip: [String: (left: Bool, right: Bool)] = [:]
     /// The model expects a BOS token at the start of raw prompts.
     public private(set) var addBosToken = false
+    /// The normaliser applies Unicode NFC.
+    public var usesNFC: Bool { nfc }
     private var nfc = false
     private var unkId: Int?
     private var cache: [String: [Int]] = [:]
@@ -189,14 +191,19 @@ public final class Tokenizer: @unchecked Sendable {
     // MARK: Encoding
 
     /// Encodes text; added/special tokens written literally in `text` map to their ids.
-    public func encode(_ text: String) -> [Int] {
+    /// `plainRanges` (UTF-16) are treated as ordinary text: special tokens inside them are not parsed.
+    public func encode(_ text: String, plainRanges: [NSRange] = []) -> [Int] {
         var text = text
-        if nfc { text = text.precomposedStringWithCanonicalMapping }
+        // NFC can shift UTF-16 offsets, so with ranges the caller normalises content first.
+        if nfc && plainRanges.isEmpty { text = text.precomposedStringWithCanonicalMapping }
         var out: [Int] = []
         let ns = text as NSString
         var cursor = 0
         var firstSegment = true
-        let matches = addedRegex?.matches(in: text, range: NSRange(location: 0, length: ns.length)) ?? []
+        var matches = addedRegex?.matches(in: text, range: NSRange(location: 0, length: ns.length)) ?? []
+        if !plainRanges.isEmpty {
+            matches.removeAll { m in plainRanges.contains { NSIntersectionRange($0, m.range).length > 0 } }
+        }
         for m in matches {
             let strip = addedStrip[ns.substring(with: m.range)]
             var segEnd = m.range.location
