@@ -15,13 +15,16 @@ struct MLXRunnerApp: App {
             RootView()
                 .environment(state)
                 .environment(updates)
-                .frame(minWidth: 980, minHeight: 640)
+                .frame(minWidth: WindowLayout.windowMinWidth, minHeight: 640)
                 .onAppear {
                     NSApp.activate(ignoringOtherApps: true)
                     DevSnapshot.runIfRequested(state)
                     updates.start()  // no-op in DevSnapshot mode or when already started
                 }
         }
+        // First launch has no saved frame: open roomy instead of at the minimum width.
+        .defaultSize(width: 1280, height: 820)
+        .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unified)
         .commands {
@@ -63,6 +66,18 @@ struct MLXRunnerApp: App {
     }
 }
 
+/// Window and column minimums. The window minimum is the sum of what the columns need, so
+/// shrinking the window can never squeeze the sidebar or a detail screen below its own minimum.
+enum WindowLayout {
+    static let sidebarMin: CGFloat = 240
+    static let sidebarMax: CGFloat = 340
+    /// The conversation column alone.
+    static let chatMin: CGFloat = 560
+    /// Chat with the inspector open (560 + 260); also fits Discover's two panes (340 + 400 + divider).
+    static let detailMin: CGFloat = chatMin + 260
+    static let windowMinWidth: CGFloat = sidebarMin + detailMin
+}
+
 struct RootView: View {
     @Environment(AppState.self) private var state
 
@@ -70,7 +85,7 @@ struct RootView: View {
         @Bindable var state = state
         NavigationSplitView {
             SidebarView()
-                .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 320)
+                .navigationSplitViewColumnWidth(min: WindowLayout.sidebarMin, ideal: 260, max: WindowLayout.sidebarMax)
         } detail: {
             ZStack {
                 switch state.selection {
@@ -86,7 +101,8 @@ struct RootView: View {
                     WelcomeView()
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(minWidth: WindowLayout.detailMin, maxWidth: .infinity, maxHeight: .infinity)
+            .navigationSplitViewColumnWidth(min: WindowLayout.detailMin, ideal: 1020)
         }
         .modifier(SafeLinkHandling())
         .alert("Chat history", isPresented: Binding(
