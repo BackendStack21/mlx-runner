@@ -1,0 +1,56 @@
+# Builds the app and CLI from a version tag on a clean GitHub-hosted runner, signs SHA256SUMS
+# (Ed25519; required by the in-app updater), signs SLSA build provenance for each file
+# (Sigstore, verifiable with `gh attestation verify`) and publishes the release. The landing
+# page reads the latest release from GitHub's API, so it needs no update here.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26 # Apple silicon, Xcode 26 SDK
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write # sign attestations
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tag matches Version.swift
+        run: |
+          v=$(sed -n 's/.*static let current = "\(.*\)".*/\1/p' Sources/MLXEngine/Version.swift)
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != Version.swift $v"; exit 1; }
+
+      - name: Update key is committed
+        run: grep -q 'publicKeyBase64 = "[A-Za-z0-9+/=]\{44\}"' Sources/MLXEngine/UpdateKey.swift
+
+      - run: swift test
+
+      - run: scripts/bundle.sh --release
+
+      # The in-app updater only installs releases whose SHA256SUMS carries this signature.
+      - name: Sign SHA256SUMS
+        env:
+          MLXRUNNER_UPDATE_KEY: ${{ secrets.MLXRUNNER_UPDATE_KEY }}
+        run: swift scripts/sign.swift dist/release/SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/release/*
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=$(awk -v v="${GITHUB_REF_NAME#v}" '$0 ~ "^## " v {f=1; next} /^## / {f=0} f' CHANGELOG.md)
+          printf '%s\n\nDownloads, checksums and verification: https://mlx-runner.21no.de/#verify\n' "$notes" > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/release/* \
+            --verify-tag \
+            --title "MLX Runner $GITHUB_REF_NAME" \
+            --notes-file notes.md

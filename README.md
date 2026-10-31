@@ -1,16 +1,43 @@
 # MLX Runner
 
-A native macOS app for discovering, downloading and chatting with **MLX models from Hugging Face**, in the spirit of LM Studio. It is written entirely in Swift, with its own Metal inference engine.
+**Run MLX models on your Mac. Natively, fast, with nothing in between.**
 
-- **Zero third-party dependencies.** The project uses the Swift standard library and Apple's system frameworks only: SwiftUI, Foundation, Metal and Network. It has no SwiftPM packages, no vendored code and no Python.
+A native macOS app for discovering, downloading and chatting with **MLX models from Hugging Face**, in the spirit of LM Studio. It is written entirely in Swift, with its own Metal inference engine. Made by [21no.de](https://21no.de).
+
+**[Download at mlx-runner.21no.de](https://mlx-runner.21no.de)**: a `.dmg` for Apple silicon Macs (macOS 15+) and the `mlxr` command-line tool. Every release ships an Ed25519-signed `SHA256SUMS` and signed build provenance; see [verifying a download](#verifying-a-download).
+
+![MLX Runner](site/assets/screenshot-chat.jpg)
+
+- **Zero third-party dependencies.** The project uses the Swift standard library and Apple's system frameworks only: SwiftUI, Foundation, Metal, Network and CryptoKit. It has no SwiftPM packages, no vendored code and no Python.
 - **Native MLX format.** It reads MLX-community repos directly: memory-mapped `safetensors` plus MLX affine quantization at 2, 3, 4, 5, 6 or 8 bits, with group sizes of 32, 64 or 128.
 - **Fast.** Hand-written Metal kernels cover every layer:
   - fused decode matvecs
   - simdgroup-matrix GEMMs for prefill
   - flash attention
   - KV-cache prefix reuse across chat turns
+- **Signed updates.** "Check for Updates…" installs a new release only after its Ed25519 signature, its SHA-256 and the app's code signature all verify, then swaps it in atomically and restarts.
 
 > **On "native MLX support" with "no external dependencies":** Apple's `mlx-swift` is a third-party package, so it is not used. MLX Runner runs MLX *models* with an engine written from scratch on Metal instead. It loads the same files `mlx-lm` uses, so any compatible `mlx-community` repo works without conversion.
+
+## Install
+
+1. Download `MLX-Runner-<version>-macos-arm64.dmg` from [mlx-runner.21no.de](https://mlx-runner.21no.de) or the [releases page](https://github.com/BackendStack21/mlx-runner/releases/latest).
+2. Open it and drag **MLX Runner** to Applications.
+3. The app is ad-hoc signed, not notarized by Apple, so the first launch needs one extra step: right-click the app and choose **Open**, or run
+   `xattr -dr com.apple.quarantine "/Applications/MLX Runner.app"`.
+
+Later versions arrive through **MLX Runner → Check for Updates…**. The app checks GitHub at launch and every 6 hours; turn that off in Settings.
+
+The CLI: unpack `mlxr-<version>-macos-arm64.tar.gz` and put `mlxr` on your `PATH`.
+
+### Verifying a download
+
+```bash
+shasum -a 256 -c SHA256SUMS --ignore-missing                       # checksums
+gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx-runner   # build provenance
+```
+
+`SHA256SUMS.sig` is a raw Ed25519 signature of `SHA256SUMS` by the key in [`packaging/update-key.pub`](packaging/update-key.pub); the in-app updater refuses anything it doesn't verify.
 
 ## Features
 
@@ -161,3 +188,15 @@ How the engine works:
   - Cancelling one request leaves others untouched.
 
 Tests that need a model are skipped when it isn't installed. Download a model with `mlxr download <repo>`.
+
+## Releasing
+
+1. Bump `MLXRunnerVersion.current` in `Sources/MLXEngine/Version.swift` and add a `## <version>` section to [CHANGELOG.md](CHANGELOG.md).
+2. Commit, then tag and push: `git tag v1.2.3 && git push origin main v1.2.3`.
+3. The [release workflow](.github/workflows/release.yml) refuses a tag that doesn't match `Version.swift`, runs the tests, builds the app and CLI on a clean runner, signs `SHA256SUMS` with the `MLXRUNNER_UPDATE_KEY` secret, attests build provenance and publishes the GitHub release. Installed apps pick it up through the updater; the landing page reads it from GitHub's API.
+
+`make release` runs the same packaging locally into `dist/release/` (without the signature). The signing key pair is created once with `swift scripts/release-key.swift`, which stores the private key in the repository secret and writes the public key into `packaging/update-key.pub` and `Sources/MLXEngine/UpdateKey.swift`.
+
+## License
+
+[MIT](LICENSE) © 2026 [21no.de](https://21no.de)
