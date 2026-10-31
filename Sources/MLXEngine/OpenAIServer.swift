@@ -108,6 +108,9 @@ public final class OpenAIServer: @unchecked Sendable {
     }
 
     /// The port actually listened on (differs from `port` when `port` is 0).
+    /// Open client connections (for monitoring and tests).
+    public var openConnections: Int { stateLock.lock(); defer { stateLock.unlock() }; return connections.count }
+
     public var boundPort: UInt16 {
         stateLock.lock(); defer { stateLock.unlock() }
         return _boundPort

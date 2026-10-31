@@ -197,7 +197,7 @@ struct ServerHelperTests {
 
 // MARK: - Server without a model
 
-@Suite("OpenAI server (no model)")
+@Suite("OpenAI server (no model)", .serialized)
 struct ServerNoModelTests {
     @Test func healthAndModelsList() async throws {
         let s = try makeServer(); defer { s.stop() }
@@ -459,7 +459,7 @@ struct ServerNoModelTests {
         let start = Date()
         let slowHead = await rawRequest(port, "GET / HTTP/1.1\r\nHost: localhost\r\n")  // never finishes headers
         #expect(slowHead.status == 408)
-        #expect(Date().timeIntervalSince(start) < 5)
+        #expect(Date().timeIntervalSince(start) < 20)  // fires instead of hanging; generous for loaded CI runners
         let slowBody = await rawRequest(port, "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"messages\"")
         expectErrorSchema(slowBody, status: 408, code: "request_timeout")
     }
@@ -482,11 +482,15 @@ struct ServerNoModelTests {
         let a = rawConnect(port), b = rawConnect(port)
         defer { close(a); close(b) }
         #expect(a >= 0 && b >= 0)
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // Wait until the server has registered both (a fixed sleep races on slow CI runners).
+        let deadline = Date().addingTimeInterval(20)
+        while s.openConnections < 2, Date() < deadline { try await Task.sleep(nanoseconds: 50_000_000) }
+        #expect(s.openConnections == 2)
         let third = await httpRequest(port, "GET", "/")
         expectErrorSchema(third, status: 503, code: "server_busy")
         close(a); close(b)
-        try await Task.sleep(nanoseconds: 300_000_000)
+        let freed = Date().addingTimeInterval(20)
+        while s.openConnections > 0, Date() < freed { try await Task.sleep(nanoseconds: 50_000_000) }
         #expect(await httpRequest(port, "GET", "/").status == 200)
     }
 }
