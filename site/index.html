@@ -382,10 +382,25 @@ openssl pkeyutl -verify -pubin -inkey mlx-runner.pub -rawin -in SHA256SUMS -sigf
       <li><h3>Check where it was built</h3><div class="cmd" data-template="# GitHub CLI: https://cli.github.com
 gh attestation verify {name:dmg} --repo BackendStack21/mlx-runner"><pre><code><span class="c"># GitHub CLI: https://cli.github.com</span>
 gh attestation verify MLX-Runner-&lt;version&gt;-macos-arm64.dmg --repo BackendStack21/mlx-runner</code></pre><button class="copy" type="button" aria-label="Copy command" data-copy="gh attestation verify MLX-Runner-&lt;version&gt;-macos-arm64.dmg --repo BackendStack21/mlx-runner"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div><p class="note">Checks a Sigstore-signed SLSA provenance statement in a public transparency log. It proves the file came out of this repository's release workflow at a specific commit, and it doesn't depend on this website.</p></li>
-      <li><h3>Install the CLI (optional)</h3><div class="cmd" data-template="tar -xzf {name:cli}
-sudo install -m 755 {dir:cli}/mlxr /usr/local/bin/mlxr"><pre><code>tar -xzf mlxr-&lt;version&gt;-macos-arm64.tar.gz
-sudo install -m 755 mlxr-&lt;version&gt;-macos-arm64/mlxr /usr/local/bin/mlxr</code></pre><button class="copy" type="button" aria-label="Copy command" data-copy="tar -xzf mlxr-&lt;version&gt;-macos-arm64.tar.gz
-sudo install -m 755 mlxr-&lt;version&gt;-macos-arm64/mlxr /usr/local/bin/mlxr"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div><p class="note">Any directory on your <code>PATH</code> works. Downloaded with a browser instead of <code>curl</code>? Clear the quarantine flag the same way: <code>xattr -d com.apple.quarantine /usr/local/bin/mlxr</code>.</p></li>
+      <li><h3>Install the CLI (optional)</h3><div class="cmd" data-template="curl -fLO {url:cli}
+curl -fLO https://github.com/BackendStack21/mlx-runner/releases/latest/download/SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar -xzf {name:cli}
+sudo mkdir -p /usr/local/bin
+sudo install -m 755 {dir:cli}/mlxr /usr/local/bin/mlxr
+mlxr list"><pre><code>curl -fLO https://github.com/BackendStack21/mlx-runner/releases/download/&lt;tag&gt;/mlxr-&lt;version&gt;-macos-arm64.tar.gz
+curl -fLO https://github.com/BackendStack21/mlx-runner/releases/latest/download/SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar -xzf mlxr-&lt;version&gt;-macos-arm64.tar.gz
+sudo mkdir -p /usr/local/bin
+sudo install -m 755 mlxr-&lt;version&gt;-macos-arm64/mlxr /usr/local/bin/mlxr
+mlxr list</code></pre><button class="copy" type="button" aria-label="Copy command" data-copy="curl -fLO https://github.com/BackendStack21/mlx-runner/releases/download/&lt;tag&gt;/mlxr-&lt;version&gt;-macos-arm64.tar.gz
+curl -fLO https://github.com/BackendStack21/mlx-runner/releases/latest/download/SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar -xzf mlxr-&lt;version&gt;-macos-arm64.tar.gz
+sudo mkdir -p /usr/local/bin
+sudo install -m 755 mlxr-&lt;version&gt;-macos-arm64/mlxr /usr/local/bin/mlxr
+mlxr list"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div><p class="note">Run it in an empty folder; it works on its own, without steps 1–4. <code>/usr/local/bin</code> doesn't exist on a new Mac, hence the <code>mkdir</code>. Any directory on your <code>PATH</code> works. Downloaded with a browser instead? Safari may unpack the archive for you, so skip the <code>tar</code> line, and clear the quarantine flag afterwards: <code>xattr -d com.apple.quarantine /usr/local/bin/mlxr</code>.</p></li>
     </ol>
     <details class="more">
       <summary>Or build it yourself</summary>
