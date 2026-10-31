@@ -375,6 +375,103 @@ kernel void qgemm(device const uchar* w      [[buffer(0)]],
     gemm_store(Xs, C, y, p, tBase, oBase, sm, sn, tid);
 }
 
+// ---------------------------------------------------------------------------
+// Short prompts (5..16 tokens): qgemm pads every batch to a 32-token tile, so
+// 5 tokens cost as much MMA work as 32. This variant uses a BM = 8 or 16 token
+// tile. Each output element sees exactly the same chain as in qgemm (fp32
+// dequant s * q + b, x zero-padded, 8×8×8 multiply-accumulates with k ascending
+// in steps of 8, rows and columns 8-aligned), so results match qgemm.
+// 4 simdgroups each own 8 of the tile's 32 output columns. K-step 64 halves the
+// barriers per MMA, and the next step's weights / activations are fetched into
+// registers before the current step's MMAs run. Requires K % 64 == 0.
+// ---------------------------------------------------------------------------
+#define SBK 64
+
+template <int BITS, typename T>
+inline void gemm_dequant8(device const uchar* wrow, device const T* srow, device const T* brow,
+                          int k, int gs, bool ok, thread float4& qa, thread float4& qb) {
+    qa = float4(0); qb = float4(0);
+    if (ok) {
+        unpack8<BITS>(wrow + ulong(k) * BITS / 8, qa, qb);
+        const int g = k / gs;
+        const float s = float(srow[g]), b = float(brow[g]);
+        qa = qa * s + b; qb = qb * s + b;
+    }
+}
+
+template <int BITS, typename T, int BM>
+kernel void qgemms(device const uchar* w      [[buffer(0)]],
+                   device const T*     scales [[buffer(1)]],
+                   device const T*     biases [[buffer(2)]],
+                   device const float* x      [[buffer(3)]],
+                   device float*       y      [[buffer(4)]],
+                   constant MMParams&  p      [[buffer(5)]],
+                   uint2 tgid [[threadgroup_position_in_grid]],
+                   uint  tid  [[thread_index_in_threadgroup]],
+                   uint  sgid [[simdgroup_index_in_threadgroup]]) {
+    static_assert(BM == 8 || BM == 16, "token tile");
+    constexpr int XV = BM * SBK / 4 / 128;      // float4s of x staged per thread per step (1 or 2)
+    threadgroup float Xs[BM * SBK];             // also the output staging area (BM × GBN floats)
+    threadgroup float Ws[GBN * SBK];
+    const int oBase = int(tgid.x) * GBN, tBase = int(tgid.y) * BM;
+    const int sn = int(sgid);                   // output columns sn*8 ..< sn*8+8 of the tile
+    simdgroup_matrix<float, 8, 8> C[BM / 8];
+    for (int i = 0; i < BM / 8; i++) C[i] = simdgroup_matrix<float, 8, 8>(0);
+    const ulong rowBytes = ulong(p.K) * BITS / 8;
+    const int gpr = p.K / p.gs;
+    // Dequantization: thread → weight row tid / 4, 8-value chunks (tid % 4) and (tid % 4) + 4.
+    const int wr = int(tid) / 4, wc = int(tid) % 4;
+    const int orow = oBase + wr;
+    const bool rowOK = orow < p.O;
+    const ulong srcRow = rowOK ? ulong(orow) : 0ul;
+    device const uchar* wrow = w + srcRow * rowBytes;
+    device const T* srow = scales + srcRow * ulong(gpr);
+    device const T* brow = biases + srcRow * ulong(gpr);
+    // Activations: float4 index tid + 128 v → token row idx / 16, column (idx % 16) * 4.
+    int xr[XV], xc[XV];
+    bool xok[XV];
+    for (int v = 0; v < XV; v++) {
+        const int idx = int(tid) + 128 * v;
+        xr[v] = idx / (SBK / 4); xc[v] = (idx % (SBK / 4)) * 4;
+        xok[v] = tBase + xr[v] < p.T;
+    }
+    float4 wq[4], xq[XV];
+    gemm_dequant8<BITS, T>(wrow, srow, brow, wc * 8, p.gs, rowOK, wq[0], wq[1]);
+    gemm_dequant8<BITS, T>(wrow, srow, brow, (wc + 4) * 8, p.gs, rowOK, wq[2], wq[3]);
+    for (int v = 0; v < XV; v++)
+        xq[v] = xok[v] ? *(device const float4*)(x + (tBase + xr[v]) * p.xStride + xc[v]) : float4(0);
+    for (int k0 = 0; k0 < p.K; k0 += SBK) {
+        for (int v = 0; v < XV; v++) *(threadgroup float4*)(Xs + xr[v] * SBK + xc[v]) = xq[v];
+        *(threadgroup float4*)(Ws + wr * SBK + wc * 8) = wq[0];
+        *(threadgroup float4*)(Ws + wr * SBK + wc * 8 + 4) = wq[1];
+        *(threadgroup float4*)(Ws + wr * SBK + (wc + 4) * 8) = wq[2];
+        *(threadgroup float4*)(Ws + wr * SBK + (wc + 4) * 8 + 4) = wq[3];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int kn = k0 + SBK;
+        if (kn < p.K) {                         // prefetch the next step while this one multiplies
+            gemm_dequant8<BITS, T>(wrow, srow, brow, kn + wc * 8, p.gs, rowOK, wq[0], wq[1]);
+            gemm_dequant8<BITS, T>(wrow, srow, brow, kn + (wc + 4) * 8, p.gs, rowOK, wq[2], wq[3]);
+            for (int v = 0; v < XV; v++)
+                xq[v] = xok[v] ? *(device const float4*)(x + (tBase + xr[v]) * p.xStride + kn + xc[v]) : float4(0);
+        }
+        for (int kk = 0; kk < SBK; kk += 8) {
+            simdgroup_matrix<float, 8, 8> A, B;
+            simdgroup_load(B, Ws + (sn * 8) * SBK + kk, SBK, ulong2(0, 0), true);
+            for (int i = 0; i < BM / 8; i++) {
+                simdgroup_load(A, Xs + (i * 8) * SBK + kk, SBK);
+                simdgroup_multiply_accumulate(C[i], A, B, C[i]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int i = 0; i < BM / 8; i++) simdgroup_store(C[i], Xs + (i * 8) * GBN + sn * 8, GBN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int idx = int(tid); idx < BM * GBN; idx += 128) {
+        const int r = idx / GBN, c = idx % GBN;
+        if (tBase + r < p.T && oBase + c < p.O) y[(tBase + r) * p.yStride + oBase + c] = Xs[idx];
+    }
+}
+
 template <typename T>
 kernel void dgemm(device const T*     w [[buffer(0)]],
                   device const float* x [[buffer(3)]],
@@ -863,7 +960,9 @@ kernel void add_bias(device float*      y [[buffer(0)]],
     constant MMParams&, uint2, uint, uint);
 #define INST_QNEW(B, T, TN) \
   template [[host_name("qmv_" #B "_" #TN)]] kernel void qmv<B, T>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const T*, device const uchar*, device const T*, device const T*, device const T*, device const T*, device const T*, uint2, uint, uint); \
-  template [[host_name("qgemm_" #B "_" #TN)]] kernel void qgemm<B, T>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, uint2, uint, uint);
+  template [[host_name("qgemm_" #B "_" #TN)]] kernel void qgemm<B, T>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, uint2, uint, uint); \
+  template [[host_name("qgemms_" #B "_" #TN "_8")]] kernel void qgemms<B, T, 8>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, uint2, uint, uint); \
+  template [[host_name("qgemms_" #B "_" #TN "_16")]] kernel void qgemms<B, T, 16>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, uint2, uint, uint);
 #define INST_QMM_ALL(B) \
   INST_QNEW(B, half, f16) INST_QNEW(B, bfloat, bf16) INST_QNEW(B, float, f32) \
   INST_QMM(B, half, f16, 1) INST_QMM(B, half, f16, 8) \

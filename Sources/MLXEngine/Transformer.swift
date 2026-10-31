@@ -22,6 +22,8 @@ final class Linear {
     private let pso1: MTLComputePipelineState          // decode (T == 1)
     private let psoN: MTLComputePipelineState          // small batches (2..<16 tokens)
     private var gemmPSO: MTLComputePipelineState?      // prefill tiles (simdgroup matrices)
+    private var gemm8PSO: MTLComputePipelineState?     // 5...8 tokens: qgemm on an 8-token tile
+    private var gemm16PSO: MTLComputePipelineState?    // 9...16 tokens: qgemm on a 16-token tile
     private(set) var qmvPSO: MTLComputePipelineState?  // fused decode kernel (bias folded in)
     private(set) var qmvbPSO: MTLComputePipelineState?  // 4-bit, 2...4 tokens (speculative verification)
     private var biasPSO: MTLComputePipelineState?
@@ -69,6 +71,10 @@ final class Linear {
                 if bits == 4 { qmvbPSO = try gpu.pipeline("qmvb4_\(sfx)_4") }
             }
             if inDim % 32 == 0 { gemmPSO = try gpu.pipeline("qgemm_\(bits)_\(sfx)") }
+            if inDim % 64 == 0 {  // the short-prompt tiles step K by 64
+                gemm8PSO = try gpu.pipeline("qgemms_\(bits)_\(sfx)_8")
+                gemm16PSO = try gpu.pipeline("qgemms_\(bits)_\(sfx)_16")
+            }
             psoN = try gpu.pipeline("qmm_\(bits)_\(sfx)_\(prefillTT)")
             description = "q\(bits)g\(groupSize)"
         } else {
@@ -132,9 +138,16 @@ final class Linear {
             Linear.encodeFusedDecode(enc, [self], x: x, xOffset: xOffset, xStride: xStride, y: y, yOffset: yOffset, yStride: yStride, T: T)
             return
         }
-        let gemm = T > Transformer.maxVerifyTokens ? gemmPSO : nil  // 5+ tokens: tiled GEMM beats the small-batch kernel
+        // 5+ tokens: tiled GEMM beats the small-batch kernel. A full tile is 32 tokens; short prompts
+        // use an 8- or 16-token tile instead of paying for 32 (same arithmetic per output element).
+        var gemm: (pso: MTLComputePipelineState, rows: Int)?
+        if T > Transformer.maxVerifyTokens {
+            if T <= 8, let p = gemm8PSO { gemm = (p, 8) }
+            else if T <= 16, let p = gemm16PSO { gemm = (p, 16) }
+            else if let p = gemmPSO { gemm = (p, 32) }
+        }
         let tt = T == 1 ? 1 : prefillTT
-        enc.setComputePipelineState(gemm ?? (T == 1 ? pso1 : psoN))
+        enc.setComputePipelineState(gemm?.pso ?? (T == 1 ? pso1 : psoN))
         enc.set(weight, 0)
         if let s = scales, let b = biases {
             enc.set(s, 1)
@@ -144,8 +157,8 @@ final class Linear {
         enc.set(y, yOffset, 4)
         enc.params(MMParams(K: Int32(inDim), O: Int32(outDim), T: Int32(T), gs: Int32(groupSize),
                             xStride: Int32(xStride), yStride: Int32(yStride)), 5)
-        if gemm != nil {
-            enc.dispatchThreadgroups(MTLSize(width: (outDim + 31) / 32, height: (T + 31) / 32, depth: 1),
+        if let gemm {
+            enc.dispatchThreadgroups(MTLSize(width: (outDim + 31) / 32, height: (T + gemm.rows - 1) / gemm.rows, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
         } else {
             enc.dispatchThreadgroups(MTLSize(width: (outDim + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
