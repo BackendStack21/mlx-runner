@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.3
+
+Performance (M2 Pro, measured against 1.0.2 by alternating the two builds; greedy output is token-identical):
+
+- Decode overlaps CPU work with the GPU: the next token's command buffer is encoded while the current one runs.
+- Decode attention at 256+ tokens of context reads each K/V row once per grouped-query head group instead of once per query head. Decode at 1K context: Qwen3 0.6B +6.7%, Llama 3.2 1B +3.8%, Mistral 7B +2.2%. At 16 tokens of context: +2.8%, +0.8%, +0.5%.
+- Short prompts (5–16 tokens, such as a follow-up chat message) use an 8- or 16-token GEMM tile instead of padding to 32: time to process them is 27–50% lower (Mistral 7B: 198 → 99 ms for 5 tokens).
+- Prefill of long prompts is unchanged.
+
 ## 1.0.2
 
 - Discover: the model list takes 40% of the area (at least 380 pt, detail at least 400) instead of whatever width the split view started with, which left it squeezed in large windows. The divider is still draggable and its position is remembered.
