@@ -55,6 +55,28 @@ struct ModelTests {
         #expect(maxDiff < 0.1, "max logit difference \(maxDiff)")
     }
 
+    /// The long-context split decode attention (attention_split + attention_combine) must give
+    /// bit-identical logits to the single-kernel decode attention, at long and short contexts.
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral])
+    func splitDecodeAttentionIsBitIdentical(repo: String) throws {
+        guard let dir = installedModel(repo) else { return }
+        let model = try Transformer(directory: dir, contextLength: 1024)
+        let tok = try Tokenizer(directory: dir)
+        var ids = tok.encode(String(repeating: "The quick brown fox jumps over the lazy dog, then it ran into the forest. ", count: 30)).map { Int32($0) }
+        ids = Array(ids.prefix(450))
+        #expect(ids.count > 300)
+        let V = model.vocabSize
+        _ = try model.forward(Array(ids.dropLast()), offset: 0)
+        for offset in [ids.count - 1, 5, 0] {
+            model.attnSplitMinContext = Int.max
+            let ref = Array(UnsafeBufferPointer(start: try model.forward([ids[offset]], offset: offset), count: V))
+            model.attnSplitMinContext = 1
+            let split = Array(UnsafeBufferPointer(start: try model.forward([ids[offset]], offset: offset), count: V))
+            #expect(ref == split, "split decode attention differs at offset \(offset)")
+        }
+        model.attnSplitMinContext = Transformer.defaultSplitMinContext
+    }
+
     @Test(.enabled(if: installedModel(qwen3) != nil))
     func chatAnswersAndReusesPromptCache() async throws {
         let engine = InferenceEngine()

@@ -308,6 +308,19 @@ public final class Transformer {
 
     private let attnDecodePSO: (MTLComputePipelineState, Int)
     private let attnPrefillPSO: (MTLComputePipelineState, Int)
+    /// Long-context decode attention: `attention_split` (KV head × 8 key slices, GQA heads share
+    /// each K/V read) + `attention_combine`. Bit-identical to `attnDecodePSO`; nil when the shape
+    /// has no instantiation.
+    private let attnSplitPSO: (split: MTLComputePipelineState, combine: MTLComputePipelineState)?
+    private let attnPartials: MTLBuffer?
+    static let attnSplitVirtualSG = 32, attnSplitSG = 4
+    /// Decode uses the split attention once the context (offset + 1) reaches this length.
+    /// Defaults to `MLXR_ATTN_SPLIT_MIN` (or 256); `Int.max` disables it.
+    var attnSplitMinContext: Int = Transformer.defaultSplitMinContext
+    static let defaultSplitMinContext: Int = {
+        if let s = ProcessInfo.processInfo.environment["MLXR_ATTN_SPLIT_MIN"], let v = Int(s), v > 0 { return v }
+        return 256
+    }()
     private let prefillQB: Int
     private let siluPSO: MTLComputePipelineState
     private let addPSO: MTLComputePipelineState
@@ -367,6 +380,28 @@ public final class Transformer {
         let e = c.headDim / 32
         let decodeSG = e >= 8 ? 16 : 32
         attnDecodePSO = (try gpu.pipeline("attention_\(e)_\(decodeSG)"), decodeSG * 32)
+        // The split kernel reproduces attention_E_32 exactly, so it needs the same virtual
+        // simdgroup count; G = query heads per KV head must have an instantiation.
+        let G = c.numHeads / c.numKVHeads
+        let V = Self.attnSplitVirtualSG
+        let maxG = e == 2 ? 8 : 4
+        if decodeSG == V, (2...4).contains(e), (1...maxG).contains(G),
+           let split = try? gpu.pipeline("attention_split_\(e)_\(G)"),
+           let combine = try? gpu.pipeline("attention_combine_\(e)"),
+           split.maxTotalThreadsPerThreadgroup >= Self.attnSplitSG * 32,
+           // floats: m + l + acc[D] per (head, virtual simdgroup)
+           case let (rows, o1) = c.numHeads.multipliedReportingOverflow(by: V), !o1,
+           case let (perRow, o2) = c.headDim.addingReportingOverflow(2), !o2,
+           case let (floats, o3) = rows.multipliedReportingOverflow(by: perRow), !o3,
+           case let (bytes, o4) = floats.multipliedReportingOverflow(by: 4), !o4,
+           rows <= Int(Int32.max) / max(1, perRow),
+           let buf = try? gpu.buffer(bytes) {
+            attnSplitPSO = (split, combine)
+            attnPartials = buf
+        } else {
+            attnSplitPSO = nil
+            attnPartials = nil
+        }
         if [32, 64, 96, 128].contains(c.headDim) {
             attnPrefillPSO = (try gpu.pipeline("flash_prefill_\(c.headDim / 8)"), 128)
             prefillQB = 32
@@ -444,6 +479,7 @@ public final class Transformer {
         let kCol = nH * D, vCol = (nH + nKV) * D
         let decode = T == 1
         let (attn, attnThreads) = decode ? attnDecodePSO : attnPrefillPSO
+        let useSplit = decode && attnSplitPSO != nil && offset + 1 >= attnSplitMinContext
         for (li, layer) in layers.enumerated() {
             // Attention block: [q|k|v] projection → norm/rope/cache → attention → o_proj
             if layer.qkvFusable && Linear.canFuse(layer.qkv, T: T) {
@@ -472,16 +508,35 @@ public final class Transformer {
             enc.dispatchThreadgroups(MTLSize(width: nH + 2 * nKV, height: T, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: D, height: 1, depth: 1))
 
-            enc.setComputePipelineState(attn)
-            enc.set(qkvBuf, 0, 0)
-            enc.set(layer.kCache, 0, 1)
-            enc.set(layer.vCache, 0, 2)
-            enc.set(attnBuf, 0, 3)
-            enc.params(AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(qkvCols),
-                                  maxSeq: Int32(maxSeq), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor / Float(D).squareRoot(),
-                                  outStride: Int32(nH * D), T: Int32(T)), 4)
-            enc.dispatchThreadgroups(MTLSize(width: nH, height: decode ? 1 : (T + prefillQB - 1) / prefillQB, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: attnThreads, height: 1, depth: 1))
+            let attnParams = AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(qkvCols),
+                                        maxSeq: Int32(maxSeq), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor / Float(D).squareRoot(),
+                                        outStride: Int32(nH * D), T: Int32(T))
+            if useSplit, let (split, combine) = attnSplitPSO, let partials = attnPartials {
+                // Partials are reused by every layer: the serial encoder orders the dispatches.
+                enc.setComputePipelineState(split)
+                enc.set(qkvBuf, 0, 0)
+                enc.set(layer.kCache, 0, 1)
+                enc.set(layer.vCache, 0, 2)
+                enc.set(partials, 0, 3)
+                enc.params(attnParams, 4)
+                enc.dispatchThreadgroups(MTLSize(width: nKV, height: Self.attnSplitVirtualSG / Self.attnSplitSG, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: Self.attnSplitSG * 32, height: 1, depth: 1))
+                enc.setComputePipelineState(combine)
+                enc.set(partials, 0, 0)
+                enc.set(attnBuf, 0, 1)
+                enc.params(attnParams, 2)
+                enc.dispatchThreadgroups(MTLSize(width: nH, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            } else {
+                enc.setComputePipelineState(attn)
+                enc.set(qkvBuf, 0, 0)
+                enc.set(layer.kCache, 0, 1)
+                enc.set(layer.vCache, 0, 2)
+                enc.set(attnBuf, 0, 3)
+                enc.params(attnParams, 4)
+                enc.dispatchThreadgroups(MTLSize(width: nH, height: decode ? 1 : (T + prefillQB - 1) / prefillQB, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: attnThreads, height: 1, depth: 1))
+            }
 
             layer.o.encode(enc, x: attnBuf, xStride: nH * D, y: tmp, yStride: H, T: T)
             layer.postNorm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T)
