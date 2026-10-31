@@ -640,7 +640,7 @@ Weather in Paris?[/INST]
 
 @Suite struct ToolNameConstraintTests {
     // A toy vocabulary: id -> text.
-    static let vocab = ["get", "_weather", "_time", "\"", "\",", "hello", "g", "et_t", "ime\"", "x", ""]
+    static let vocab = ["get", "_weather", "_time", "\"", "\",", "hello", "g", "et_t", "ime\",", "x", "", "\"}", "\", ", ",", "\",\""]
     static var index: (texts: [String], byFirst: [Character: [Int]]) {
         var by: [Character: [Int]] = [:]
         for (i, t) in vocab.enumerated() { if let c = t.first { by[c, default: []].append(i) } }
@@ -654,8 +654,9 @@ Weather in Paris?[/INST]
         #expect(Self.allowed("") == ["get", "g"])                      // "hello" (an invented name) is masked
         #expect(Self.allowed("get") == ["_weather", "_time"])
         #expect(Self.allowed("g") == ["et_t"])
-        #expect(Self.allowed("get_t") == ["ime\""])
-        #expect(Self.allowed("get_weather") == ["\"", "\","])          // the closing quote, alone or merged
+        #expect(Self.allowed("get_t") == ["ime\","])
+        #expect(Self.allowed("get_weather") == ["\"", "\",", "\", "])  // never `"}`: the call cannot close without arguments
+        #expect(Self.allowed("get_weather\"") == [","])
         #expect(Self.allowed("got").isEmpty)                            // off every name: constraint gives up
     }
 }

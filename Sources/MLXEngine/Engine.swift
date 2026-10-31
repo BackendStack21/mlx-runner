@@ -446,7 +446,7 @@ public final class InferenceEngine: @unchecked Sendable {
             history.append(t)
             if nameOpen, let texts {
                 nameText += texts.texts[t]
-                if (nameChoices ?? []).contains(where: { nameText.hasPrefix($0 + "\"") }) { nameOpen = false }
+                if (nameChoices ?? []).contains(where: { nameText.hasPrefix($0 + "\",") }) { nameOpen = false }
             }
             if stats.generatedTokens >= maxNew { stats.stopReason = "length"; return false }
             if history.count >= model.maxSeq { stats.stopReason = "context"; return false }
@@ -456,7 +456,9 @@ public final class InferenceEngine: @unchecked Sendable {
             if nameOpen, let texts {
                 let allowed = Self.allowedNameTokens(nameChoices ?? [], typed: nameText, texts: texts)
                 if allowed.isEmpty { nameOpen = false } else {
-                    for i in 0..<count where !allowed.contains(i) { row[i] = -.infinity }
+                    let keep = allowed.compactMap { $0 < count ? ($0, row[$0]) : nil }
+                    for i in 0..<count { row[i] = -.infinity }
+                    for (i, v) in keep { row[i] = v }
                 }
             }
             guard let d = sampler.distribution(row, count: count, recent: history.suffix(parameters.repetitionWindow)) else {
@@ -522,18 +524,20 @@ extension InferenceEngine {
         return (texts, byFirst)
     }
 
-    /// Tokens that keep `typed` on the way to one of `names` followed by its closing quote.
+    /// Tokens that keep `typed` on the way to one of `names`, its closing quote and the comma
+    /// that must follow (`"name": "get_weather", "arguments": …` in every supported format).
+    /// A token may run past the comma only with whitespace, so the call cannot close early.
     static func allowedNameTokens(_ names: [String], typed: String,
                                   texts: (texts: [String], byFirst: [Character: [Int]])) -> Set<Int> {
         var allowed = Set<Int>()
         for n in names {
-            let target = n + "\""
+            let target = n + "\","
             guard target.hasPrefix(typed) else { continue }
             let rest = target.dropFirst(typed.count)
             guard let c = rest.first else { continue }
             for id in texts.byFirst[c] ?? [] {
                 let t = texts.texts[id]
-                if rest.hasPrefix(t) || t.hasPrefix(rest) { allowed.insert(id) }
+                if rest.hasPrefix(t) || (t.hasPrefix(rest) && t.dropFirst(rest.count).allSatisfy(\.isWhitespace)) { allowed.insert(id) }
             }
         }
         return allowed

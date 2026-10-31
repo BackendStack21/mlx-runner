@@ -34,6 +34,15 @@ public indirect enum JSONValue: Equatable, Sendable {
     }
 
     public var stringValue: String? { if case .string(let s) = self { return s }; return nil }
+
+    /// Nesting depth (a scalar is 0).
+    var depth: Int {
+        switch self {
+        case .array(let a): return 1 + (a.map(\.depth).max() ?? 0)
+        case .object(let kv): return 1 + (kv.map(\.1.depth).max() ?? 0)
+        default: return 0
+        }
+    }
     public var isObject: Bool { if case .object = self { return true }; return false }
 
     /// The object with `key` removed (no-op for other values).
@@ -61,21 +70,6 @@ public indirect enum JSONValue: Equatable, Sendable {
         let v = try p.value(depth: 0)
         let rest = String(decoding: bytes[p.i...], as: UTF8.self)
         return (v, Substring(rest))
-    }
-
-    /// Converts a JSONSerialization value. Key order is lost, so keys are sorted.
-    static func from(_ any: Any?, depth: Int = 0) throws -> JSONValue {
-        guard depth <= 64 else { throw ParseError.tooDeep }
-        switch any {
-        case nil, is NSNull: return .null
-        case let n as NSNumber:
-            if CFGetTypeID(n) == CFBooleanGetTypeID() { return .bool(n.boolValue) }
-            return .number(CFNumberIsFloatType(n) ? JSONValue.pythonFloat(n.doubleValue) : n.stringValue)
-        case let s as String: return .string(s)
-        case let a as [Any]: return .array(try a.map { try from($0, depth: depth + 1) })
-        case let d as [String: Any]: return .object(try d.keys.sorted().map { ($0, try from(d[$0], depth: depth + 1)) })
-        default: throw ParseError.invalid("unsupported value")
-        }
     }
 
     // MARK: Serialization
@@ -547,7 +541,7 @@ struct ToolStreamGate {
         guard holding, let r = ToolCallParser.parse(tail, format: format, tools: tools) else {
             // Not a call: show the text as it would appear without tools (special tokens hidden).
             let text = ToolCallParser.revealedMarkers(format).reduce(tail) { $0.replacingOccurrences(of: $1, with: "") }
-            return (holdAll ? tail : text, [], false)
+            return (text, [], false)
         }
         return (r.content, r.calls, true)
     }

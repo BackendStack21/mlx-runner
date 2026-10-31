@@ -370,7 +370,7 @@ struct ServerNoModelTests {
         // Deeply nested JSON Schema is refused rather than recursed into.
         var deep: Any = ["type": "string"]
         for _ in 0..<70 { deep = ["type": "array", "items": deep] }
-        await check(["tools": [["type": "function", "function": ["name": "f", "parameters": deep]]]], nil)
+        await check(["tools": [["type": "function", "function": ["name": "f", "parameters": deep]]]], "tools[0]")
         await check(["logprobs": true], "logprobs")
         await check(["stop": 5], "stop")
         await check(["stream": "yes"], "stream")

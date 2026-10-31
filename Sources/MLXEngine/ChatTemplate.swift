@@ -72,13 +72,7 @@ public struct ChatTemplate: Sendable {
     }
 
     /// Special tokens that start a tool call and must reach the output parser.
-    public var toolCallMarkerTokens: [String] {
-        switch format {
-        case .mistral: return ["[TOOL_CALLS]"]
-        case .llama3: return ["<|python_tag|>"]
-        case .chatML, .phi3, .plain: return []
-        }
-    }
+    public var toolCallMarkerTokens: [String] { ToolCallParser.revealedMarkers(format) }
 
     /// Text that starts the assistant turn so the reply must be a tool call: any call for
     /// `.required`, a call to the named function for `.function`. nil otherwise.

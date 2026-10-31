@@ -526,6 +526,10 @@ public final class OpenAIServer: @unchecked Sendable {
                 throw APIError.invalid("'tools' must be an array", param: "tools")
             }
             guard items.count <= maxTools else { throw APIError.invalid("At most \(maxTools) tools are supported", param: "tools") }
+            // Tool schemas are rendered into the prompt recursively: keep them shallow.
+            for (i, item) in items.enumerated() where item.depth > 64 {
+                throw APIError.invalid("'tools[\(i)]' is nested too deeply (max 64 levels)", param: "tools[\(i)]")
+            }
             var names = Set<String>()
             for (i, item) in items.enumerated() {
                 let p = "tools[\(i)]"
@@ -1221,8 +1225,9 @@ public final class OpenAIServer: @unchecked Sendable {
             if parsed {
                 out.toolCalls = tools.parallelCalls ? calls : Array(calls.prefix(1))
                 out.finish = "tool_calls"
-            } else if job.prefill != nil {
-                // The reply had to be a call (tool_choice required or a named function).
+            } else if job.prefill != nil, out.finish != "length" {
+                // The reply had to be a call (tool_choice required or a named function). A call cut
+                // off by max_tokens is reported like any truncated reply (finish_reason "length").
                 let excerpt = rest.count > 300 ? String(rest.prefix(300)) + "…" : rest
                 throw APIError(status: 500, message: "The model did not produce a valid call to a defined tool "
                                + "(finish reason: \(out.finish)). Model output: \(excerpt)", type: "server_error", code: "tool_call_failed")
@@ -1405,9 +1410,9 @@ struct JSONBody {
     /// client's order, as the models' templates do). Nesting is capped.
     func ordered() throws -> JSONValue {
         do {
-            return try JSONValue.parse(String(decoding: data, as: UTF8.self), maxDepth: 64)
+            return try JSONValue.parse(String(decoding: data, as: UTF8.self), maxDepth: 256)
         } catch JSONValue.ParseError.tooDeep {
-            throw APIError.invalid("Request JSON is nested too deeply (max 64 levels)")
+            throw APIError.invalid("Request JSON is nested too deeply")
         } catch {
             throw APIError.invalid("Request body must be a valid JSON object")
         }
