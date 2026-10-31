@@ -54,6 +54,8 @@ public final class Tokenizer: @unchecked Sendable {
     public private(set) var bosToken: String?
     public private(set) var eosToken: String?
     public private(set) var chatTemplate: String?
+    /// A separate tool-use template, when `chat_template` is a named list (Mistral v0.3).
+    public private(set) var toolUseTemplate: String?
 
     public var vocabularySize: Int { idToToken.count }
 
@@ -171,6 +173,7 @@ public final class Tokenizer: @unchecked Sendable {
             else if let arr = cfg["chat_template"] as? [[String: Any]] {
                 chatTemplate = arr.first(where: { $0["name"] as? String == "default" })?["template"] as? String
                     ?? arr.first?["template"] as? String
+                toolUseTemplate = arr.first(where: { $0["name"] as? String == "tool_use" })?["template"] as? String
             }
         }
         if chatTemplate == nil,

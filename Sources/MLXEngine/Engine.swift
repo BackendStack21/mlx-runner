@@ -47,6 +47,8 @@ public struct LoadedModelInfo: Sendable, Hashable {
     public let chatFormat: String
     public let supportsThinking: Bool
     public let loadSeconds: Double
+    /// The chat template defines native tool calling.
+    public var supportsTools: Bool = false
 }
 
 /// Minimal xorshift RNG so sampling is seedable.
@@ -188,6 +190,9 @@ public final class InferenceEngine: @unchecked Sendable {
     private var currentToken: CancelToken?
     /// Sticky trim cut per conversation (key: caller-supplied id, else the first turn).
     private var trimState: [String: Int] = [:]
+    /// Decoded text of every token, indexed by first character (built on first use per model;
+    /// used to constrain forced tool-call names).
+    private var tokenTexts: (texts: [String], byFirst: [Character: [Int]])?
     private let infoLock = NSLock()
     private var _info: LoadedModelInfo?
     /// The loaded model; safe to read from any thread.
@@ -210,10 +215,12 @@ public final class InferenceEngine: @unchecked Sendable {
                     self.info = nil
                     self.cachedTokens = []
                     self.trimState = [:]
+                    self.tokenTexts = nil
                     let tok = try Tokenizer(directory: directory)
                     try Self.checkMemory(directory: directory, contextLength: contextLength)
                     let model = try Transformer(directory: directory, contextLength: contextLength)
-                    let tpl = ChatTemplate(template: tok.chatTemplate, modelType: model.config.modelType, bosToken: tok.bosToken)
+                    let tpl = ChatTemplate(template: tok.chatTemplate, modelType: model.config.modelType, bosToken: tok.bosToken,
+                                           toolTemplate: tok.toolUseTemplate)
                     var stops = Set(model.config.eosTokenIds)
                     if let e = tok.eosToken, let id = tok.tokenId(e) { stops.insert(id) }
                     for s in tpl.stopTokens { if let id = tok.tokenId(s) { stops.insert(id) } }
@@ -229,7 +236,7 @@ public final class InferenceEngine: @unchecked Sendable {
                         parameterBytes: model.weightBytes, contextLength: model.maxSeq,
                         layers: model.config.numLayers, hiddenSize: model.config.hiddenSize,
                         chatFormat: tpl.format.rawValue, supportsThinking: tpl.supportsThinkingToggle,
-                        loadSeconds: Date().timeIntervalSince(start))
+                        loadSeconds: Date().timeIntervalSince(start), supportsTools: tpl.supportsTools)
                     self.info = info
                     cont.resume(returning: info)
                 } catch {
@@ -259,13 +266,22 @@ public final class InferenceEngine: @unchecked Sendable {
 
     /// Streams a chat completion. Cancel with `token`, or simply stop consuming the stream.
     /// `conversationID` keeps context trimming stable across turns of the same chat.
+    /// With `tools`, the tool definitions are rendered into the prompt (unless the choice is
+    /// "none") and the template's tool-call marker tokens appear in the output text. `prefill`
+    /// (from `ChatTemplate.toolCallPrefill`) starts the assistant turn.
+    /// `constrainToolNames`: the reply continues a prefill that ends inside a function name
+    /// (`tool_choice: required`); until the name is complete, only tokens that keep it one of
+    /// these names can be sampled.
     public func chat(_ messages: [ChatMessage], parameters: SamplingParameters = .init(), enableThinking: Bool = true,
-                     conversationID: String? = nil, token: CancelToken = CancelToken()) -> AsyncThrowingStream<GenerationEvent, Error> {
-        stream(token, parameters: parameters) { tok, tpl in
+                     conversationID: String? = nil, tools: ToolRequest? = nil, prefill: String? = nil,
+                     constrainToolNames: [String]? = nil,
+                     token: CancelToken = CancelToken()) -> AsyncThrowingStream<GenerationEvent, Error> {
+        let defs = (tools?.active ?? false) ? tools?.tools ?? [] : []
+        return stream(token, parameters: parameters, revealToolMarkers: !defs.isEmpty, nameChoices: constrainToolNames) { tok, tpl in
             guard let tpl else { throw EngineError.invalidFile("No model loaded") }
             return self.fitToContext(messages, template: tpl, tokenizer: tok,
                                      reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking,
-                                     conversationID: conversationID)
+                                     conversationID: conversationID, tools: defs, prefill: prefill)
         }
     }
 
@@ -280,7 +296,8 @@ public final class InferenceEngine: @unchecked Sendable {
         }
     }
 
-    private func stream(_ token: CancelToken, parameters: SamplingParameters,
+    private func stream(_ token: CancelToken, parameters: SamplingParameters, revealToolMarkers: Bool = false,
+                        nameChoices: [String]? = nil,
                         _ makeTokens: @escaping (Tokenizer, ChatTemplate?) throws -> [Int]) -> AsyncThrowingStream<GenerationEvent, Error> {
         AsyncThrowingStream { cont in
             cont.onTermination = { _ in token.cancel() }
@@ -294,7 +311,10 @@ public final class InferenceEngine: @unchecked Sendable {
                 defer { self.cancelLock.lock(); self.currentToken = nil; self.cancelLock.unlock() }
                 do {
                     let tokens = try makeTokens(tok, self.template)
-                    try self.run(tokens: tokens, parameters: parameters, token: token) { cont.yield($0) }
+                    let reveal = revealToolMarkers
+                        ? Set((self.template?.toolCallMarkerTokens ?? []).compactMap { tok.tokenId($0) }) : []
+                    try self.run(tokens: tokens, parameters: parameters, reveal: reveal, nameChoices: nameChoices,
+                                 token: token) { cont.yield($0) }
                     cont.finish()
                 } catch {
                     cont.finish(throwing: error)
@@ -318,21 +338,26 @@ public final class InferenceEngine: @unchecked Sendable {
     /// share a stable prefix, so the KV cache keeps being reused instead of re-prefilling
     /// the whole window on every turn.
     private func fitToContext(_ messages: [ChatMessage], template: ChatTemplate, tokenizer: Tokenizer,
-                              reserve: Int, enableThinking: Bool, conversationID: String?) -> [Int] {
+                              reserve: Int, enableThinking: Bool, conversationID: String?,
+                              tools: [ToolDefinition] = [], prefill: String? = nil) -> [Int] {
         let limit = (model?.maxSeq ?? Int.max) - reserve
         // Content is tokenized as plain text (see renderMarked), normalised up front if needed.
-        let msgs = tokenizer.usesNFC ? messages.map { ChatMessage(role: $0.role, content: $0.content.precomposedStringWithCanonicalMapping) } : messages
+        let msgs = tokenizer.usesNFC ? messages.map {
+            var m = $0
+            m.content = m.content.precomposedStringWithCanonicalMapping
+            return m
+        } : messages
         let system = msgs.filter { $0.role == .system }
         let turns = msgs.filter { $0.role != .system }
         guard let first = turns.first else {
-            let r = template.renderMarked(msgs, enableThinking: enableThinking)
+            let r = template.renderMarked(msgs, enableThinking: enableThinking, tools: tools, prefill: prefill)
             return tokenizer.encode(r.text, plainRanges: r.content)
         }
         let key = conversationID ?? (first.role.rawValue + "\u{0}" + first.content)
         if trimState.count > 256 { trimState = [:] }
 
         func render(_ d: Int) -> [Int] {
-            let r = template.renderMarked(system + turns[d...], enableThinking: enableThinking)
+            let r = template.renderMarked(system + turns[d...], enableThinking: enableThinking, tools: tools, prefill: prefill)
             return tokenizer.encode(r.text, plainRanges: r.content)
         }
         /// Next cut index > d that keeps the history starting with a user turn.
@@ -360,7 +385,9 @@ public final class InferenceEngine: @unchecked Sendable {
         return tokens
     }
 
-    private func run(tokens: [Int], parameters: SamplingParameters, token: CancelToken, emit: (GenerationEvent) -> Void) throws {
+    /// `reveal`: special tokens whose text is emitted (tool-call markers); others decode to nothing.
+    private func run(tokens: [Int], parameters: SamplingParameters, reveal: Set<Int> = [], nameChoices: [String]? = nil,
+                     token: CancelToken, emit: (GenerationEvent) -> Void) throws {
         guard let model, let tok = tokenizer else { throw EngineError.invalidFile("No model loaded") }
         var stats = GenerationStats()
         stats.promptTokens = tokens.count
@@ -401,23 +428,39 @@ public final class InferenceEngine: @unchecked Sendable {
         var drafted = 0, acceptedDrafts = 0
         // Speculative decoding (prompt lookup): verifying k drafted tokens costs one batched
         // pass, so every accepted draft is a token generated without its own weight read.
-        let speculative = (parameters.speculative ?? false) && model.supportsBatchedVerify
+        // Constrained name: the text generated so far while a forced tool-call name is open.
+        var nameText = ""
+        var nameOpen = !(nameChoices ?? []).isEmpty
+        let texts = nameOpen ? tokenTextIndex(tok) : nil
+        let speculative = (parameters.speculative ?? false) && model.supportsBatchedVerify && !nameOpen
         var draftLen = 4
 
         /// Emits a sampled token. Returns false when generation must stop.
         func accept(_ t: Int) -> Bool {
             if stopIds.contains(t) { stats.stopReason = "stop"; return false }
             stats.generatedTokens += 1
-            var text = decoder.append(tok.bytes(for: t))
+            var text = decoder.append(tok.bytes(for: t, includeSpecial: reveal.contains(t)))
             // SentencePiece models start the reply with a word-boundary space.
             if atStart, tok.mode == .sentencePiece { text = String(text.drop(while: { $0 == " " })) }
             if !text.isEmpty { atStart = false; emit(.text(text)) }
             history.append(t)
+            if nameOpen, let texts {
+                nameText += texts.texts[t]
+                if (nameChoices ?? []).contains(where: { nameText.hasPrefix($0 + "\",") }) { nameOpen = false }
+            }
             if stats.generatedTokens >= maxNew { stats.stopReason = "length"; return false }
             if history.count >= model.maxSeq { stats.stopReason = "context"; return false }
             return true
         }
         func dist(_ row: UnsafeMutablePointer<Float>) throws -> [(id: Int, p: Float)] {
+            if nameOpen, let texts {
+                let allowed = Self.allowedNameTokens(nameChoices ?? [], typed: nameText, texts: texts)
+                if allowed.isEmpty { nameOpen = false } else {
+                    let keep = allowed.compactMap { $0 < count ? ($0, row[$0]) : nil }
+                    for i in 0..<count { row[i] = -.infinity }
+                    for (i, v) in keep { row[i] = v }
+                }
+            }
             guard let d = sampler.distribution(row, count: count, recent: history.suffix(parameters.repetitionWindow)) else {
                 throw EngineError.invalidOutput("non-finite logits")
             }
@@ -466,6 +509,40 @@ public final class InferenceEngine: @unchecked Sendable {
 }
 
 extension InferenceEngine {
+    /// Token texts, built once per loaded model (runs on the inference queue).
+    private func tokenTextIndex(_ tok: Tokenizer) -> (texts: [String], byFirst: [Character: [Int]]) {
+        if let t = tokenTexts { return t }
+        var texts: [String] = []
+        texts.reserveCapacity(tok.vocabularySize)
+        var byFirst: [Character: [Int]] = [:]
+        for id in 0..<tok.vocabularySize {
+            let s = String(decoding: tok.bytes(for: id), as: UTF8.self)
+            texts.append(s)
+            if let c = s.first { byFirst[c, default: []].append(id) }
+        }
+        tokenTexts = (texts, byFirst)
+        return (texts, byFirst)
+    }
+
+    /// Tokens that keep `typed` on the way to one of `names`, its closing quote and the comma
+    /// that must follow (`"name": "get_weather", "arguments": …` in every supported format).
+    /// A token may run past the comma only with whitespace, so the call cannot close early.
+    static func allowedNameTokens(_ names: [String], typed: String,
+                                  texts: (texts: [String], byFirst: [Character: [Int]])) -> Set<Int> {
+        var allowed = Set<Int>()
+        for n in names {
+            let target = n + "\","
+            guard target.hasPrefix(typed) else { continue }
+            let rest = target.dropFirst(typed.count)
+            guard let c = rest.first else { continue }
+            for id in texts.byFirst[c] ?? [] {
+                let t = texts.texts[id]
+                if rest.hasPrefix(t) || (t.hasPrefix(rest) && t.dropFirst(rest.count).allSatisfy(\.isWhitespace)) { allowed.insert(id) }
+            }
+        }
+        return allowed
+    }
+
     /// Refuses to load a model whose weights plus KV cache would not fit in GPU-addressable memory.
     static func checkMemory(directory: URL, contextLength: Int) throws {
         let fm = FileManager.default

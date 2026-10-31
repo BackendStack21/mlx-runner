@@ -23,16 +23,25 @@ import Security
 ///   - Header/body/write deadlines, a connection cap, a generation-queue cap and body,
 ///     message-count and output-token limits.
 ///
+/// Tool calling: function tools in the Chat Completions shape (`tools`, `tool_choice`,
+/// `parallel_tool_calls`, assistant `tool_calls`, `tool` messages) and the Responses shape (flat
+/// function tools, `function_call` / `function_call_output` items, `function_call` output items and
+/// their streaming events). Tools are rendered in the model's native format (see ChatTemplate) and
+/// its replies parsed back into calls (ToolCallParser); while streaming, text that may start a call
+/// is held back until the reply ends. `required` and named `tool_choice` prefill the call opener;
+/// for `required` the function name is also constrained to the defined tools. A forced call that
+/// still fails to parse is a 500 (`tool_call_failed`). Models without a tool format get a 400.
+///
 /// Unsupported OpenAI features are rejected with 400 rather than silently ignored when ignoring
-/// them would change the meaning of the request: tools/functions (unless `tool_choice` is
-/// "none"), `tool`/`function` messages, non-text content parts, `response_format` /
+/// them would change the meaning of the request: non-function tools, the deprecated `functions` /
+/// `function_call` / `function` role, non-text content parts, `response_format` /
 /// `text.format` other than text, `n` > 1, `logprobs`, non-empty `logit_bias`, audio output,
 /// `previous_response_id`, `conversation`, `background`, prompt templates and `echo`/`suffix`/
 /// `best_of` on legacy completions. Accepted but ignored: `model` (the loaded model always
 /// answers), `frequency_penalty`/`presence_penalty` (range-checked; the engine's multiplicative
 /// repetition penalty is not equivalent), `store` (nothing is ever stored; responses report
 /// `store: false`), `metadata` (echoed back), `user`, `safety_identifier`, `prompt_cache_key`,
-/// `service_tier`, `parallel_tool_calls`, `include`, `truncation` (history is always trimmed
+/// `service_tier`, `include`, `truncation` (history is always trimmed
 /// to fit), `stream_options` other than `include_usage`.
 ///
 /// Reasoning: when a model's reply starts with `<think>…</think>` (Qwen3 and similar), Chat
@@ -485,25 +494,159 @@ public final class OpenAIServer: @unchecked Sendable {
         case "system", "developer": return .system
         case "user": return .user
         case "assistant": return .assistant
-        case "tool", "function":
-            throw APIError.invalid("Role '\(s)' is not supported: this server does not support tool calling", param: param)
+        case "tool": return .tool
+        case "function":
+            throw APIError.invalid("Role 'function' is deprecated and not supported; use 'tool' messages with a 'tool_call_id'",
+                                   param: param, code: "unsupported_parameter")
         default:
             throw APIError.invalid("Invalid role '\(s)'", param: param)
         }
     }
 
-    /// Rejects tool definitions unless tool_choice is "none".
-    private static func rejectTools(_ b: JSONBody) throws {
-        let toolChoiceNone = (b.raw["tool_choice"] as? String) == "none"
-        for k in ["tools", "functions"] {
-            if let a = b.raw[k] as? [Any], !a.isEmpty, !toolChoiceNone {
-                throw APIError.invalid("Tool calling is not supported by this server (set tool_choice to \"none\" or omit '\(k)')",
+    // MARK: - Tools
+
+    static let maxTools = 128
+    static let maxToolCallIDLength = 256
+
+    /// Parses `tools`, `tool_choice` and `parallel_tool_calls`. Chat Completions tools are
+    /// `{"type": "function", "function": {name, description, parameters, strict}}`; Responses
+    /// tools are flat (`{"type": "function", name, description, parameters, strict}`). Returns nil
+    /// when no tools are defined.
+    static func toolRequest(_ b: JSONBody, responses: Bool) throws -> ToolRequest? {
+        if !responses {
+            for k in ["functions", "function_call"] where b.has(k) {
+                throw APIError.invalid("'\(k)' is deprecated and not supported; use 'tools' and 'tool_choice'",
                                        param: k, code: "unsupported_parameter")
             }
         }
-        if let tc = b.raw["tool_choice"], !(tc is NSNull), (tc as? String) != "none", (tc as? String) != "auto" {
-            throw APIError.invalid("Tool calling is not supported by this server", param: "tool_choice", code: "unsupported_parameter")
+        let parallel = try b.bool("parallel_tool_calls") ?? true
+        var tools: [ToolDefinition] = []
+        if b.has("tools") {
+            guard case .array(let items)? = try b.ordered()["tools"] else {
+                throw APIError.invalid("'tools' must be an array", param: "tools")
+            }
+            guard items.count <= maxTools else { throw APIError.invalid("At most \(maxTools) tools are supported", param: "tools") }
+            // Tool schemas are rendered into the prompt recursively: keep them shallow.
+            for (i, item) in items.enumerated() where item.depth > 64 {
+                throw APIError.invalid("'tools[\(i)]' is nested too deeply (max 64 levels)", param: "tools[\(i)]")
+            }
+            var names = Set<String>()
+            for (i, item) in items.enumerated() {
+                let p = "tools[\(i)]"
+                guard item.isObject else { throw APIError.invalid("'\(p)' must be an object", param: p) }
+                guard let type = item["type"]?.stringValue else { throw APIError.invalid("'\(p).type' is required", param: "\(p).type") }
+                guard type == "function" else {
+                    throw APIError.invalid("Tool type '\(type)' is not supported: this server only runs function tools",
+                                           param: "\(p).type", code: "unsupported_parameter")
+                }
+                let fp = responses ? p : "\(p).function"
+                let fn: JSONValue
+                if responses { fn = item.removing("type") } else {
+                    guard let f = item["function"], f.isObject else { throw APIError.invalid("'\(fp)' must be an object", param: fp) }
+                    fn = f
+                }
+                guard let name = fn["name"]?.stringValue else { throw APIError.invalid("'\(fp).name' is required", param: "\(fp).name") }
+                guard ToolDefinition.isValidName(name) else {
+                    throw APIError.invalid("Invalid function name '\(name.prefix(80))': use 1-64 letters, digits, '_' or '-'",
+                                           param: "\(fp).name")
+                }
+                guard names.insert(name).inserted else { throw APIError.invalid("Duplicate function name '\(name)'", param: "\(fp).name") }
+                if let d = fn["description"], d.stringValue == nil, d != .null {
+                    throw APIError.invalid("'\(fp).description' must be a string", param: "\(fp).description")
+                }
+                if let params = fn["parameters"], !params.isObject, params != .null {
+                    throw APIError.invalid("'\(fp).parameters' must be a JSON Schema object", param: "\(fp).parameters")
+                }
+                // Templates render the Chat Completions shape.
+                let spec: JSONValue = responses ? .object([("type", .string("function")), ("function", fn)]) : item
+                tools.append(ToolDefinition(name: name, spec: spec))
+            }
         }
+        let choice: ToolChoice
+        let p = "tool_choice"
+        switch b.raw[p] {
+        case nil, is NSNull: choice = .auto
+        case let s as String:
+            switch s {
+            case "none": choice = .none
+            case "auto": choice = .auto
+            case "required": choice = .required
+            default: throw APIError.invalid("Invalid tool_choice '\(s.prefix(40))': use none, auto, required or a function", param: p)
+            }
+        case let d as [String: Any]:
+            guard d["type"] as? String == "function" else {
+                throw APIError.invalid("Only function tool_choice objects are supported", param: p, code: "unsupported_parameter")
+            }
+            let name = responses ? d["name"] as? String : (d["function"] as? [String: Any])?["name"] as? String
+            guard let name else { throw APIError.invalid("tool_choice needs the function's name", param: p) }
+            guard tools.contains(where: { $0.name == name }) else {
+                throw APIError.invalid("tool_choice names '\(name.prefix(64))', which is not in 'tools'", param: p)
+            }
+            choice = .function(name)
+        default:
+            throw APIError.invalid("'tool_choice' must be a string or an object", param: p)
+        }
+        if tools.isEmpty {
+            if choice == .required { throw APIError.invalid("tool_choice 'required' needs 'tools'", param: p) }
+            return nil
+        }
+        return ToolRequest(tools: tools, choice: choice, parallelCalls: parallel)
+    }
+
+    /// Parses an assistant message's `tool_calls` (Chat Completions shape).
+    static func toolCalls(_ v: Any?, param: String) throws -> [ToolCall] {
+        guard let items = v as? [Any] else { throw APIError.invalid("'\(param)' must be an array", param: param) }
+        guard items.count <= maxTools else { throw APIError.invalid("Too many tool calls in '\(param)'", param: param) }
+        return try items.enumerated().map { i, item in
+            let p = "\(param)[\(i)]"
+            guard let d = item as? [String: Any] else { throw APIError.invalid("'\(p)' must be an object", param: p) }
+            if let t = d["type"] as? String, t != "function" {
+                throw APIError.invalid("Tool call type '\(t)' is not supported", param: "\(p).type", code: "unsupported_parameter")
+            }
+            guard let fn = d["function"] as? [String: Any] else { throw APIError.invalid("'\(p).function' is required", param: "\(p).function") }
+            return try toolCall(id: d["id"], name: fn["name"], arguments: fn["arguments"], param: p)
+        }
+    }
+
+    /// Validates one call from a conversation's history.
+    static func toolCall(id: Any?, name: Any?, arguments: Any?, param p: String) throws -> ToolCall {
+        guard let id = id as? String, !id.isEmpty, id.utf8.count <= maxToolCallIDLength else {
+            throw APIError.invalid("'\(p)' needs an id of 1-\(maxToolCallIDLength) characters", param: p)
+        }
+        guard let name = name as? String, ToolDefinition.isValidName(name) else {
+            throw APIError.invalid("'\(p)' needs a valid function name", param: p)
+        }
+        let args = arguments as? String ?? "{}"
+        guard let v = try? JSONValue.parse(args), v.isObject else {
+            throw APIError.invalid("'\(p)' arguments must be a JSON object encoded as a string", param: p)
+        }
+        return ToolCall(id: id, name: name, arguments: v.serialized(.compact))
+    }
+
+    /// Checks that the loaded model can handle this request's tools and tool history, and
+    /// returns the call opener to prefill for `required` / named `tool_choice`.
+    static func checkTools(_ tools: ToolRequest?, _ messages: [ChatMessage], info: LoadedModelInfo) throws -> String? {
+        let history = messages.contains { $0.role == .tool || !($0.toolCalls ?? []).isEmpty }
+        guard (tools?.active ?? false) || history else { return nil }
+        guard info.supportsTools, let format = ChatFormat(rawValue: info.chatFormat) else {
+            throw APIError.invalid("The loaded model (\(info.name)) does not support tool calling", param: "tools",
+                                   code: "unsupported_parameter")
+        }
+        if format == .llama3 {
+            if messages.contains(where: { ($0.toolCalls ?? []).count > 1 }) {
+                throw APIError.invalid("This model (Llama 3) supports one tool call per assistant message", param: "messages")
+            }
+            if tools?.active ?? false, messages.first(where: { $0.role != .system })?.role != .user {
+                throw APIError.invalid("With tools, this model (Llama 3) needs the conversation to start with a user message",
+                                       param: "messages")
+            }
+        }
+        guard let tools, tools.active else { return nil }
+        return ChatTemplate.toolCallPrefill(format, tools.choice)
+    }
+
+    static func toolCallJSON(_ c: ToolCall) -> [String: Any] {
+        ["id": c.id, "type": "function", "function": ["name": c.name, "arguments": c.arguments]]
     }
 
     // MARK: - Chat Completions
@@ -518,19 +661,33 @@ public final class OpenAIServer: @unchecked Sendable {
             throw APIError.invalid("Too many messages (max \(cfg.maxMessages))", param: "messages")
         }
         var messages: [ChatMessage] = []
+        var callIDs = Set<String>()
         for (i, item) in raw.enumerated() {
             let p = "messages[\(i)]"
             guard let m = item as? [String: Any], let roleStr = m["role"] as? String else {
                 throw APIError.invalid("'\(p)' must be an object with a 'role'", param: "\(p).role")
             }
             let role = try Self.role(roleStr, param: "\(p).role")
-            if role == .assistant, let tc = m["tool_calls"] as? [Any], !tc.isEmpty {
-                throw APIError.invalid("Assistant tool_calls are not supported", param: "\(p).tool_calls")
-            }
             let content = try Self.textContent(m["content"], param: "\(p).content", textTypes: ["text"])
-            messages.append(ChatMessage(role: role, content: content))
+            var msg = ChatMessage(role: role, content: content)
+            if role == .assistant, let tc = m["tool_calls"], !(tc is NSNull) {
+                let calls = try Self.toolCalls(tc, param: "\(p).tool_calls")
+                if !calls.isEmpty { msg.toolCalls = calls }
+                calls.forEach { callIDs.insert($0.id) }
+            }
+            if role == .tool {
+                guard let id = m["tool_call_id"] as? String else {
+                    throw APIError.invalid("'\(p).tool_call_id' is required for tool messages", param: "\(p).tool_call_id")
+                }
+                guard callIDs.contains(id) else {
+                    throw APIError.invalid("Messages with role 'tool' must answer a preceding assistant 'tool_calls' entry "
+                                           + "(unknown tool_call_id '\(id.prefix(64))')", param: "\(p).tool_call_id")
+                }
+                msg.toolCallID = id
+            }
+            messages.append(msg)
         }
-        try Self.rejectTools(b)
+        let tools = try Self.toolRequest(b, responses: false)
         if let rf = b.raw["response_format"] as? [String: Any], let t = rf["type"] as? String, t != "text" {
             throw APIError.invalid("response_format '\(t)' is not supported by this server", param: "response_format",
                                    code: "unsupported_parameter")
@@ -549,13 +706,15 @@ public final class OpenAIServer: @unchecked Sendable {
         let stream = try b.bool("stream") ?? false
         let includeUsage = ((b.raw["stream_options"] as? [String: Any])?["include_usage"] as? Bool) ?? false
         let thinking = try enableThinking(b, effort: b.raw["reasoning_effort"] as? String)
-        let job = Job(chat: true, messages: messages, prompt: "", params: params, stops: stopList,
-                      enableThinking: thinking, splitReasoning: true)
+        var job = Job(chat: true, messages: messages, prompt: "", params: params, stops: stopList,
+                      enableThinking: thinking, splitReasoning: true, tools: tools)
 
         let token = CancelToken()
         conn.onClientGone = { token.cancel() }
         conn.watchForDisconnect()
         return try await withGenerationSlot(conn) { info in
+            job.prefill = try Self.checkTools(tools, messages, info: info)
+            job.format = ChatFormat(rawValue: info.chatFormat) ?? .chatML
             let id = "chatcmpl-" + Self.randomID()
             let created = Int(Date().timeIntervalSince1970)
             let model = info.name
@@ -564,7 +723,10 @@ public final class OpenAIServer: @unchecked Sendable {
             if !stream {
                 let out = try await self.run(job, token: token) { _ in !conn.isClosed }
                 if conn.isClosed { return 499 }
-                var message: [String: Any] = ["role": "assistant", "content": out.content, "refusal": NSNull(), "annotations": []]
+                var message: [String: Any] = ["role": "assistant", "refusal": NSNull(), "annotations": []]
+                // OpenAI sends null content when the reply is only tool calls.
+                message["content"] = out.content.isEmpty && !out.toolCalls.isEmpty ? NSNull() : out.content
+                if !out.toolCalls.isEmpty { message["tool_calls"] = out.toolCalls.map(Self.toolCallJSON) }
                 if !out.reasoning.isEmpty { message["reasoning_content"] = out.reasoning }
                 conn.sendResponse(status: 200, json: [
                     "id": id, "object": "chat.completion", "created": created, "model": model, "system_fingerprint": fp,
@@ -596,6 +758,12 @@ public final class OpenAIServer: @unchecked Sendable {
                     }
                 }
                 guard first, !out.aborted, !conn.isClosed else { conn.close(); return 499 }
+                // Tool calls stream as OpenAI does: id, type and name first, then the arguments.
+                for (i, c) in out.toolCalls.enumerated() {
+                    _ = await send(chunk(["tool_calls": [["index": i, "id": c.id, "type": "function",
+                                                          "function": ["name": c.name, "arguments": ""]] as [String: Any]]], finish: nil))
+                    _ = await send(chunk(["tool_calls": [["index": i, "function": ["arguments": c.arguments]] as [String: Any]]], finish: nil))
+                }
                 _ = await send(chunk([:], finish: out.finish))
                 if includeUsage {
                     _ = await send(["id": id, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -692,7 +860,7 @@ public final class OpenAIServer: @unchecked Sendable {
         if try b.bool("background") == true {
             throw APIError.invalid("Background responses are not supported", param: "background", code: "unsupported_parameter")
         }
-        try Self.rejectTools(b)
+        let tools = try Self.toolRequest(b, responses: true)
         if let text = b.raw["text"] as? [String: Any], let f = text["format"] as? [String: Any],
            let t = f["type"] as? String, t != "text" {
             throw APIError.invalid("text.format '\(t)' is not supported by this server", param: "text.format",
@@ -712,18 +880,43 @@ public final class OpenAIServer: @unchecked Sendable {
             guard items.count <= cfg.maxMessages else {
                 throw APIError.invalid("Too many input items (max \(cfg.maxMessages))", param: "input")
             }
+            var callIDs = Set<String>()
+            var lastWasAssistant = false  // a function_call joins the assistant turn right before it
             for (i, item) in items.enumerated() {
                 let p = "input[\(i)]"
                 guard let d = item as? [String: Any] else { throw APIError.invalid("'\(p)' must be an object", param: p) }
                 let type = d["type"] as? String ?? "message"
                 if type == "reasoning" { continue }  // prior reasoning items are not re-fed to the model
-                guard type == "message" else {
+                switch type {
+                case "message":
+                    guard let roleStr = d["role"] as? String else { throw APIError.invalid("'\(p).role' is required", param: "\(p).role") }
+                    let role = try Self.role(roleStr, param: "\(p).role")
+                    guard role != .tool else {
+                        throw APIError.invalid("Use 'function_call_output' items for tool results", param: "\(p).role")
+                    }
+                    let content = try Self.textContent(d["content"], param: "\(p).content", textTypes: ["input_text", "output_text", "text"])
+                    messages.append(ChatMessage(role: role, content: content))
+                    lastWasAssistant = role == .assistant
+                case "function_call":
+                    let call = try Self.toolCall(id: d["call_id"], name: d["name"], arguments: d["arguments"], param: p)
+                    callIDs.insert(call.id)
+                    if lastWasAssistant, var last = messages.popLast() {
+                        last.toolCalls = (last.toolCalls ?? []) + [call]
+                        messages.append(last)
+                    } else {
+                        messages.append(ChatMessage(role: .assistant, content: "", toolCalls: [call]))
+                    }
+                    lastWasAssistant = true
+                case "function_call_output":
+                    guard let id = d["call_id"] as? String, callIDs.contains(id) else {
+                        throw APIError.invalid("'\(p).call_id' must match a preceding function_call item", param: "\(p).call_id")
+                    }
+                    let output = try Self.textContent(d["output"], param: "\(p).output", textTypes: ["input_text", "output_text", "text"])
+                    messages.append(ChatMessage(role: .tool, content: output, toolCallID: id))
+                    lastWasAssistant = false
+                default:
                     throw APIError.invalid("Input item type '\(type)' is not supported", param: "\(p).type", code: "unsupported_parameter")
                 }
-                guard let roleStr = d["role"] as? String else { throw APIError.invalid("'\(p).role' is required", param: "\(p).role") }
-                let role = try Self.role(roleStr, param: "\(p).role")
-                let content = try Self.textContent(d["content"], param: "\(p).content", textTypes: ["input_text", "output_text", "text"])
-                messages.append(ChatMessage(role: role, content: content))
             }
         } else {
             throw APIError.invalid("'input' is required and must be a string or an array of input items", param: "input")
@@ -737,13 +930,19 @@ public final class OpenAIServer: @unchecked Sendable {
         let thinking = try enableThinking(b, effort: effort)
         let stream = try b.bool("stream") ?? false
         let metadata = b.raw["metadata"] as? [String: Any] ?? [:]
-        let job = Job(chat: true, messages: messages, prompt: "", params: params, stops: [],
-                      enableThinking: thinking, splitReasoning: true)
+        var job = Job(chat: true, messages: messages, prompt: "", params: params, stops: [],
+                      enableThinking: thinking, splitReasoning: true, tools: tools)
+        // Echoed in the response object, as OpenAI does.
+        let echoTools: Any = b.raw["tools"] ?? []
+        let echoChoice: Any = b.raw["tool_choice"].flatMap { $0 is NSNull ? nil : $0 } ?? (tools == nil ? "none" : "auto")
+        let parallelCalls = try tools?.parallelCalls ?? (b.bool("parallel_tool_calls") ?? true)
 
         let token = CancelToken()
         conn.onClientGone = { token.cancel() }
         conn.watchForDisconnect()
         return try await withGenerationSlot(conn) { info in
+            job.prefill = try Self.checkTools(tools, messages, info: info)
+            job.format = ChatFormat(rawValue: info.chatFormat) ?? .chatML
             let respID = "resp_" + Self.randomID(32)
             let msgID = "msg_" + Self.randomID(32)
             let rsID = "rs_" + Self.randomID(32)
@@ -756,16 +955,20 @@ public final class OpenAIServer: @unchecked Sendable {
                     "incomplete_details": incomplete ? ["reason": "max_output_tokens"] : NSNull(),
                     "instructions": instructions.map { $0 as Any } ?? NSNull(), "max_output_tokens": maxOutputTokens,
                     "max_tool_calls": NSNull(), "model": info.name, "output": output,
-                    "parallel_tool_calls": false, "previous_response_id": NSNull(),
+                    "parallel_tool_calls": parallelCalls, "previous_response_id": NSNull(),
                     "reasoning": ["effort": effort.map { $0 as Any } ?? NSNull(), "summary": NSNull()],
                     "store": false, "temperature": Double(String(params.temperature)) ?? 1, "top_p": Double(String(params.topP)) ?? 1,
-                    "text": ["format": ["type": "text"]], "tool_choice": "none", "tools": [],
+                    "text": ["format": ["type": "text"]], "tool_choice": echoChoice, "tools": echoTools,
                     "truncation": "auto", "usage": usage, "user": NSNull(), "metadata": metadata,
                 ]
             }
             func reasoningItem(_ text: String, status: String) -> [String: Any] {
                 ["type": "reasoning", "id": rsID, "status": status, "summary": [],
                  "content": text.isEmpty && status == "in_progress" ? [] : [["type": "reasoning_text", "text": text]]]
+            }
+            func callItem(_ c: ToolCall, status: String) -> [String: Any] {
+                ["type": "function_call", "id": "fc_" + Self.randomID(32), "call_id": c.id, "name": c.name,
+                 "arguments": status == "completed" ? c.arguments : "", "status": status]
             }
             func messageItem(_ text: String?, status: String) -> [String: Any] {
                 ["type": "message", "id": msgID, "status": status, "role": "assistant",
@@ -778,7 +981,10 @@ public final class OpenAIServer: @unchecked Sendable {
                 let incomplete = out.finish == "length"
                 var output: [[String: Any]] = []
                 if !out.reasoning.isEmpty { output.append(reasoningItem(out.reasoning, status: "completed")) }
-                output.append(messageItem(out.content, status: incomplete ? "incomplete" : "completed"))
+                if !out.content.isEmpty || out.toolCalls.isEmpty {
+                    output.append(messageItem(out.content, status: incomplete ? "incomplete" : "completed"))
+                }
+                output += out.toolCalls.map { callItem($0, status: "completed") }
                 conn.sendResponse(status: 200, json: response(status: incomplete ? "incomplete" : "completed",
                                                               output: output, usage: Self.responsesUsage(out),
                                                               incomplete: incomplete))
@@ -853,12 +1059,26 @@ public final class OpenAIServer: @unchecked Sendable {
                 }
                 guard alive, !out.aborted, !conn.isClosed else { conn.close(); return 499 }
                 let incomplete = out.finish == "length"
-                if await openMessage(), let idx = messageIndex {
+                if messageIndex == nil, !out.toolCalls.isEmpty { _ = await closeReasoning() }
+                if messageIndex != nil || out.toolCalls.isEmpty, await openMessage(), let idx = messageIndex {
                     let part: [String: Any] = ["type": "output_text", "text": messageText, "annotations": [], "logprobs": []]
                     let item = messageItem(messageText, status: incomplete ? "incomplete" : "completed")
                     output.append(item)
                     _ = await event("response.output_text.done", ["item_id": msgID, "output_index": idx, "content_index": 0, "text": messageText, "logprobs": []])
                     _ = await event("response.content_part.done", ["item_id": msgID, "output_index": idx, "content_index": 0, "part": part])
+                    _ = await event("response.output_item.done", ["output_index": idx, "item": item])
+                }
+                for c in out.toolCalls {
+                    let idx = output.count
+                    var item = callItem(c, status: "in_progress")
+                    let itemID = item["id"] as? String ?? ""
+                    _ = await event("response.output_item.added", ["output_index": idx, "item": item])
+                    _ = await event("response.function_call_arguments.delta", ["item_id": itemID, "output_index": idx, "delta": c.arguments])
+                    _ = await event("response.function_call_arguments.done", ["item_id": itemID, "output_index": idx,
+                                                                              "name": c.name, "arguments": c.arguments])
+                    item["arguments"] = c.arguments
+                    item["status"] = "completed"
+                    output.append(item)
                     _ = await event("response.output_item.done", ["output_index": idx, "item": item])
                 }
                 _ = await event(incomplete ? "response.incomplete" : "response.completed", [
@@ -886,6 +1106,10 @@ public final class OpenAIServer: @unchecked Sendable {
         let stops: [String]
         let enableThinking: Bool
         let splitReasoning: Bool
+        var tools: ToolRequest? = nil
+        /// Call opener the reply continues (`required` / named `tool_choice`).
+        var prefill: String? = nil
+        var format: ChatFormat = .chatML
     }
 
     enum Delta { case reasoning(String), content(String) }
@@ -893,6 +1117,7 @@ public final class OpenAIServer: @unchecked Sendable {
     struct Outcome {
         var reasoning = ""
         var content = ""
+        var toolCalls: [ToolCall] = []
         var stats = GenerationStats()
         var finish = "stop"
         var reasoningEvents = 0
@@ -937,10 +1162,15 @@ public final class OpenAIServer: @unchecked Sendable {
     /// `onDelta` returns false when the client is gone; generation is then cancelled.
     private func run(_ job: Job, token: CancelToken, onDelta: (Delta) async -> Bool) async throws -> Outcome {
         let events = job.chat
-            ? engine.chat(job.messages, parameters: job.params, enableThinking: job.enableThinking, token: token)
+            ? engine.chat(job.messages, parameters: job.params, enableThinking: job.prefill == nil && job.enableThinking,
+                          tools: job.tools, prefill: job.prefill,
+                          constrainToolNames: job.tools?.choice == .required && job.prefill != nil ? job.tools?.tools.map(\.name) : nil,
+                          token: token)
             : engine.complete(job.prompt, parameters: job.params, token: token)
-        var splitter = ReasoningSplitter(enabled: job.splitReasoning)
+        var splitter = ReasoningSplitter(enabled: job.splitReasoning && job.prefill == nil)
         var filter = StopFilter(stops: job.stops)
+        // Holds back text that may be a tool call until the reply ends (see ToolStreamGate).
+        var gate = (job.tools?.active ?? false) ? ToolStreamGate(format: job.format, prefill: job.prefill) : nil
         var out = Outcome()
         var stopped = false
         var alive = true
@@ -949,6 +1179,7 @@ public final class OpenAIServer: @unchecked Sendable {
             var hit = false
             if final { let (x, h) = filter.feed(c); c = x + (h ? "" : filter.flush()); hit = h }
             else { (c, hit) = filter.feed(c) }
+            if gate != nil { c = gate!.feed(c) }
             if !r.isEmpty {
                 out.reasoning += r
                 out.reasoningEvents += 1
@@ -988,8 +1219,25 @@ public final class OpenAIServer: @unchecked Sendable {
             let (r, c) = splitter.flush()
             alive = await emit(r, c, final: true)
         }
-        out.aborted = !alive
         out.finish = stopped ? "stop" : Self.finishReason(out.stats.stopReason)
+        if alive, var g = gate, let tools = job.tools {
+            let (rest, calls, parsed) = g.finish(tools: tools.tools)
+            if parsed {
+                out.toolCalls = tools.parallelCalls ? calls : Array(calls.prefix(1))
+                out.finish = "tool_calls"
+            } else if job.prefill != nil, out.finish != "length" {
+                // The reply had to be a call (tool_choice required or a named function). A call cut
+                // off by max_tokens is reported like any truncated reply (finish_reason "length").
+                let excerpt = rest.count > 300 ? String(rest.prefix(300)) + "…" : rest
+                throw APIError(status: 500, message: "The model did not produce a valid call to a defined tool "
+                               + "(finish reason: \(out.finish)). Model output: \(excerpt)", type: "server_error", code: "tool_call_failed")
+            }
+            if !rest.isEmpty {
+                out.content += rest
+                alive = await onDelta(.content(rest))
+            }
+        }
+        out.aborted = !alive
         return out
     }
 
@@ -1147,6 +1395,7 @@ struct APIError: Error {
 /// Typed accessors over a decoded JSON object body.
 struct JSONBody {
     let raw: [String: Any]
+    let data: Data
 
     init(_ data: Data) throws {
         guard !data.isEmpty else { throw APIError.invalid("Request body is empty; expected a JSON object") }
@@ -1154,6 +1403,19 @@ struct JSONBody {
             throw APIError.invalid("Request body must be a valid JSON object")
         }
         raw = d
+        self.data = data
+    }
+
+    /// The body parsed with object key order kept (tool definitions are rendered in the
+    /// client's order, as the models' templates do). Nesting is capped.
+    func ordered() throws -> JSONValue {
+        do {
+            return try JSONValue.parse(String(decoding: data, as: UTF8.self), maxDepth: 256)
+        } catch JSONValue.ParseError.tooDeep {
+            throw APIError.invalid("Request JSON is nested too deeply")
+        } catch {
+            throw APIError.invalid("Request body must be a valid JSON object")
+        }
     }
 
     func has(_ k: String) -> Bool { raw[k] != nil && !(raw[k] is NSNull) }
