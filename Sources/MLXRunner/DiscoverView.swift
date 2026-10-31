@@ -1,3 +1,4 @@
+import AppKit
 import MLXEngine
 import SwiftUI
 
@@ -11,17 +12,18 @@ struct DiscoverView: View {
     @State private var error: String?
     @State private var supportedOnly = true
     @State private var searchTask: Task<Void, Never>?
+    /// Share of the Discover area the model list takes; the user can drag the divider.
+    @AppStorage("discoverListFraction") private var listFraction = 0.4
 
     var body: some View {
-        HSplitView {
+        ResizableSplit(fraction: $listFraction, leadingMin: 380, trailingMin: 400) {
             VStack(spacing: 0) {
                 header
                 if query.isEmpty { RecommendedStrip(selected: $selected) }
                 Divider()
                 list
             }
-            .frame(minWidth: 340, idealWidth: 420)
-
+        } trailing: {
             Group {
                 if let id = selected {
                     ModelDetailView(repo: id).id(id)
@@ -37,7 +39,7 @@ struct DiscoverView: View {
                     }
                 }
             }
-            .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .navigationTitle("Discover")
         .task { await search() }
@@ -66,8 +68,9 @@ struct DiscoverView: View {
                 .onChange(of: sort) { _, _ in Task { await search() } }
                 Toggle("Runnable only", isOn: $supportedOnly)
                     .toggleStyle(.switch).controlSize(.mini)
-                Spacer()
-                Text("\(visible.count) models").font(.caption).foregroundStyle(.secondary)
+                    .fixedSize()
+                Spacer(minLength: 8)
+                Text("\(visible.count) models").font(.caption).foregroundStyle(.secondary).fixedSize()
             }
         }
         .padding(12)
@@ -303,5 +306,58 @@ struct ModelDetailView: View {
             return lines[(end + 1)...].joined(separator: "\n")
         }
         return s
+    }
+}
+
+/// Two panes with a draggable divider. Unlike HSplitView (NSSplitView), the split is a fraction of
+/// the available width, so it doesn't depend on the size the window happened to open at and keeps
+/// its proportion as the window resizes. Each pane keeps its minimum width.
+struct ResizableSplit<Leading: View, Trailing: View>: View {
+    @Binding var fraction: Double
+    let leadingMin: CGFloat
+    let trailingMin: CGFloat
+    @ViewBuilder let leading: Leading
+    @ViewBuilder let trailing: Trailing
+    @State private var dragStart: CGFloat?
+
+    var body: some View {
+        GeometryReader { geo in
+            let total = geo.size.width
+            let width = leadingWidth(total)
+            HStack(spacing: 0) {
+                leading.frame(width: width)
+                Divider()
+                    .overlay {
+                        // A wider, invisible grab area centred on the 1 pt line.
+                        Color.clear
+                            .frame(width: 8)
+                            .contentShape(Rectangle())
+                            .onHover { inside in
+                                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                            }
+                            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                                .onChanged { g in
+                                    let start = dragStart ?? width
+                                    dragStart = start
+                                    let proposed = start + g.translation.width
+                                    if total > 0 { fraction = Double(proposed / total) }
+                                }
+                                .onEnded { _ in
+                                    dragStart = nil
+                                    // Store the clamped value, not wherever the pointer went.
+                                    if total > 0 { fraction = Double(leadingWidth(total) / total) }
+                                })
+                    }
+                trailing.frame(maxWidth: .infinity)
+            }
+        }
+        .frame(minWidth: leadingMin + trailingMin + 1)
+    }
+
+    private func leadingWidth(_ total: CGFloat) -> CGFloat {
+        // The stored fraction comes from user defaults: fall back to 40% if it isn't sane.
+        let f = fraction.isFinite && fraction > 0 && fraction < 1 ? fraction : 0.4
+        let upper = max(leadingMin, total - trailingMin - 1)
+        return min(max(total * f, leadingMin), upper)
     }
 }

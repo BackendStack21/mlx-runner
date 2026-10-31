@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2
+
+- Discover: the model list takes 40% of the area (at least 380 pt, detail at least 400) instead of whatever width the split view started with, which left it squeezed in large windows. The divider is still draggable and its position is remembered.
+- Discover: "Runnable only" and the model count stay on one line in narrow windows.
+
 ## 1.0.1
 
 - The window opens at 1280×820 on first launch instead of at its minimum width, which squeezed the Discover screen and the chat.
