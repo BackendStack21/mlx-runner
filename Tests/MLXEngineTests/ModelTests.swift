@@ -12,6 +12,8 @@ func installedModel(_ repo: String) -> URL? {
 struct ModelTests {
     static let qwen3 = "mlx-community/Qwen3-0.6B-4bit"
     static let llama = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+    static let phi = "mlx-community/Phi-3.5-mini-instruct-4bit"
+    static let mistral = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
 
     @Test(.enabled(if: installedModel(qwen3) != nil))
     func qwenTokenizerKnownIdsAndRoundTrip() throws {
@@ -32,7 +34,7 @@ struct ModelTests {
 
     /// Prefill (GEMM + flash attention) and token-by-token decode (matvec + decode attention)
     /// must produce the same next-token distribution.
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama])
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral])
     func prefillMatchesIncrementalDecode(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let model = try Transformer(directory: dir, contextLength: 1024)

@@ -243,9 +243,9 @@ public final class Transformer {
     private let ids: MTLBuffer
     private let h: MTLBuffer
     let xn: MTLBuffer
-    private let qkvBuf: MTLBuffer
-    private let attnBuf: MTLBuffer
-    private let guBuf: MTLBuffer
+    let qkvBuf: MTLBuffer
+    let attnBuf: MTLBuffer
+    let guBuf: MTLBuffer
     let mlpBuf: MTLBuffer
     let tmp: MTLBuffer
     let logits: MTLBuffer
@@ -376,7 +376,7 @@ public final class Transformer {
             enc.set(layer.vCache, 0, 2)
             enc.set(attnBuf, 0, 3)
             enc.params(AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(qkvCols),
-                                  maxSeq: Int32(maxSeq), offset: Int32(offset), scale: 1 / Float(D).squareRoot(),
+                                  maxSeq: Int32(maxSeq), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor / Float(D).squareRoot(),
                                   outStride: Int32(nH * D), T: Int32(T)), 4)
             enc.dispatchThreadgroups(MTLSize(width: nH, height: decode ? 1 : (T + prefillQB - 1) / prefillQB, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: attnThreads, height: 1, depth: 1))
@@ -450,6 +450,16 @@ extension Transformer {
         out += String(format: "down_proj matvec: %.1f us  (~%.0f GB/s)\n", tDown * 1e6, downBytes / tDown / 1e9)
         let tAdd = time(500) { enc in self.add(enc, tmp, xn, H) }
         out += String(format: "tiny dependent dispatch: %.1f us\n", tAdd * 1e6)
+        // Prefill composition at T = 512: all projection GEMMs of one layer.
+        let T = 512, I = config.intermediateSize
+        let tGemm = time(10) { enc in
+            for q in l0.qkv { q.encode(enc, x: self.xn, xStride: H, y: self.qkvBuf, yStride: q.outDim, T: T) }
+            l0.o.encode(enc, x: self.attnBuf, xStride: l0.o.inDim, y: self.tmp, yStride: H, T: T)
+            for g in l0.gateUp { g.encode(enc, x: self.xn, xStride: H, y: self.guBuf, yStride: g.outDim, T: T) }
+            l0.down.encode(enc, x: self.mlpBuf, xStride: I, y: self.tmp, yStride: H, T: T)
+        }
+        let flops = 2.0 * Double(T) * Double(l0.qkv.reduce(0) { $0 + $1.outDim * H } + l0.o.outDim * l0.o.inDim + l0.gateUp.reduce(0) { $0 + $1.outDim * H } + H * I)
+        out += String(format: "layer GEMMs at T=512: %.2f ms (%.2f TFLOPS) x %d layers = %.0f ms\n", tGemm * 1000, flops / tGemm / 1e12, layers.count, tGemm * 1000 * Double(layers.count))
         return out
     }
 }

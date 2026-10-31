@@ -285,14 +285,17 @@ public final class InferenceEngine: @unchecked Sendable {
         let tGen = Date()
         stats.stopReason = "length"
         let maxNew = min(parameters.maxTokens, model.maxSeq - tokens.count)
+        var atStart = true
         for _ in 0..<max(0, maxNew) {
             if token.isCancelled { stats.stopReason = "cancelled"; break }
             let window = history.suffix(parameters.repetitionWindow)
             let next = sampler.sample(logits, count: min(model.vocabSize, tok.vocabularySize), recent: window)
             if stopIds.contains(next) { stats.stopReason = "stop"; break }
             stats.generatedTokens += 1
-            let text = decoder.append(tok.bytes(for: next))
-            if !text.isEmpty { emit(.text(text)) }
+            var text = decoder.append(tok.bytes(for: next))
+            // SentencePiece models start the reply with a word-boundary space.
+            if atStart, tok.mode == .sentencePiece { text = String(text.drop(while: { $0 == " " })) }
+            if !text.isEmpty { atStart = false; emit(.text(text)) }
             history.append(next)
             if history.count >= model.maxSeq { stats.stopReason = "context"; break }
             logits = try model.forward([Int32(next)], offset: history.count - 1)

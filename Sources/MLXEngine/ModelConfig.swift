@@ -27,6 +27,7 @@ public struct ModelConfig {
     public var ropeScaling: [String: Any]?
     public var tieWordEmbeddings: Bool
     public var maxPositionEmbeddings: Int
+    public var originalMaxPosition: Int
     public var eosTokenIds: [Int]
     public var bits: Int?
     public var groupSize: Int?
@@ -65,6 +66,7 @@ public struct ModelConfig {
         ropeScaling = obj["rope_scaling"] as? [String: Any]
         tieWordEmbeddings = (obj["tie_word_embeddings"] as? Bool) ?? false
         maxPositionEmbeddings = int("max_position_embeddings") ?? 4096
+        originalMaxPosition = int("original_max_position_embeddings") ?? maxPositionEmbeddings
 
         var eos: [Int] = []
         if let e = obj["eos_token_id"] as? NSNumber { eos.append(e.intValue) }
@@ -103,9 +105,23 @@ public struct ModelConfig {
                 }
             } else if type == "linear" {
                 freqs = freqs.map { $0 / factor }
+            } else if type == "longrope" || type == "su", let long = rs["long_factor"] as? [NSNumber], long.count == half {
+                // Phi-3 LongRoPE (matches mlx-lm SuScaledRotaryEmbedding: long factors always).
+                freqs = zip(freqs, long).map { $0 / $1.doubleValue }
             }
         }
         return freqs.map { Float($0) }
+    }
+
+    /// Multiplier applied to q and k by scaled RoPE variants (LongRoPE), folded into the attention scale.
+    var ropeAttentionFactor: Float {
+        guard let rs = ropeScaling else { return 1 }
+        let type = (rs["rope_type"] as? String) ?? (rs["type"] as? String) ?? ""
+        guard type == "longrope" || type == "su" else { return 1 }
+        if let m = (rs["long_mscale"] as? NSNumber)?.floatValue { return m }
+        let orig = (rs["original_max_position_embeddings"] as? NSNumber)?.floatValue ?? Float(originalMaxPosition)
+        let scale = Float(maxPositionEmbeddings) / orig
+        return scale <= 1 ? 1 : (1 + log(scale) / log(orig)).squareRoot()
     }
 
     var rotaryDim: Int { Int(Float(headDim) * partialRotaryFactor) / 2 * 2 }

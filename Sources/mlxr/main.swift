@@ -59,7 +59,9 @@ case "download":
     if !details.isSupported { print("warning: \(details.modelType ?? "unknown") architecture is not supported by the engine") }
     print("Downloading \(repo) (\(formatBytes(details.downloadSize)))")
     let dl = ModelDownload(details: details, destination: ModelStore.directory(for: repo))
+    let last = LockedDate()
     dl.onProgress = { p, done, total, speed in
+        guard last.elapsed(0.25) || p >= 1 else { return }
         print(String(format: "\r  %5.1f%%  %@ / %@  %@/s   ", p * 100, formatBytes(Int(done)), formatBytes(Int(total)), formatBytes(Int(speed))), terminator: "")
     }
     let dir = try await dl.start()
@@ -150,4 +152,16 @@ case "bench":
 
 default:
     fail("unknown command \(cmd)")
+}
+
+/// Rate limiter for progress output.
+final class LockedDate: @unchecked Sendable {
+    private var date = Date.distantPast
+    private let lock = NSLock()
+    func elapsed(_ s: TimeInterval) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard Date().timeIntervalSince(date) >= s else { return false }
+        date = Date()
+        return true
+    }
 }
