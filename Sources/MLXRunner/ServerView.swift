@@ -228,7 +228,7 @@ struct ServerView: View {
                 .frame(width: 44)
                 .padding(.vertical, 3)
                 .background(method == "GET" ? Theme.accent2 : Theme.accent, in: RoundedRectangle(cornerRadius: 5))
-            Text("http://localhost:\(server.port)\(path)").font(.system(size: 12.5, design: .monospaced)).textSelection(.enabled)
+            Text(verbatim: "http://localhost:\(String(server.port))\(path)").font(.system(size: 12.5, design: .monospaced)).textSelection(.enabled)
         }
     }
 }
