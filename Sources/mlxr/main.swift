@@ -55,17 +55,23 @@ case "search":
 
 case "download":
     guard let repo = args.first else { fail("usage: mlxr download <org/repo>") }
+    guard RepoID.isValid(repo) else { fail("invalid repo id: \(repo) (expected owner/name)") }
     let details = try await HubClient.details(repo)
     if !details.isSupported { print("warning: \(details.modelType ?? "unknown") architecture is not supported by the engine") }
     print("Downloading \(repo) (\(formatBytes(details.downloadSize)))")
-    let dl = ModelDownload(details: details, destination: ModelStore.directory(for: repo))
+    let dl = ModelDownload(details: details, destination: try ModelStore.directory(for: repo))
     let last = LockedDate()
     dl.onProgress = { p, done, total, speed in
         guard last.elapsed(0.25) || p >= 1 else { return }
         print(String(format: "\r  %5.1f%%  %@ / %@  %@/s   ", p * 100, formatBytes(Int(done)), formatBytes(Int(total)), formatBytes(Int(speed))), terminator: "")
     }
-    let dir = try await dl.start()
-    print("\nSaved to \(dir.path)")
+    dl.onEvent = { print("\n  \($0)") }
+    do {
+        let dir = try await dl.start()
+        print("\nSaved to \(dir.path)")
+    } catch {
+        fail("\ndownload failed: \(error.localizedDescription)")
+    }
 
 case "list":
     for m in ModelStore.scan() {
@@ -98,6 +104,7 @@ case "run":
     params.maxTokens = maxTokens
     params.repetitionPenalty = 1.0
     params.seed = 42
+    if flag("--spec") { params.speculative = true }
     let stream = raw ? engine.complete(prompt, parameters: params)
         : engine.chat([ChatMessage(role: .user, content: prompt)], parameters: params, enableThinking: !noThink)
     if showIds {
@@ -110,7 +117,7 @@ case "run":
             print(String(format: "[prompt: %d tokens, %.0f tok/s, ttft %.3fs]", s.promptTokens, s.promptTokensPerSecond, s.timeToFirstToken))
         case .text(let t): print(t, terminator: "")
         case .finished(let s):
-            print(String(format: "\n[generated %d tokens at %.1f tok/s, stop: %@]", s.generatedTokens, s.tokensPerSecond, s.stopReason))
+            print(String(format: "\n[generated %d tokens at %.1f tok/s, stop: %@, drafts accepted %d/%d]", s.generatedTokens, s.tokensPerSecond, s.stopReason, s.acceptedDraftTokens ?? 0, s.draftTokens ?? 0))
         }
     }
 
@@ -149,6 +156,19 @@ case "bench":
         for i in 0..<steps { _ = try t.forward([Int32(500 + i)], offset: ctx + i); gpu += t.lastGPUTime }
         let dt = Date().timeIntervalSince(s)
         print(String(format: "decode @%4d: %6.1f tok/s  (wall %.2f ms, gpu %.2f ms per token)", ctx, Double(steps) / dt, dt / Double(steps) * 1000, gpu / Double(steps) * 1000))
+    }
+    // Speculative verification cost: one forward over T tokens with logits for every row.
+    for T in 1...Transformer.maxVerifyTokens {
+        let steps = 32
+        let s = Date()
+        for i in 0..<steps { _ = try t.forward((0..<T).map { Int32(600 + $0 + i) }, offset: 64, allLogits: true) }
+        let dt = Date().timeIntervalSince(s) / Double(steps)
+        print(String(format: "verify T=%d: %6.2f ms per pass (%5.2f ms per token)", T, dt * 1000, dt * 1000 / Double(T)))
+    }
+    for T in [5, 8, 12, 15] {
+        let s = Date()
+        for i in 0..<8 { _ = try t.forward((0..<T).map { Int32(600 + $0 + i) }, offset: 64) }
+        print(String(format: "prefill T=%d: %6.2f ms", T, Date().timeIntervalSince(s) / 8 * 1000))
     }
 
 default:

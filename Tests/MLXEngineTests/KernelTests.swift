@@ -131,7 +131,7 @@ struct MatmulKernelTests {
         for gs in [32, 64, 128] {
             for scaleType in [DType.f16, .bf16] {
                 let fx = try QuantFixture(O: O, K: K, bits: bits, gs: gs, scaleType: scaleType)
-                for T in [1, 5, 33] {   // decode (qmv), small batch (qmm), prefill tiles (qgemm)
+                for T in [1, 2, 3, 4, 5, 33] {   // decode (qmv), small batch (qmm), prefill tiles (qgemm)
                     var rng = RNG(s: UInt64(T * 31 + bits))
                     let x = (0..<(T * K)).map { _ in rng.float() }
                     let xb = makeBuffer(x)

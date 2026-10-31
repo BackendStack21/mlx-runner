@@ -9,6 +9,9 @@ public struct SamplingParameters: Codable, Hashable, Sendable {
     public var repetitionWindow: Int = 64
     public var maxTokens: Int = 4096
     public var seed: UInt64? = nil
+    /// Speculative decoding with prompt-lookup drafts (nil = off). Output is unchanged; it pays
+    /// off only once a verify pass costs well under k decode steps (see README).
+    public var speculative: Bool? = nil
     public init() {}
 }
 
@@ -20,6 +23,9 @@ public struct GenerationStats: Sendable, Hashable, Codable {
     public var promptTokensPerSecond: Double = 0
     public var tokensPerSecond: Double = 0
     public var stopReason: String = ""
+    /// Speculative decoding: drafted tokens and how many the model accepted.
+    public var draftTokens: Int? = nil
+    public var acceptedDraftTokens: Int? = nil
     public init() {}
 }
 
@@ -58,7 +64,10 @@ struct Sampler {
     var params: SamplingParameters
     var rng: XorShift
 
-    mutating func sample(_ logits: UnsafeMutablePointer<Float>, count: Int, recent: ArraySlice<Int>) -> Int {
+    /// The final sampling distribution after the repetition penalty, temperature and
+    /// top-k / top-p / min-p filters (descending probability). Greedy decoding gives a
+    /// single candidate. Returns nil for non-finite logits.
+    mutating func distribution(_ logits: UnsafeMutablePointer<Float>, count: Int, recent: ArraySlice<Int>) -> [(id: Int, p: Float)]? {
         if params.repetitionPenalty != 1, !recent.isEmpty {
             let p = params.repetitionPenalty
             for t in Set(recent) where t >= 0 && t < count {
@@ -69,7 +78,7 @@ struct Sampler {
             var best = 0
             var bestV = -Float.infinity
             for i in 0..<count where logits[i] > bestV { bestV = logits[i]; best = i }
-            return bestV.isFinite ? best : -1
+            return bestV.isFinite ? [(id: best, p: Float(1))] : nil
         }
         // Top-k candidates by partial selection (k capped to keep this O(V)).
         let k = params.topK > 0 ? min(params.topK, count) : min(512, count)
@@ -82,7 +91,6 @@ struct Sampler {
                 cand.append((i, v))
                 if cand.count == k { cand.sort { $0.1 > $1.1 }; minV = cand[k - 1].1 }
             } else if v > minV {
-                // insert keeping descending order
                 var lo = 0, hi = k - 1
                 while lo < hi { let mid = (lo + hi) / 2; if cand[mid].1 >= v { lo = mid + 1 } else { hi = mid } }
                 cand.insert((i, v), at: lo)
@@ -93,10 +101,9 @@ struct Sampler {
         if cand.count < k { cand.sort { $0.1 > $1.1 } }
         let invT = 1 / params.temperature
         let maxV = cand[0].1
-        guard maxV.isFinite else { return -1 }  // NaN or infinite logits
+        guard maxV.isFinite else { return nil }  // NaN or infinite logits
         var probs = cand.map { exp(($0.1 - maxV) * invT) }
         var total = probs.reduce(0, +)
-        // min-p and top-p filtering
         var cut = probs.count
         if params.minP > 0 {
             let threshold = params.minP * probs[0]
@@ -109,14 +116,61 @@ struct Sampler {
                 if acc >= params.topP { cut = i + 1; break }
             }
         }
-        probs = Array(probs[0..<max(1, cut)])
-        total = probs.reduce(0, +)
-        var r = Float.random(in: 0..<1, using: &rng) * total
-        for (i, p) in probs.enumerated() {
-            r -= p
-            if r <= 0 { return cand[i].0 }
+        cut = max(1, cut)
+        total = probs[0..<cut].reduce(0, +)
+        return (0..<cut).map { (cand[$0].0, probs[$0] / total) }
+    }
+
+    mutating func draw(_ dist: [(id: Int, p: Float)]) -> Int {
+        var r = Float.random(in: 0..<1, using: &rng)
+        for c in dist {
+            r -= c.p
+            if r <= 0 { return c.id }
         }
-        return cand[probs.count - 1].0
+        return dist[dist.count - 1].id
+    }
+
+    mutating func sample(_ logits: UnsafeMutablePointer<Float>, count: Int, recent: ArraySlice<Int>) -> Int {
+        guard let d = distribution(logits, count: count, recent: recent) else { return -1 }
+        return draw(d)
+    }
+
+    /// Exact speculative acceptance for a deterministic draft: accept `draft` with
+    /// probability p(draft), otherwise draw from p with the draft removed. The output
+    /// distribution is identical to sampling from p directly (and to argmax when greedy).
+    mutating func verify(_ dist: [(id: Int, p: Float)], draft: Int) -> (accepted: Bool, token: Int) {
+        let pd = dist.first(where: { $0.id == draft })?.p ?? 0
+        if pd >= 1 || (pd > 0 && Float.random(in: 0..<1, using: &rng) < pd) { return (true, draft) }
+        let rest = dist.filter { $0.id != draft }
+        let total = rest.reduce(Float(0)) { $0 + $1.p }
+        guard total > 0 else { return (true, draft) }
+        return (false, draw(rest.map { ($0.id, $0.p / total) }))
+    }
+}
+
+/// Prompt-lookup drafting: if the last few generated tokens already occurred in the
+/// context, propose the tokens that followed them. Free to compute, and very effective
+/// when the answer quotes or edits the prompt (code, documents, RAG).
+enum NGramDraft {
+    static func propose(_ history: [Int], maxTokens: Int, maxNGram: Int = 3, minNGram: Int = 2, searchWindow: Int = 8192) -> [Int] {
+        guard maxTokens > 0 else { return [] }
+        let n = history.count
+        let lo = max(0, n - searchWindow)
+        for g in stride(from: maxNGram, through: minNGram, by: -1) where n > g {
+            let tail = n - g
+            var i = tail - 1
+            while i >= lo {
+                var match = true
+                for j in 0..<g where history[i + j] != history[tail + j] { match = false; break }
+                if match {
+                    let start = i + g
+                    let end = min(start + maxTokens, n)
+                    if end > start { return Array(history[start..<end]) }
+                }
+                i -= 1
+            }
+        }
+        return []
     }
 }
 
@@ -337,27 +391,72 @@ public final class InferenceEngine: @unchecked Sendable {
         let tGen = Date()
         stats.stopReason = "length"
         let maxNew = min(parameters.maxTokens, model.maxSeq - tokens.count)
+        let vocab = model.vocabSize
+        let count = min(vocab, tok.vocabularySize)
         var atStart = true
-        for _ in 0..<max(0, maxNew) {
-            if token.isCancelled { stats.stopReason = "cancelled"; break }
-            let window = history.suffix(parameters.repetitionWindow)
-            let next = sampler.sample(logits, count: min(model.vocabSize, tok.vocabularySize), recent: window)
-            guard next >= 0 else { throw EngineError.invalidOutput("non-finite logits") }
-            if stopIds.contains(next) { stats.stopReason = "stop"; break }
+        var drafted = 0, acceptedDrafts = 0
+        // Speculative decoding (prompt lookup): verifying k drafted tokens costs one batched
+        // pass, so every accepted draft is a token generated without its own weight read.
+        let speculative = (parameters.speculative ?? false) && model.supportsBatchedVerify
+        var draftLen = 4
+
+        /// Emits a sampled token. Returns false when generation must stop.
+        func accept(_ t: Int) -> Bool {
+            if stopIds.contains(t) { stats.stopReason = "stop"; return false }
             stats.generatedTokens += 1
-            var text = decoder.append(tok.bytes(for: next))
+            var text = decoder.append(tok.bytes(for: t))
             // SentencePiece models start the reply with a word-boundary space.
             if atStart, tok.mode == .sentencePiece { text = String(text.drop(while: { $0 == " " })) }
             if !text.isEmpty { atStart = false; emit(.text(text)) }
-            history.append(next)
-            if history.count >= model.maxSeq { stats.stopReason = "context"; break }
-            logits = try model.forward([Int32(next)], offset: history.count - 1)
+            history.append(t)
+            if stats.generatedTokens >= maxNew { stats.stopReason = "length"; return false }
+            if history.count >= model.maxSeq { stats.stopReason = "context"; return false }
+            return true
+        }
+        func dist(_ row: UnsafeMutablePointer<Float>) throws -> [(id: Int, p: Float)] {
+            guard let d = sampler.distribution(row, count: count, recent: history.suffix(parameters.repetitionWindow)) else {
+                throw EngineError.invalidOutput("non-finite logits")
+            }
+            return d
+        }
+
+        // Invariant: `history.last` (the pending token) is not yet in the KV cache;
+        // everything before it is, and `cachedTokens` mirrors exactly that.
+        var running = maxNew > 0 && !token.isCancelled
+        if running { running = accept(sampler.draw(try dist(logits))) }
+        while running {
+            if token.isCancelled { stats.stopReason = "cancelled"; break }
+            let pending = history[history.count - 1]
+            let room = min(maxNew - stats.generatedTokens, model.maxSeq - history.count) - 1
+            let draft = speculative ? NGramDraft.propose(history, maxTokens: min(draftLen, room, Transformer.maxVerifyTokens - 1)) : []
+            if draft.isEmpty {
+                logits = try model.forward([Int32(pending)], offset: history.count - 1)
+                cachedTokens = history
+                running = accept(sampler.draw(try dist(logits)))
+                continue
+            }
+            let rows = try model.forward(([pending] + draft).map { Int32($0) }, offset: history.count - 1, allLogits: true)
             cachedTokens = history
+            drafted += draft.count
+            var accepted = 0
+            var corrected = false
+            for (i, d) in draft.enumerated() {
+                let (ok, t) = sampler.verify(try dist(rows + i * vocab), draft: d)
+                running = accept(t)
+                if ok { accepted += 1; if running { cachedTokens = history } }
+                else { corrected = true }
+                if !ok || !running { break }
+            }
+            acceptedDrafts += accepted
+            // Bonus token: every draft matched, so the last row predicts one more for free.
+            if running && !corrected { running = accept(sampler.draw(try dist(rows + draft.count * vocab))) }
+            draftLen = accepted == draft.count ? min(draftLen + 1, Transformer.maxVerifyTokens - 1) : max(1, accepted)
         }
         let rest = decoder.flush()
         if !rest.isEmpty { emit(.text(rest)) }
         let dt = Date().timeIntervalSince(tGen)
         stats.tokensPerSecond = Double(stats.generatedTokens) / max(dt, 1e-6)
+        if drafted > 0 { stats.draftTokens = drafted; stats.acceptedDraftTokens = acceptedDrafts }
         emit(.finished(stats))
     }
 }

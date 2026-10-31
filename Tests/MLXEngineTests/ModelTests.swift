@@ -168,4 +168,29 @@ struct ModelTests {
         // rstrip=true on the role tags and a Prepend("▁") normalizer applied to every segment.
         #expect(tok.encode("<|user|>\nHello there<|end|>\n<|assistant|>\n") == [32010, 15043, 727, 32007, 32001])
     }
+
+    @Test(.enabled(if: installedModel(qwen3) != nil))
+    func speculativeGreedyOutputIsIdentical() async throws {
+        let engine = InferenceEngine()
+        _ = try await engine.load(directory: installedModel(Self.qwen3)!, contextLength: 2048)
+        let code = "func fib(_ n: Int) -> Int {\n    if n < 2 { return n }\n    return fib(n - 1) + fib(n - 2)\n}"
+        let msgs = [ChatMessage(role: .user, content: "Repeat this Swift code exactly, then explain it in one line:\n\n\(code)")]
+        func run(_ spec: Bool) async throws -> (String, GenerationStats?) {
+            var p = SamplingParameters()
+            p.temperature = 0
+            p.maxTokens = 96
+            p.speculative = spec
+            var text = ""
+            var stats: GenerationStats?
+            for try await ev in engine.chat(msgs, parameters: p, enableThinking: false) {
+                if case .text(let t) = ev { text += t }
+                if case .finished(let s) = ev { stats = s }
+            }
+            return (text, stats)
+        }
+        let (plain, _) = try await run(false)
+        let (spec, stats) = try await run(true)
+        #expect(spec == plain)
+        #expect((stats?.acceptedDraftTokens ?? 0) > 10, "prompt lookup should accept drafts when copying")
+    }
 }

@@ -215,6 +215,79 @@ kernel void qmv(device const uchar* wA [[buffer(0)]],
     }
 }
 
+// Small-batch 4-bit matvec for speculative verification (2..TT tokens): each
+// weight chunk is loaded once and applied to every token, so verifying a few
+// draft tokens costs little more than decoding one. Same fused [A|B|C] layout.
+template <typename T, int TT, int R>
+kernel void qmvb4(device const uchar* wA [[buffer(0)]],
+                  device const T*     sA [[buffer(1)]],
+                  device const T*     bA [[buffer(2)]],
+                  device const float* x  [[buffer(3)]],
+                  device float*       y  [[buffer(4)]],
+                  constant MMParams&  p  [[buffer(5)]],
+                  device const uchar* wB [[buffer(6)]],
+                  device const T*     sB [[buffer(7)]],
+                  device const T*     bB [[buffer(8)]],
+                  device const uchar* wC [[buffer(9)]],
+                  device const T*     sC [[buffer(10)]],
+                  device const T*     bC [[buffer(11)]],
+                  device const T*     biasA [[buffer(12)]],
+                  device const T*     biasB [[buffer(13)]],
+                  device const T*     biasC [[buffer(14)]],
+                  uint2 tgid [[threadgroup_position_in_grid]],
+                  uint  sgid [[simdgroup_index_in_threadgroup]],
+                  uint  lane [[thread_index_in_simdgroup]]) {
+    const int gRow = (int(tgid.x) * QVNSG + int(sgid)) * R;
+    if (gRow >= p.O) return;
+    device const uchar* w; device const T* sc; device const T* bi; device const T* rb;
+    int rowBase;
+    if (gRow < p.o1) { w = wA; sc = sA; bi = bA; rb = biasA; rowBase = gRow; }
+    else if (gRow < p.o1 + p.o2) { w = wB; sc = sB; bi = bB; rb = biasB; rowBase = gRow - p.o1; }
+    else { w = wC; sc = sC; bi = bC; rb = biasC; rowBase = gRow - p.o1 - p.o2; }
+    const int nr = min(R, p.O - gRow);
+    const int nt = min(TT, p.T);
+    const ulong rowBytes = ulong(p.K) / 2;
+    const int gpr = p.K / p.gs;
+    float acc[R][TT];
+    for (int r = 0; r < R; r++) for (int t = 0; t < TT; t++) acc[r][t] = 0.0f;
+    device const uchar* wb = w + ulong(rowBase) * rowBytes;
+    device const T* sb = sc + rowBase * gpr;
+    device const T* bb = bi + rowBase * gpr;
+    const float4 sLo = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    const float4 sHi = sLo * (1.0f / 65536.0f);
+    const uint4 mLo = uint4(0xFu, 0xF0u, 0xF00u, 0xF000u);
+    const uint4 mHi = mLo << 16;
+    // 8 weights (one packed uint) per lane per step: the activations of every token
+    // fit in registers, and each weight is dequantised once and reused by all tokens.
+    for (int k = int(lane) * 8; k < p.K; k += 256) {
+        float4 xl[TT], xh[TT];
+        float xs[TT];
+        for (int t = 0; t < TT; t++) {
+            device const float4* xp = (device const float4*)(x + min(t, nt - 1) * p.xStride + k);
+            const float4 a = xp[0], b = xp[1];
+            xs[t] = dot(a + b, float4(1.0f));
+            xl[t] = a * sLo; xh[t] = b * sHi;
+        }
+        const int g = k / p.gs;
+        const ulong off = ulong(k) >> 1;
+        for (int r = 0; r < R; r++) {
+            const int rr = min(r, nr - 1);
+            const uint wv = *(device const uint*)(wb + ulong(rr) * rowBytes + off);
+            const float4 ql = float4(uint4(wv) & mLo), qh = float4(uint4(wv) & mHi);
+            const float s = float(sb[rr * gpr + g]), b = float(bb[rr * gpr + g]);
+            for (int t = 0; t < TT; t++)
+                acc[r][t] += s * (dot(ql, xl[t]) + dot(qh, xh[t])) + b * xs[t];
+        }
+    }
+    for (int r = 0; r < R; r++) {
+        for (int t = 0; t < TT; t++) {
+            const float v = simd_sum(acc[r][t]);
+            if (lane == 0 && r < nr && t < nt)
+                y[t * p.yStride + gRow + r] = v + (p.hasBias ? float(rb[rowBase + r]) : 0.0f);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Prefill path: tiled GEMM on simdgroup matrices. Y[T, O] = X[T, K] · W[O, K]ᵀ
 // Threadgroup tile: 32 tokens × 32 output rows, K-step 32, 4 simdgroups (2×2),
@@ -806,6 +879,11 @@ INST_QMM_ALL(4)
 INST_QMM_ALL(5)
 INST_QMM_ALL(6)
 INST_QMM_ALL(8)
+
+#define QVBR 4
+#define INST_QMVB(T, TN, TT) \
+  template [[host_name("qmvb4_" #TN "_" #TT)]] kernel void qmvb4<T, TT, QVBR>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const T*, device const uchar*, device const T*, device const T*, device const T*, device const T*, device const T*, uint2, uint, uint);
+INST_QMVB(half, f16, 4) INST_QMVB(bfloat, bf16, 4) INST_QMVB(float, f32, 4)
 
 #define INST_DENSE(T, TN) \
   template [[host_name("dmm_" #TN "_1")]] kernel void dmm<T, 1>(device const T*, device const float*, device float*, constant MMParams&, uint2, uint, uint); \

@@ -7,6 +7,7 @@ private let rowsPerThreadgroup = 8 // QROWS * QNSG
 private let qmvSimdgroups = 2 // QVNSG
 private let qmvRowsPerThreadgroup = 4 * qmvSimdgroups
 private let qmvThreads = 32 * qmvSimdgroups
+private let qmvbRowsPerSimdgroup = 4 // QVBR
 
 /// A linear layer, either MLX-quantized or dense.
 final class Linear {
@@ -22,6 +23,7 @@ final class Linear {
     private let psoN: MTLComputePipelineState          // small batches (2..<16 tokens)
     private var gemmPSO: MTLComputePipelineState?      // prefill tiles (simdgroup matrices)
     private(set) var qmvPSO: MTLComputePipelineState?  // fused decode kernel (bias folded in)
+    private(set) var qmvbPSO: MTLComputePipelineState?  // 4-bit, 2...4 tokens (speculative verification)
     private var biasPSO: MTLComputePipelineState?
     let description: String
 
@@ -64,6 +66,7 @@ final class Linear {
             let qmvAlign = bits == 4 ? 32 : 16  // the 4-bit fast path consumes 32 values per lane
             if inDim % qmvAlign == 0 && groupSize % qmvAlign == 0 && (bias == nil || bias?.dtype == s.dtype) {
                 qmvPSO = try gpu.pipeline("qmv_\(bits)_\(sfx)")
+                if bits == 4 { qmvbPSO = try gpu.pipeline("qmvb4_\(sfx)_4") }
             }
             if inDim % 32 == 0 { gemmPSO = try gpu.pipeline("qgemm_\(bits)_\(sfx)") }
             psoN = try gpu.pipeline("qmm_\(bits)_\(sfx)_\(prefillTT)")
@@ -93,11 +96,16 @@ final class Linear {
         }
     }
 
-    /// One dispatch computing [A | B | C] rows for a single token (T == 1).
+    /// The fused matvec kernels handle T tokens (1, or up to 8 for 4-bit weights).
+    static func canFuse(_ parts: [Linear], T: Int) -> Bool {
+        T == 1 ? parts.allSatisfy { $0.qmvPSO != nil } : (T <= Transformer.maxVerifyTokens && parts.allSatisfy { $0.qmvbPSO != nil })
+    }
+
+    /// One dispatch computing [A | B | C] rows for T tokens (T == 1, or up to maxVerifyTokens with 4-bit weights).
     static func encodeFusedDecode(_ enc: MTLComputeCommandEncoder, _ parts: [Linear], x: MTLBuffer, xOffset: Int = 0,
-                                  y: MTLBuffer, yOffset: Int = 0) {
+                                  xStride: Int = 0, y: MTLBuffer, yOffset: Int = 0, yStride: Int = 0, T: Int = 1) {
         let f = parts[0]
-        enc.setComputePipelineState(f.qmvPSO!)
+        enc.setComputePipelineState(T == 1 ? f.qmvPSO! : f.qmvbPSO!)
         for slot in 0..<3 {
             let p = parts[min(slot, parts.count - 1)]
             let base = slot == 0 ? 0 : 3 + slot * 3   // 0, 6, 9
@@ -109,21 +117,22 @@ final class Linear {
         enc.set(x, xOffset, 3)
         enc.set(y, yOffset, 4)
         let total = parts.reduce(0) { $0 + $1.outDim }
-        enc.params(MMParams(K: Int32(f.inDim), O: Int32(total), T: 1, gs: Int32(f.groupSize), xStride: 0, yStride: 0,
+        let rowsPerTG = T == 1 ? qmvRowsPerThreadgroup : qmvbRowsPerSimdgroup * qmvSimdgroups
+        enc.params(MMParams(K: Int32(f.inDim), O: Int32(total), T: Int32(T), gs: Int32(f.groupSize), xStride: Int32(xStride), yStride: Int32(yStride),
                             o1: Int32(parts[0].outDim), o2: Int32(parts.count > 1 ? parts[1].outDim : 0),
                             hasBias: f.bias != nil ? 1 : 0), 5)
-        enc.dispatchThreadgroups(MTLSize(width: (total + qmvRowsPerThreadgroup - 1) / qmvRowsPerThreadgroup, height: 1, depth: 1),
+        enc.dispatchThreadgroups(MTLSize(width: (total + rowsPerTG - 1) / rowsPerTG, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: qmvThreads, height: 1, depth: 1))
     }
 
     /// y[t, :outDim] (row stride yStride, starting at yOffset bytes) = x[t] · Wᵀ (+ bias)
     func encode(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, xOffset: Int = 0, xStride: Int,
                 y: MTLBuffer, yOffset: Int = 0, yStride: Int, T: Int) {
-        if T == 1, qmvPSO != nil {
-            Linear.encodeFusedDecode(enc, [self], x: x, xOffset: xOffset, y: y, yOffset: yOffset)
+        if Linear.canFuse([self], T: T) {
+            Linear.encodeFusedDecode(enc, [self], x: x, xOffset: xOffset, xStride: xStride, y: y, yOffset: yOffset, yStride: yStride, T: T)
             return
         }
-        let gemm = T >= 16 ? gemmPSO : nil
+        let gemm = T > Transformer.maxVerifyTokens ? gemmPSO : nil  // 5+ tokens: tiled GEMM beats the small-batch kernel
         let tt = T == 1 ? 1 : prefillTT
         enc.setComputePipelineState(gemm ?? (T == 1 ? pso1 : psoN))
         enc.set(weight, 0)
@@ -268,6 +277,9 @@ public final class Transformer {
     let mlpBuf: MTLBuffer
     let tmp: MTLBuffer
     let logits: MTLBuffer
+    /// Logits for every row of a small batch (speculative verification).
+    let logitsAll: MTLBuffer
+    public static let maxVerifyTokens = 4
     private let invFreq: MTLBuffer
 
     private let attnDecodePSO: (MTLComputePipelineState, Int)
@@ -280,6 +292,12 @@ public final class Transformer {
     public private(set) var lastGPUTime: Double = 0
     public var vocabSize: Int { lmHead.outDim }
     public var weightBytes: Int { store.totalBytes }
+    /// Every projection has the batched 4-bit kernel, so verifying a few tokens is cheap.
+    public var supportsBatchedVerify: Bool {
+        Linear.canFuse([lmHead], T: 2) && layers.allSatisfy { l in
+            Linear.canFuse(l.qkv, T: 2) && Linear.canFuse([l.o], T: 2) && Linear.canFuse(l.gateUp, T: 2) && Linear.canFuse([l.down], T: 2)
+        }
+    }
 
     public init(directory: URL, contextLength: Int) throws {
         let gpu = GPU.shared
@@ -313,6 +331,7 @@ public final class Transformer {
         mlpBuf = try gpu.buffer(B * I * 4)
         tmp = try gpu.buffer(B * H * 4)
         logits = try gpu.buffer(lmHead.outDim * 4)
+        logitsAll = try gpu.buffer(Self.maxVerifyTokens * lmHead.outDim * 4)
         let f = c.inverseFrequencies()
         invFreq = gpu.device.makeBuffer(bytes: f, length: max(16, f.count * 4), options: .storageModeShared)!
 
@@ -332,7 +351,10 @@ public final class Transformer {
 
     /// Runs `tokens` at positions offset..<offset+count, updating the KV cache.
     /// Returns a pointer to the logits of the last token (valid until the next call).
-    public func forward(_ tokens: [Int32], offset: Int, isCancelled: (() -> Bool)? = nil) throws -> UnsafeMutablePointer<Float> {
+    /// Runs the tokens at positions offset..<offset+count. Returns the last row's logits, or with
+    /// `allLogits` (count <= maxVerifyTokens) a row-major [count][vocab] block.
+    public func forward(_ tokens: [Int32], offset: Int, allLogits: Bool = false, isCancelled: (() -> Bool)? = nil) throws -> UnsafeMutablePointer<Float> {
+        guard !allLogits || tokens.count <= Self.maxVerifyTokens else { throw EngineError.invalidOutput("verify batch too large") }
         guard offset + tokens.count <= maxSeq else { throw EngineError.contextFull }
         let rows = embed.outDim
         guard tokens.allSatisfy({ $0 >= 0 && Int($0) < rows }) else {
@@ -343,13 +365,14 @@ public final class Transformer {
             if start > 0, isCancelled?() == true { throw EngineError.cancelled }
             let n = min(maxBatch, tokens.count - start)
             let last = start + n == tokens.count
-            try step(Array(tokens[start..<start + n]), offset: offset + start, computeLogits: last)
+            try step(Array(tokens[start..<start + n]), offset: offset + start, computeLogits: last, allLogits: allLogits)
             start += n
         }
+        if allLogits { return logitsAll.contents().bindMemory(to: Float.self, capacity: tokens.count * lmHead.outDim) }
         return logits.contents().bindMemory(to: Float.self, capacity: lmHead.outDim)
     }
 
-    private func step(_ tokens: [Int32], offset: Int, computeLogits: Bool) throws {
+    private func step(_ tokens: [Int32], offset: Int, computeLogits: Bool, allLogits: Bool = false) throws {
         let c = config
         let T = tokens.count
         let H = c.hiddenSize, D = c.headDim, I = c.intermediateSize
@@ -368,8 +391,8 @@ public final class Transformer {
         let (attn, attnThreads) = decode ? attnDecodePSO : attnPrefillPSO
         for (li, layer) in layers.enumerated() {
             // Attention block: [q|k|v] projection → norm/rope/cache → attention → o_proj
-            if decode && layer.qkvFusable {
-                Linear.encodeFusedDecode(enc, layer.qkv, x: xn, y: qkvBuf)
+            if layer.qkvFusable && Linear.canFuse(layer.qkv, T: T) {
+                Linear.encodeFusedDecode(enc, layer.qkv, x: xn, xStride: H, y: qkvBuf, yStride: qkvCols, T: T)
             } else if layer.qkv.count == 1 {
                 layer.qkv[0].encode(enc, x: xn, xStride: H, y: qkvBuf, yStride: qkvCols, T: T)
             } else {
@@ -409,8 +432,8 @@ public final class Transformer {
             layer.postNorm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T)
 
             // MLP block: [gate|up] → SiLU(gate)·up → down_proj
-            if decode && layer.gateUpFusable {
-                Linear.encodeFusedDecode(enc, layer.gateUp, x: xn, y: guBuf)
+            if layer.gateUpFusable && Linear.canFuse(layer.gateUp, T: T) {
+                Linear.encodeFusedDecode(enc, layer.gateUp, x: xn, xStride: H, y: guBuf, yStride: 2 * I, T: T)
             } else if layer.gateUp.count == 1 {
                 layer.gateUp[0].encode(enc, x: xn, xStride: H, y: guBuf, yStride: 2 * I, T: T)
             } else {
@@ -433,7 +456,9 @@ public final class Transformer {
             }
         }
 
-        if computeLogits {
+        if computeLogits && allLogits {
+            lmHead.encode(enc, x: xn, xStride: H, y: logitsAll, yStride: lmHead.outDim, T: T)
+        } else if computeLogits {
             lmHead.encode(enc, x: xn, xOffset: (T - 1) * H * 4, xStride: H, y: logits, yStride: lmHead.outDim, T: 1)
         }
         enc.endEncoding()
@@ -467,21 +492,23 @@ extension Transformer {
         let H = config.hiddenSize
         func bytes(_ l: Linear) -> Double { Double(l.weight.nbytes + (l.scales?.nbytes ?? 0) + (l.biases?.nbytes ?? 0)) }
         // Matvecs over every layer's distinct weights, so nothing is served from cache.
-        func sweep(_ name: String, _ parts: (TransformerLayer) -> [Linear], x: MTLBuffer) {
+        func sweep(_ name: String, _ parts: (TransformerLayer) -> [Linear], x: MTLBuffer, T: Int = 1) {
             let total = layers.reduce(0.0) { acc, l in acc + parts(l).reduce(0.0) { $0 + bytes($1) } }
             let t = time(3) { enc in
                 for l in self.layers {
                     let ps = parts(l)
-                    if ps.count > 1, Linear.fusable(ps) { Linear.encodeFusedDecode(enc, ps, x: x, y: self.guBuf) }
-                    else { for p in ps { p.encode(enc, x: x, xStride: p.inDim, y: self.guBuf, yStride: p.outDim, T: 1) } }
+                    if ps.count > 1, Linear.fusable(ps) { Linear.encodeFusedDecode(enc, ps, x: x, xStride: ps[0].inDim, y: self.guBuf, yStride: ps.reduce(0) { $0 + $1.outDim }, T: T) }
+                    else { for p in ps { p.encode(enc, x: x, xStride: p.inDim, y: self.guBuf, yStride: p.outDim, T: T) } }
                 }
             }
-            out += String(format: "%-8@ matvec x%d: %6.2f ms  %6.1f GB/s\n", name as NSString, layers.count, t * 1000, total / t / 1e9)
+            out += String(format: "%-8@ matvec x%d: %6.2f ms  %6.1f GB/s\n", "\(name)@T\(T)" as NSString, layers.count, t * 1000, total / t / 1e9)
         }
         sweep("qkv", { $0.qkv }, x: xn)
         sweep("o_proj", { [$0.o] }, x: attnBuf)
         sweep("gate_up", { $0.gateUp }, x: xn)
         sweep("down", { [$0.down] }, x: mlpBuf)
+        sweep("gate_up", { $0.gateUp }, x: xn, T: 4)
+        sweep("down", { [$0.down] }, x: mlpBuf, T: 4)
         let tLM = time(20) { lmHead.encode($0, x: xn, xStride: H, y: logits, yStride: lmHead.outDim, T: 1) }
         out += String(format: "lm_head matvec: %.3f ms  (%.0f GB/s, cache-warm)\n", tLM * 1000, bytes(lmHead) / tLM / 1e9)
         let l0 = layers[0]
