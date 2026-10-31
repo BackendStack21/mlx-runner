@@ -85,7 +85,7 @@ Measured with `mlxr bench` on an **M2 Pro (16 GB)**. Decode is measured with gre
 | Phi-3.5 mini | 2.15 GB | 320 tok/s | 65 tok/s | 57 tok/s |
 | Mistral 7B v0.3 | 4.08 GB | 166 tok/s | 38.6 tok/s | 36.6 tok/s |
 
-**The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 38.6 tok/s, about 82% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a smaller quantization (3-bit), or speculative decoding (see Limitations).
+**The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 38.6 tok/s, about 82% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a 3-bit model (which would raise the ceiling to about 60 tok/s, but only 4-bit has an optimized decode kernel so far), or speculative decoding (see Limitations).
 
 Load times stay short because the weights are `mmap`ed and wrapped in Metal buffers with no copy: about 0.5 s for the small models, 1.6 s for Phi-3.5 and 3.3 s for Mistral 7B. Those figures include a warm-up pass that pages the weights in.
 
