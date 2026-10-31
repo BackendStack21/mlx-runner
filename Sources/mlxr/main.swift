@@ -7,6 +7,7 @@ import MLXEngine
 //   mlxr list
 //   mlxr run <org/repo|path> [-p prompt] [--raw] [--max N] [--temp T] [--no-think] [--ctx N]
 //   mlxr tokenize <org/repo|path> <text>
+//   mlxr serve <org/repo|path> [--port 1234] [--ctx N] [--lan]
 
 setvbuf(stdout, nil, _IONBF, 0)
 var args = Array(CommandLine.arguments.dropFirst())
@@ -40,7 +41,7 @@ func formatBytes(_ b: Int) -> String {
 }
 
 guard let cmd = args.first else {
-    print("usage: mlxr <search|download|list|run|tokenize> ...")
+    print("usage: mlxr <search|download|list|run|tokenize|serve> ...")
     exit(0)
 }
 args.removeFirst()
@@ -110,6 +111,19 @@ case "run":
             print(String(format: "\n[generated %d tokens at %.1f tok/s, stop: %@]", s.generatedTokens, s.tokensPerSecond, s.stopReason))
         }
     }
+
+case "serve":
+    let port = UInt16(option("--port") ?? "1234") ?? 1234
+    let ctx = Int(option("--ctx") ?? "8192") ?? 8192
+    let lan = flag("--lan")
+    guard let model = args.first else { fail("usage: mlxr serve <model> [--port 1234] [--ctx N] [--lan]") }
+    let info = try await InferenceEngine.shared.load(directory: resolve(model), contextLength: ctx)
+    print("Loaded \(info.name) in \(String(format: "%.2f", info.loadSeconds))s")
+    let server = OpenAIServer(port: port, allowLAN: lan)
+    server.onLog = { print($0) }
+    try server.start()
+    print("OpenAI-compatible server on http://\(lan ? "0.0.0.0" : "127.0.0.1"):\(port)/v1  (Ctrl-C to stop)")
+    while true { try await Task.sleep(nanoseconds: 3_600_000_000_000) }
 
 default:
     fail("unknown command \(cmd)")
