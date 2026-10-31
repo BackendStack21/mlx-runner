@@ -332,6 +332,7 @@ final class AppState {
     // MARK: Persistence
 
     func scheduleSave() {
+        guard !DevSnapshot.isActive else { return }
         saveTask?.cancel()
         let snapshot = conversations
         let url = chatsURL
@@ -358,6 +359,7 @@ final class AppState {
     }
 
     private func saveSettings() {
+        guard !DevSnapshot.isActive else { return }
         let d = UserDefaults.standard
         if let data = try? JSONEncoder().encode(sampling) { d.set(data, forKey: "sampling") }
         d.set(systemPrompt, forKey: "systemPrompt")

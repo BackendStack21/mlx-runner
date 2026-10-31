@@ -5,6 +5,9 @@ import SwiftUI
 /// window for each main screen, so UI can be reviewed in headless/CI environments.
 @MainActor
 enum DevSnapshot {
+    /// Snapshot runs never persist chats or settings.
+    static let isActive = ProcessInfo.processInfo.environment["MLXRUNNER_SNAPSHOT"] != nil
+
     static func runIfRequested(_ state: AppState) {
         guard let dir = ProcessInfo.processInfo.environment["MLXRUNNER_SNAPSHOT"] else { return }
         let screens: [(String, () -> Void)] = [

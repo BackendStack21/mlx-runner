@@ -9,11 +9,20 @@ enum Theme {
     static let good = Color(red: 0.2, green: 0.8, blue: 0.5)
 }
 
+enum GlassSupport {
+    /// Liquid Glass when available; `MLXRUNNER_NO_GLASS=1` forces the material fallback.
+    static let enabled: Bool = {
+        guard ProcessInfo.processInfo.environment["MLXRUNNER_NO_GLASS"] == nil else { return false }
+        if #available(macOS 26.0, *) { return true }
+        return false
+    }()
+}
+
 extension View {
     /// Liquid Glass on macOS 26+, material card on earlier systems.
     @ViewBuilder
     func glassCard(cornerRadius: CGFloat = 16, interactive: Bool = false) -> some View {
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), GlassSupport.enabled {
             self.glassEffect(interactive ? .regular.interactive() : .regular, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         } else {
             self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
@@ -23,7 +32,7 @@ extension View {
 
     @ViewBuilder
     func glassCapsule(interactive: Bool = false) -> some View {
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), GlassSupport.enabled {
             self.glassEffect(interactive ? .regular.interactive() : .regular, in: Capsule())
         } else {
             self.background(.ultraThinMaterial, in: Capsule())

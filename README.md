@@ -22,8 +22,8 @@ A native macOS app for discovering, downloading and chatting with **MLX models f
 
 **Downloads**
 - Background downloads with progress, speed and cancel.
-- Files that are already complete are skipped, so an interrupted download resumes where it stopped.
-- Gated models work with a Hugging Face token (Settings).
+- An interrupted download resumes per file: completed files are skipped, but a partially downloaded file starts over.
+- A Hugging Face token (Settings) is sent with requests for gated models. That path hasn't been tested yet.
 
 **My Models**
 - A card grid of installed models with load, eject, delete and "Show in Finder".
@@ -50,15 +50,23 @@ A native macOS app for discovering, downloading and chatting with **MLX models f
 
 ## Supported models
 
-| `model_type` | Examples | Notes |
+| `model_type` | Verified checkpoint | Notes |
 |---|---|---|
-| `qwen3` | Qwen3 0.6B–32B, DeepSeek-R1-0528-Qwen3 | per-head q/k RMSNorm, thinking toggle |
-| `qwen2` | Qwen2.5, Qwen2.5-Coder, DeepSeek-R1-Distill-Qwen | q/k/v biases |
-| `llama` | Llama 3.x, SmolLM2, many fine-tunes | Llama-3 RoPE scaling |
-| `mistral` | Mistral 7B v0.3, Ministral | SentencePiece BPE + byte fallback |
-| `phi3` | Phi-3 / Phi-3.5 mini | fused qkv / gate_up, LongRoPE |
+| `qwen3` | Qwen3-0.6B-4bit | per-head q/k RMSNorm, thinking toggle |
+| `qwen2` | Qwen2.5-0.5B-Instruct-4bit | q/k/v biases |
+| `llama` | Llama-3.2-1B-Instruct-4bit | Llama-3 RoPE scaling |
+| `mistral` | Mistral-7B-Instruct-v0.3-4bit | SentencePiece BPE + byte fallback |
+| `phi3` | Phi-3.5-mini-instruct-4bit | fused qkv / gate_up, LongRoPE |
 
-Each model type above has been verified end to end on a real checkpoint. Gemma, mixture-of-experts and vision-language models are not supported yet; Discover marks them as not runnable.
+Each checkpoint above passes end-to-end generation and the prefill-versus-decode consistency test. Other models of the same type, such as larger Qwen3, Qwen2.5-Coder or other Llama 3 fine-tunes, should work too, unless they need a feature that isn't implemented, such as sliding-window attention.
+
+## Limitations
+
+- **Unsupported model types:** Gemma, mixture-of-experts (Mixtral, Qwen3-MoE) and vision-language models. Discover marks them as not runnable.
+- **Chat templates:** the prompt format is detected (ChatML, Llama 3, Mistral, Phi-3) rather than executed as Jinja, so a model with an unusual template may get a near-match format.
+- **Prefill speed:** about 170 tok/s on a 7B model on an M2 Pro, because the prefill GEMM reaches about 35% of fp32 peak. Decode runs close to the memory-bandwidth limit.
+- **Download resume:** a partly downloaded file restarts from the beginning.
+- **Glass effects:** set `MLXRUNNER_NO_GLASS=1` to use plain materials instead of Liquid Glass.
 
 ## Performance
 
