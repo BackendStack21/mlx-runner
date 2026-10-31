@@ -132,9 +132,10 @@ case "bench":
     let dir = resolve(model)
     let t = try Transformer(directory: dir, contextLength: 4096)
     print("weights: \(formatBytes(t.weightBytes))")
-    print(try t.profile())
+    let quick = ProcessInfo.processInfo.environment["MLXR_BENCH_DECODE"] != nil
+    if !quick { print(try t.profile()) }
     _ = try t.forward([1], offset: 0)
-    for n in [128, 512, 2048] {
+    for n in (quick ? [] : [128, 512, 2048]) {
         let toks = (0..<n).map { Int32($0 % 1000 + 100) }
         let s = Date()
         _ = try t.forward(toks, offset: 0)

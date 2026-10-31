@@ -4,6 +4,9 @@ import Metal
 /// Tokens per simdgroup in the small-batch matmul kernels.
 private let prefillTT = 8
 private let rowsPerThreadgroup = 8 // QROWS * QNSG
+private let qmvSimdgroups = 2 // QVNSG
+private let qmvRowsPerThreadgroup = 4 * qmvSimdgroups
+private let qmvThreads = 32 * qmvSimdgroups
 
 /// A linear layer, either MLX-quantized or dense.
 final class Linear {
@@ -47,7 +50,8 @@ final class Linear {
             }
             guard let sfx = s.dtype.suffix else { throw EngineError.unsupported("\(prefix): scales dtype \(s.dtype)") }
             pso1 = try gpu.pipeline("qmm_\(bits)_\(sfx)_1")
-            if inDim % 16 == 0 && groupSize % 16 == 0 && (bias == nil || bias?.dtype == s.dtype) {
+            let qmvAlign = bits == 4 ? 32 : 16  // the 4-bit fast path consumes 32 values per lane
+            if inDim % qmvAlign == 0 && groupSize % qmvAlign == 0 && (bias == nil || bias?.dtype == s.dtype) {
                 qmvPSO = try gpu.pipeline("qmv_\(bits)_\(sfx)")
             }
             if inDim % 32 == 0 { gemmPSO = try gpu.pipeline("qgemm_\(bits)_\(sfx)") }
@@ -97,8 +101,8 @@ final class Linear {
         enc.params(MMParams(K: Int32(f.inDim), O: Int32(total), T: 1, gs: Int32(f.groupSize), xStride: 0, yStride: 0,
                             o1: Int32(parts[0].outDim), o2: Int32(parts.count > 1 ? parts[1].outDim : 0),
                             hasBias: f.bias != nil ? 1 : 0), 5)
-        enc.dispatchThreadgroups(MTLSize(width: (total + rowsPerThreadgroup - 1) / rowsPerThreadgroup, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.dispatchThreadgroups(MTLSize(width: (total + qmvRowsPerThreadgroup - 1) / qmvRowsPerThreadgroup, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: qmvThreads, height: 1, depth: 1))
     }
 
     /// y[t, :outDim] (row stride yStride, starting at yOffset bytes) = x[t] · Wᵀ (+ bias)
@@ -441,13 +445,26 @@ extension Transformer {
         }
         var out = ""
         let H = config.hiddenSize
-        let lmBytes = Double(lmHead.outDim) * Double(H) * 0.5 * 1.125
-        let tLM = time(50) { lmHead.encode($0, x: xn, xStride: H, y: logits, yStride: lmHead.outDim, T: 1) }
-        out += String(format: "lm_head matvec: %.3f ms  (~%.0f GB/s)\n", tLM * 1000, lmBytes / tLM / 1e9)
+        func bytes(_ l: Linear) -> Double { Double(l.weight.nbytes + (l.scales?.nbytes ?? 0) + (l.biases?.nbytes ?? 0)) }
+        // Matvecs over every layer's distinct weights, so nothing is served from cache.
+        func sweep(_ name: String, _ parts: (TransformerLayer) -> [Linear], x: MTLBuffer) {
+            let total = layers.reduce(0.0) { acc, l in acc + parts(l).reduce(0.0) { $0 + bytes($1) } }
+            let t = time(3) { enc in
+                for l in self.layers {
+                    let ps = parts(l)
+                    if ps.count > 1, Linear.fusable(ps) { Linear.encodeFusedDecode(enc, ps, x: x, y: self.guBuf) }
+                    else { for p in ps { p.encode(enc, x: x, xStride: p.inDim, y: self.guBuf, yStride: p.outDim, T: 1) } }
+                }
+            }
+            out += String(format: "%-8@ matvec x%d: %6.2f ms  %6.1f GB/s\n", name as NSString, layers.count, t * 1000, total / t / 1e9)
+        }
+        sweep("qkv", { $0.qkv }, x: xn)
+        sweep("o_proj", { [$0.o] }, x: attnBuf)
+        sweep("gate_up", { $0.gateUp }, x: xn)
+        sweep("down", { [$0.down] }, x: mlpBuf)
+        let tLM = time(20) { lmHead.encode($0, x: xn, xStride: H, y: logits, yStride: lmHead.outDim, T: 1) }
+        out += String(format: "lm_head matvec: %.3f ms  (%.0f GB/s, cache-warm)\n", tLM * 1000, bytes(lmHead) / tLM / 1e9)
         let l0 = layers[0]
-        let tDown = time(200) { l0.down.encode($0, x: mlpBuf, xStride: config.intermediateSize, y: tmp, yStride: H, T: 1) }
-        let downBytes = Double(l0.down.outDim) * Double(l0.down.inDim) * 0.5 * 1.125
-        out += String(format: "down_proj matvec: %.1f us  (~%.0f GB/s)\n", tDown * 1e6, downBytes / tDown / 1e9)
         let tAdd = time(500) { enc in self.add(enc, tmp, xn, H) }
         out += String(format: "tiny dependent dispatch: %.1f us\n", tAdd * 1e6)
         // Prefill composition at T = 512: all projection GEMMs of one layer.

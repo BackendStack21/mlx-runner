@@ -16,6 +16,7 @@ struct EWParams   { int n; int stride; int cols; int pad; };
 
 #define QROWS 4
 #define QNSG 2
+#define QVNSG 2
 
 // ---------------------------------------------------------------------------
 // MLX affine quantization: 8 values are packed little-endian into BITS bytes.
@@ -147,7 +148,7 @@ kernel void qmv(device const uchar* wA [[buffer(0)]],
                 uint2 tgid [[threadgroup_position_in_grid]],
                 uint  sgid [[simdgroup_index_in_threadgroup]],
                 uint  lane [[thread_index_in_simdgroup]]) {
-    const int gRow = (int(tgid.x) * QNSG + int(sgid)) * QROWS;
+    const int gRow = (int(tgid.x) * QVNSG + int(sgid)) * QROWS;
     if (gRow >= p.O) return;
     device const uchar* w; device const T* sc; device const T* bi; device const T* rb;
     int rowBase;
@@ -161,17 +162,48 @@ kernel void qmv(device const uchar* wA [[buffer(0)]],
     device const uchar* wb = w + ulong(rowBase) * rowBytes;
     device const T* sb = sc + rowBase * gpr;
     device const T* bb = bi + rowBase * gpr;
-    for (int k = int(lane) * 16; k < p.K; k += 512) {
-        device const float4* xp = (device const float4*)(x + k);
-        const float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
-        const float xs = dot(x0 + x1 + x2 + x3, float4(1.0f));
-        const int g = k / p.gs;
-        const ulong off = ulong(k) * BITS / 8;
-        for (int r = 0; r < nr; r++) {
-            float4 q[4];
-            unpack16<BITS>(wb + ulong(r) * rowBytes + off, q);
-            const float d = dot(q[0], x0) + dot(q[1], x1) + dot(q[2], x2) + dot(q[3], x3);
-            acc[r] += float(sb[r * gpr + g]) * d + float(bb[r * gpr + g]) * xs;
+    if (BITS == 4) {
+        // Fast 4-bit path: 32 weights (16 bytes) per lane per row per step.
+        // x is pre-scaled by 16^-j so each nibble is extracted with a mask only
+        // (no shifts): (w & 0xF0) * x/16 == ((w >> 4) & 0xF) * x.
+        const float4 sLo = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+        const float4 sHi = sLo * (1.0f / 65536.0f);
+        const uint4 mLo = uint4(0xFu, 0xF0u, 0xF00u, 0xF000u);
+        const uint4 mHi = mLo << 16;
+        for (int k = int(lane) * 32; k < p.K; k += 1024) {
+            device const float4* xp = (device const float4*)(x + k);
+            float4 xv[8];
+            float xs = 0.0f;
+            for (int i = 0; i < 8; i++) {
+                const float4 v = xp[i];
+                xs += v.x + v.y + v.z + v.w;
+                xv[i] = v * ((i & 1) ? sHi : sLo);
+            }
+            const int g = k / p.gs;
+            const ulong off = ulong(k) >> 1;
+            for (int r = 0; r < nr; r++) {
+                const uint4 w = *(device const uint4*)(wb + ulong(r) * rowBytes + off);
+                float d = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const uint4 wi = uint4(w[i]);
+                    d += dot(float4(wi & mLo), xv[2 * i]) + dot(float4(wi & mHi), xv[2 * i + 1]);
+                }
+                acc[r] += float(sb[r * gpr + g]) * d + float(bb[r * gpr + g]) * xs;
+            }
+        }
+    } else {
+        for (int k = int(lane) * 16; k < p.K; k += 512) {
+            device const float4* xp = (device const float4*)(x + k);
+            const float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
+            const float xs = dot(x0 + x1 + x2 + x3, float4(1.0f));
+            const int g = k / p.gs;
+            const ulong off = ulong(k) * BITS / 8;
+            for (int r = 0; r < nr; r++) {
+                float4 q[4];
+                unpack16<BITS>(wb + ulong(r) * rowBytes + off, q);
+                const float d = dot(q[0], x0) + dot(q[1], x1) + dot(q[2], x2) + dot(q[3], x3);
+                acc[r] += float(sb[r * gpr + g]) * d + float(bb[r * gpr + g]) * xs;
+            }
         }
     }
     for (int r = 0; r < nr; r++) {
