@@ -22,8 +22,8 @@ A native macOS app for discovering, downloading and chatting with **MLX models f
 
 **Downloads**
 - Background downloads with progress, speed and cancel.
-- An interrupted download resumes per file: completed files are skipped, but a partially downloaded file starts over.
-- A Hugging Face token (Settings) is sent with requests for gated models. That path hasn't been tested yet.
+- Interrupted downloads resume with HTTP range requests, and every LFS file is checked against its SHA-256 from the Hub.
+- A Hugging Face token (Settings) is stored in the Keychain and only ever sent to huggingface.co hosts, never to the CDN a download redirects to. The gated-model path hasn't been tested against a real gated repo.
 
 **My Models**
 - A card grid of installed models with load, eject, delete and "Show in Finder".
@@ -37,12 +37,17 @@ A native macOS app for discovering, downloading and chatting with **MLX models f
 - An inspector panel for temperature, top-p, top-k, min-p, repeat penalty, max tokens and context length.
 
 **Local Server**
-- An OpenAI-compatible API: `GET /v1/models`, `POST /v1/chat/completions` and `POST /v1/completions`.
-- Streaming via SSE, stop sequences, and CORS.
-- Binds to localhost by default, with LAN as an option.
+- OpenAI-compatible: the Responses API (`POST /v1/responses`, with typed streaming events), Chat Completions (`developer` role, content parts, `max_completion_tokens`, `stream_options.include_usage`), legacy Completions, and `/v1/models`.
+- Qwen3 thinking is returned as `reasoning_content` (Chat Completions) or a `reasoning` item (Responses).
+- Features it can't honour (tools, JSON mode, images, logprobs) are rejected with an OpenAI-style 400 instead of being silently ignored.
+- Safe by default: binds to localhost, rejects other `Host` headers (DNS rebinding) and unknown browser `Origin`s, accepts JSON bodies only, and enforces timeouts plus connection, queue and size limits. An API key is optional on localhost and required in LAN mode.
 - Includes a request log.
 
-**Reliability**
+**Reliability and security**
+- Model files are untrusted input: safetensors headers, tensor offsets, config dimensions, token ids and every weight shape are validated before anything reaches the GPU.
+- Chat message text is tokenized as plain text, so a message can't inject control tokens and forge turns.
+- Links in model cards and replies open only for https (with a confirmation for non-Hugging Face hosts) and mailto.
+- Chat history is never overwritten if it can't be read; it is saved on send and on quit.
 - A memory guard refuses models that won't fit in GPU-addressable memory, with a clear message.
 - Long chats are trimmed to fit the context window, oldest turns first. The system prompt and the latest message are always kept.
 - Cancellation is per request, so the server and the chat UI never cancel each other.
@@ -64,8 +69,8 @@ Each checkpoint above passes end-to-end generation and the prefill-versus-decode
 
 - **Unsupported model types:** Gemma, mixture-of-experts (Mixtral, Qwen3-MoE) and vision-language models. Discover marks them as not runnable.
 - **Chat templates:** the prompt format is detected (ChatML, Llama 3, Mistral, Phi-3) rather than executed as Jinja, so a model with an unusual template may get a near-match format.
-- **Prefill speed:** about 170 tok/s on a 7B model on an M2 Pro, because the prefill GEMM reaches about 35% of fp32 peak. Decode runs close to the memory-bandwidth limit.
-- **Download resume:** a partly downloaded file restarts from the beginning.
+- **Prefill speed:** about 165 tok/s on a 7B model on an M2 Pro, because the prefill GEMM reaches about 35% of fp32 peak.
+- **Speculative decoding is opt-in.** Prompt-lookup drafting with exact verification is implemented and tested (greedy output is identical), but checking 4 drafted tokens on a 7B model still costs about 3 decode steps. So it only helps when most drafts are accepted (copying or editing text), and it is off by default (`SamplingParameters.speculative`, or `mlxr run --spec`).
 - **Glass effects:** set `MLXRUNNER_NO_GLASS=1` to use plain materials instead of Liquid Glass.
 
 ## Performance
@@ -74,11 +79,13 @@ Measured with `mlxr bench` on an **M2 Pro (16 GB)**. Decode is measured with gre
 
 | Model (4-bit) | Weights | Prefill (512 tok) | Decode @16 | Decode @1K ctx |
 |---|---|---|---|---|
-| Qwen2.5 0.5B Instruct | 278 MB | 3,000 tok/s | 254 tok/s | 235 tok/s |
-| Qwen3 0.6B | 336 MB | 2,050 tok/s | 219 tok/s | 182 tok/s |
-| Llama 3.2 1B Instruct | 695 MB | 1,185 tok/s | 161 tok/s | 149 tok/s |
-| Phi-3.5 mini | 2.15 GB | 323 tok/s | 57 tok/s | 50 tok/s |
-| Mistral 7B v0.3 | 4.08 GB | 168 tok/s | 31 tok/s | 30 tok/s |
+| Qwen2.5 0.5B Instruct | 278 MB | 2,970 tok/s | 285 tok/s | 258 tok/s |
+| Qwen3 0.6B | 336 MB | 2,030 tok/s | 247 tok/s | 204 tok/s |
+| Llama 3.2 1B Instruct | 695 MB | 1,170 tok/s | 183 tok/s | 165 tok/s |
+| Phi-3.5 mini | 2.15 GB | 320 tok/s | 65 tok/s | 57 tok/s |
+| Mistral 7B v0.3 | 4.08 GB | 166 tok/s | 38.6 tok/s | 36.6 tok/s |
+
+**The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 38.6 tok/s, about 82% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a smaller quantization (3-bit), or speculative decoding (see Limitations).
 
 Load times stay short because the weights are `mmap`ed and wrapped in Metal buffers with no copy: about 0.5 s for the small models, 1.6 s for Phi-3.5 and 3.3 s for Mistral 7B. Those figures include a warm-up pass that pages the weights in.
 
@@ -104,7 +111,7 @@ mlxr search qwen3                           # search MLX models on the Hub
 mlxr download mlx-community/Qwen3-4B-4bit   # download into the app's library
 mlxr list                                   # installed models
 mlxr run mlx-community/Qwen3-4B-4bit -p "Explain RoPE" --max 300 [--temp 0.7] [--no-think]
-mlxr serve mlx-community/Qwen3-4B-4bit --port 1234     # OpenAI-compatible server
+mlxr serve mlx-community/Qwen3-4B-4bit --port 1234     # OpenAI-compatible server (--lan prints an API key)
 mlxr bench mlx-community/Qwen3-4B-4bit      # prefill/decode throughput + kernel micro-benchmarks
 mlxr tokenize <model> "some text"
 ```
