@@ -131,6 +131,7 @@ public final class InferenceEngine: @unchecked Sendable {
     private var cachedTokens: [Int] = []
     private let cancelLock = NSLock()
     private var currentToken: CancelToken?
+    private var trimState: (anchor: String, dropped: Int)?
     public private(set) var info: LoadedModelInfo?
 
     public init() {}
@@ -239,21 +240,42 @@ public final class InferenceEngine: @unchecked Sendable {
     }
 
     /// Encodes the conversation, dropping the oldest turns (never the system prompt or the
-    /// latest message) until it fits in the context window with room to answer.
+    /// latest message) so it fits in the context window with room to answer.
+    ///
+    /// The cut point is sticky: it is remembered per conversation and only advances, and when
+    /// it does it drops down to a low watermark (70% of the window). Consecutive turns then
+    /// share a stable prefix, so the KV cache keeps being reused instead of re-prefilling
+    /// the whole window on every turn.
     private func fitToContext(_ messages: [ChatMessage], template: ChatTemplate, tokenizer: Tokenizer,
                               reserve: Int, enableThinking: Bool) -> [Int] {
         let limit = (model?.maxSeq ?? Int.max) - reserve
-        var msgs = messages
-        var tokens = tokenizer.encode(template.render(msgs, enableThinking: enableThinking))
-        while tokens.count > limit {
-            guard let drop = msgs.firstIndex(where: { $0.role != .system }), drop < msgs.count - 1 else { break }
-            msgs.remove(at: drop)
-            // keep turns paired: never start the history with an assistant reply
-            if let next = msgs.firstIndex(where: { $0.role != .system }), msgs[next].role == .assistant, next < msgs.count - 1 {
-                msgs.remove(at: next)
-            }
-            tokens = tokenizer.encode(template.render(msgs, enableThinking: enableThinking))
+        let system = messages.filter { $0.role == .system }
+        let turns = messages.filter { $0.role != .system }
+        guard let first = turns.first else {
+            return tokenizer.encode(template.render(messages, enableThinking: enableThinking))
         }
+        let anchor = first.role.rawValue + "\u{0}" + first.content
+        var dropped = (trimState?.anchor == anchor) ? min(trimState!.dropped, turns.count - 1) : 0
+
+        func render(_ d: Int) -> [Int] {
+            tokenizer.encode(template.render(system + turns[d...], enableThinking: enableThinking))
+        }
+        /// Next cut index > d that keeps the history starting with a user turn.
+        func advance(_ d: Int) -> Int? {
+            var n = d + 1
+            while n < turns.count - 1 && turns[n].role != .user { n += 1 }
+            return n < turns.count ? n : nil
+        }
+        var tokens = render(dropped)
+        if tokens.count > limit {
+            let target = Int(Double(limit) * 0.7)
+            while tokens.count > target, let n = advance(dropped), n <= turns.count - 1 {
+                dropped = n
+                tokens = render(dropped)
+                if dropped == turns.count - 1 { break }
+            }
+        }
+        trimState = (anchor, dropped)
         return tokens
     }
 

@@ -128,5 +128,15 @@ struct ModelTests {
             if case .finished = ev { finished = true }
         }
         #expect(finished)
+
+        // The next turn of the same overflowing chat must reuse the KV cache (sticky cut point).
+        msgs.append(ChatMessage(role: .assistant, content: "Hi."))
+        msgs.append(ChatMessage(role: .user, content: "Say bye."))
+        var cached = 0
+        for try await ev in engine.chat(msgs, parameters: p, enableThinking: false) {
+            if case .promptProcessed(let s) = ev { cached = s.cachedPromptTokens }
+        }
+        // 12 tokens = system prompt only (the old, non-sticky behaviour); more means history is reused.
+        #expect(cached > 15, "trimmed conversation should still hit the prefix cache (got \(cached))")
     }
 }
