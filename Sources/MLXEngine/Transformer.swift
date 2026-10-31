@@ -247,6 +247,7 @@ public final class Transformer {
 
     private let attnDecodePSO: (MTLComputePipelineState, Int)
     private let attnPrefillPSO: (MTLComputePipelineState, Int)
+    private let prefillQB: Int
     private let siluPSO: MTLComputePipelineState
     private let addPSO: MTLComputePipelineState
 
@@ -293,7 +294,13 @@ public final class Transformer {
         let e = c.headDim / 32
         let decodeSG = e >= 8 ? 16 : 32
         attnDecodePSO = (try gpu.pipeline("attention_\(e)_\(decodeSG)"), decodeSG * 32)
-        attnPrefillPSO = (try gpu.pipeline("attention_\(e)_8"), 256)
+        if [32, 64, 96, 128].contains(c.headDim) {
+            attnPrefillPSO = (try gpu.pipeline("flash_prefill_\(c.headDim / 8)"), 128)
+            prefillQB = 32
+        } else {
+            attnPrefillPSO = (try gpu.pipeline("attention_prefill_\(e)"), 256)
+            prefillQB = e > 4 ? 4 : 8
+        }
         siluPSO = try gpu.pipeline("silu_mul")
         addPSO = try gpu.pipeline("add_inplace")
     }
@@ -364,8 +371,8 @@ public final class Transformer {
             enc.set(attnBuf, 0, 3)
             enc.params(AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(qkvCols),
                                   maxSeq: Int32(maxSeq), offset: Int32(offset), scale: 1 / Float(D).squareRoot(),
-                                  outStride: Int32(nH * D)), 4)
-            enc.dispatchThreadgroups(MTLSize(width: nH, height: T, depth: 1),
+                                  outStride: Int32(nH * D), T: Int32(T)), 4)
+            enc.dispatchThreadgroups(MTLSize(width: nH, height: decode ? 1 : (T + prefillQB - 1) / prefillQB, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: attnThreads, height: 1, depth: 1))
 
             layer.o.encode(enc, x: attnBuf, xStride: nH * D, y: tmp, yStride: H, T: T)

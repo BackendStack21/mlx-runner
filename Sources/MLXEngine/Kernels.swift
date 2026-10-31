@@ -11,7 +11,7 @@ using namespace metal;
 // ---------------------------------------------------------------------------
 struct MMParams   { int K; int O; int T; int gs; int xStride; int yStride; int o1; int o2; int hasBias; int pad; };
 struct NormParams { int dim; int headsPerRow; int rowStride; float eps; };
-struct AttnParams { int D; int nH; int nKV; int qStride; int maxSeq; int offset; float scale; int outStride; };
+struct AttnParams { int D; int nH; int nKV; int qStride; int maxSeq; int offset; float scale; int outStride; int T; };
 struct EWParams   { int n; int stride; int cols; int pad; };
 
 #define QROWS 4
@@ -536,6 +536,191 @@ kernel void attention(device const float* qkv [[buffer(0)]],
     }
 }
 
+// Prefill attention: one threadgroup per (head, block of QB queries). Each K/V
+// row is loaded once and scored against all QB queries; 8 simdgroups split the
+// keys with per-query online softmax, merged through threadgroup memory.
+template <int E, int QB>
+kernel void attention_prefill(device const float* qkv [[buffer(0)]],
+                              device const half*  kc  [[buffer(1)]],
+                              device const half*  vc  [[buffer(2)]],
+                              device float*       out [[buffer(3)]],
+                              constant AttnParams& p  [[buffer(4)]],
+                              uint2 tg   [[threadgroup_position_in_grid]],
+                              uint  tid  [[thread_index_in_threadgroup]],
+                              uint  sg   [[simdgroup_index_in_threadgroup]],
+                              uint  lane [[thread_index_in_simdgroup]]) {
+    const int NSG = 8;
+    const int h = int(tg.x), t0 = int(tg.y) * QB;
+    const int nq = min(QB, p.T - t0);
+    const int kvh = h / (p.nH / p.nKV);
+    float qr[QB][E], acc[QB][E], m[QB], l[QB];
+    for (int qi = 0; qi < QB; qi++) {
+        m[qi] = -1e30f; l[qi] = 0.0f;
+        device const float* q = qkv + (t0 + min(qi, nq - 1)) * p.qStride + h * p.D;
+        for (int e = 0; e < E; e++) { qr[qi][e] = q[e * 32 + lane] * p.scale; acc[qi][e] = 0.0f; }
+    }
+    const int L = p.offset + t0 + nq;
+    device const half* kb = kc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
+    device const half* vb = vc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
+    for (int j = int(sg); j < L; j += NSG) {
+        float kv[E], vv[E];
+        device const half* kp = kb + ulong(j) * ulong(p.D);
+        device const half* vp = vb + ulong(j) * ulong(p.D);
+        for (int e = 0; e < E; e++) { kv[e] = float(kp[e * 32 + lane]); vv[e] = float(vp[e * 32 + lane]); }
+        for (int qi = 0; qi < QB; qi++) {
+            if (qi >= nq || j > p.offset + t0 + qi) continue;   // causal mask (uniform per simdgroup)
+            float s = 0.0f;
+            for (int e = 0; e < E; e++) s += qr[qi][e] * kv[e];
+            s = simd_sum(s);
+            const float mn = max(m[qi], s);
+            const float cr = exp(m[qi] - mn), pe = exp(s - mn);
+            l[qi] = l[qi] * cr + pe;
+            for (int e = 0; e < E; e++) acc[qi][e] = acc[qi][e] * cr + pe * vv[e];
+            m[qi] = mn;
+        }
+    }
+    threadgroup float tm[NSG][QB], tl[NSG][QB];
+    threadgroup float o[QB][E * 32];
+    if (lane == 0) for (int qi = 0; qi < QB; qi++) { tm[sg][qi] = m[qi]; tl[sg][qi] = l[qi]; }
+    for (int i = int(tid); i < QB * E * 32; i += NSG * 32) o[i / (E * 32)][i % (E * 32)] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float M[QB], Ls[QB];
+    for (int qi = 0; qi < QB; qi++) {
+        M[qi] = -1e30f;
+        for (int s = 0; s < NSG; s++) M[qi] = max(M[qi], tm[s][qi]);
+        Ls[qi] = 0.0f;
+        for (int s = 0; s < NSG; s++) Ls[qi] += tl[s][qi] * exp(tm[s][qi] - M[qi]);
+    }
+    for (int s = 0; s < NSG; s++) {
+        if (int(sg) == s) {
+            for (int qi = 0; qi < nq; qi++) {
+                const float f = exp(m[qi] - M[qi]);
+                for (int e = 0; e < E; e++) o[qi][e * 32 + lane] += acc[qi][e] * f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int qi = int(sg); qi < nq; qi += NSG) {
+        device float* op = out + (t0 + qi) * p.outStride + h * p.D;
+        const float inv = 1.0f / Ls[qi];
+        for (int e = 0; e < E; e++) op[e * 32 + lane] = o[qi][e * 32 + lane] * inv;
+    }
+}
+
+// Flash attention for prefill on simdgroup matrices.
+// Threadgroup = (head, 32 queries); 4 simdgroups × 8 query rows; key blocks of 16.
+// S = Q·Kᵀ and O += P·V use 8×8 MMA; the online-softmax rescale of O is a
+// multiply by a diagonal matrix. DD = head_dim / 8.
+template <int DD>
+kernel void flash_prefill(device const float* qkv [[buffer(0)]],
+                          device const half*  kc  [[buffer(1)]],
+                          device const half*  vc  [[buffer(2)]],
+                          device float*       out [[buffer(3)]],
+                          constant AttnParams& p  [[buffer(4)]],
+                          uint2 tg   [[threadgroup_position_in_grid]],
+                          uint  tid  [[thread_index_in_threadgroup]],
+                          uint  sg   [[simdgroup_index_in_threadgroup]],
+                          uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr int D = DD * 8;
+    constexpr int BK = 16;
+    threadgroup float KV[2 * BK * D];            // K block then V block; reused for the output
+    threadgroup float Ssh[4][8 * BK];
+    threadgroup float Dg[4][64];
+    threadgroup float* Ks = KV;
+    threadgroup float* Vs = KV + BK * D;
+
+    const int h = int(tg.x), t0 = int(tg.y) * 32;
+    const int kvh = h / (p.nH / p.nKV);
+    const int qRow0 = t0 + int(sg) * 8;           // first query (batch index) of this simdgroup
+    const int lastQ = min(t0 + 32, p.T) - 1;
+    const int L = p.offset + lastQ + 1;           // keys needed by this block
+
+    simdgroup_matrix<float, 8, 8> Q[DD], O[DD];
+    for (int d = 0; d < DD; d++) {
+        simdgroup_load(Q[d], qkv + qRow0 * p.qStride + h * D + d * 8, p.qStride);
+        O[d] = simdgroup_matrix<float, 8, 8>(0);
+    }
+    for (int i = int(lane); i < 64; i += 32) Dg[sg][i] = 0.0f;
+
+    const int r = int(lane) / 4, c0 = (int(lane) % 4) * 4;   // softmax ownership: row r, 4 columns
+    const int qAbs = p.offset + qRow0 + r;                     // absolute position of row r
+    const bool rowValid = qRow0 + r < p.T;
+    float m = -1e30f, l = 0.0f;
+
+    device const half* kb = kc + ulong(kvh) * ulong(p.maxSeq) * ulong(D);
+    device const half* vb = vc + ulong(kvh) * ulong(p.maxSeq) * ulong(D);
+
+    for (int j0 = 0; j0 < L; j0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = int(tid); i < BK * D; i += 128) {
+            const int j = j0 + i / D;
+            const bool ok = j < L;
+            Ks[i] = ok ? float(kb[ulong(j0) * D + i]) : 0.0f;
+            Vs[i] = ok ? float(vb[ulong(j0) * D + i]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Skip key blocks that are entirely in the future for all 8 rows of this simdgroup.
+        if (j0 > p.offset + qRow0 + 7) continue;
+
+        simdgroup_matrix<float, 8, 8> S0(0), S1(0), Kt;
+        for (int d = 0; d < DD; d++) {
+            simdgroup_load(Kt, Ks + 0 * D + d * 8, D, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(S0, Q[d], Kt, S0);
+            simdgroup_load(Kt, Ks + 8 * D + d * 8, D, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(S1, Q[d], Kt, S1);
+        }
+        simdgroup_store(S0, &Ssh[sg][0], BK);
+        simdgroup_store(S1, &Ssh[sg][8], BK);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float s[4];
+        float bmax = -1e30f;
+        for (int c = 0; c < 4; c++) {
+            const int j = j0 + c0 + c;
+            s[c] = (rowValid && j <= qAbs && j < L) ? Ssh[sg][r * BK + c0 + c] * p.scale : -1e30f;
+            bmax = max(bmax, s[c]);
+        }
+        bmax = max(bmax, simd_shuffle_xor(bmax, 1));
+        bmax = max(bmax, simd_shuffle_xor(bmax, 2));
+        const float mn = max(m, bmax);
+        float bsum = 0.0f;
+        for (int c = 0; c < 4; c++) {
+            const float pe = s[c] <= -1e29f ? 0.0f : exp(s[c] - mn);
+            Ssh[sg][r * BK + c0 + c] = pe;
+            bsum += pe;
+        }
+        bsum += simd_shuffle_xor(bsum, 1);
+        bsum += simd_shuffle_xor(bsum, 2);
+        const float corr = exp(m - mn);
+        l = l * corr + bsum;
+        m = mn;
+        if (c0 == 0) Dg[sg][r * 8 + r] = corr;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_matrix<float, 8, 8> Dm, P0, P1, Vb;
+        simdgroup_load(Dm, &Dg[sg][0], 8);
+        simdgroup_load(P0, &Ssh[sg][0], BK);
+        simdgroup_load(P1, &Ssh[sg][8], BK);
+        for (int d = 0; d < DD; d++) {
+            simdgroup_multiply(O[d], Dm, O[d]);
+            simdgroup_load(Vb, Vs + 0 * D + d * 8, D);
+            simdgroup_multiply_accumulate(O[d], P0, Vb, O[d]);
+            simdgroup_load(Vb, Vs + 8 * D + d * 8, D);
+            simdgroup_multiply_accumulate(O[d], P1, Vb, O[d]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Write out: stage each simdgroup's 8×D block, normalise rows by l.
+    threadgroup float* Osh = KV + int(sg) * 8 * D;
+    for (int d = 0; d < DD; d++) simdgroup_store(O[d], Osh + d * 8, D);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = l > 0 ? 1.0f / l : 0.0f;
+    if (rowValid) {
+        device float* op = out + (qRow0 + r) * p.outStride + h * D;
+        for (int c = int(lane) % 4; c < D; c += 4) op[c] = Osh[r * D + c] * inv;
+    }
+}
+
 // Elementwise ---------------------------------------------------------------
 // out[t, i] = silu(gu[t, i]) * gu[t, cols + i]
 kernel void silu_mul(device const float* gu  [[buffer(0)]],
@@ -615,5 +800,20 @@ INST_ATTN(4)
 INST_ATTN(5)
 INST_ATTN(6)
 INST_ATTN(8)
+#define INST_ATTNP(E, QB) \
+  template [[host_name("attention_prefill_" #E)]] kernel void attention_prefill<E, QB>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint, uint);
+INST_ATTNP(1, 8)
+INST_ATTNP(2, 8)
+INST_ATTNP(3, 8)
+INST_ATTNP(4, 8)
+INST_ATTNP(5, 4)
+INST_ATTNP(6, 4)
+INST_ATTNP(8, 4)
+#define INST_FLASH(DD) \
+  template [[host_name("flash_prefill_" #DD)]] kernel void flash_prefill<DD>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint, uint);
+INST_FLASH(4)
+INST_FLASH(8)
+INST_FLASH(12)
+INST_FLASH(16)
 """#
 }
