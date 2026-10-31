@@ -1,0 +1,14 @@
+// Cloudflare Workers static assets: the landing page at mlx-runner.21no.de.
+// Only site/ is published (headers in site/_headers). No build step is needed: site/ is committed,
+// and the page reads each release (version, files, sizes, SHA-256) from GitHub's API at runtime.
+{
+  "$schema": "https://unpkg.com/wrangler@latest/config-schema.json",
+  "name": "mlx-runner",
+  "compatibility_date": "2026-10-23",
+  "assets": {
+    "directory": "./site",
+    "not_found_handling": "none"
+  },
+  "workers_dev": true,
+  "preview_urls": false
+}

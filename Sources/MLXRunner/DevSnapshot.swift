@@ -6,9 +6,8 @@ import SwiftUI
 ///
 /// - `MLXRUNNER_SNAPSHOT=/dir`: renders each main screen offscreen to PNG (fast, headless, but
 ///   offscreen rendering skips Liquid Glass and vibrancy, so it is for layout review only).
-/// - `MLXRUNNER_TOUR=/dir`: drives the real window through each screen for real screenshots.
-///   At each step it writes `<dir>/ready-<name>` (holding the window number) and waits until
-///   `<dir>/<name>.png` exists; `scripts/shots.sh` takes the shots with `screencapture -l`.
+/// - `MLXRUNNER_TOUR=/dir`: drives the real window through each screen and captures it as the
+///   window server draws it (`<dir>/<name>.png`); see scripts/shots.sh.
 @MainActor
 enum DevSnapshot {
     static let env = ProcessInfo.processInfo.environment
@@ -85,14 +84,16 @@ enum DevSnapshot {
 
     private static func shot(_ name: String, window: NSWindow, dir: URL, settle: Double) async {
         try? await Task.sleep(nanoseconds: UInt64(settle * 1e9))
-        let png = dir.appendingPathComponent("\(name).png")
-        try? FileManager.default.removeItem(at: png)
-        try? String(window.windowNumber).write(to: dir.appendingPathComponent("ready-\(name)"), atomically: true, encoding: .utf8)
-        let deadline = Date().addingTimeInterval(60)
-        while !FileManager.default.fileExists(atPath: png.path), Date() < deadline {
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        try? await Task.sleep(nanoseconds: 300_000_000)  // let screencapture finish writing
+        // The window server composites the real window (Liquid Glass, vibrancy). Capturing a
+        // process's own window needs no Screen Recording permission. CGWindowListCreateImage is
+        // marked unavailable in the macOS 15 SDK but still works for this; it is looked up at run time.
+        typealias Fn = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
+        guard let sym = dlsym(dlopen(nil, RTLD_NOW), "CGWindowListCreateImage") else { return }
+        let create = unsafeBitCast(sym, to: Fn.self)
+        // kCGWindowListOptionIncludingWindow, kCGWindowImageBoundsIgnoreFraming
+        guard let image = create(.null, 1 << 3, UInt32(window.windowNumber), 1 << 0)?.takeRetainedValue() else { return }
+        let rep = NSBitmapImageRep(cgImage: image)
+        try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("\(name).png"))
     }
 
     static func capture(to url: URL) {
