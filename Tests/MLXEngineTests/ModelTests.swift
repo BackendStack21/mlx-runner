@@ -76,6 +76,38 @@ struct ModelTests {
     }
 
     @Test(.enabled(if: installedModel(qwen3) != nil))
+    func cancellingOneRequestDoesNotAffectAnother() async throws {
+        let engine = InferenceEngine()
+        _ = try await engine.load(directory: installedModel(Self.qwen3)!, contextLength: 1024)
+        var p = SamplingParameters()
+        p.temperature = 0
+        p.maxTokens = 32
+        let msgs = [ChatMessage(role: .user, content: "Count from 1 to 100.")]
+        let a = CancelToken(), b = CancelToken()
+        let streamA = engine.chat(msgs, parameters: p, enableThinking: false, token: a)
+        let streamB = engine.chat(msgs, parameters: p, enableThinking: false, token: b)
+        b.cancel()
+        var statsA = GenerationStats()
+        for try await ev in streamA { if case .finished(let s) = ev { statsA = s } }
+        #expect(statsA.stopReason != "cancelled" && statsA.generatedTokens > 0)
+        var eventsB = 0
+        for try await _ in streamB { eventsB += 1 }
+        #expect(eventsB == 0)
+
+        // Cancelling mid-stream stops promptly.
+        let c = CancelToken()
+        p.maxTokens = 2000
+        var n = 0
+        var reason = ""
+        for try await ev in engine.chat(msgs, parameters: p, enableThinking: false, token: c) {
+            if case .text = ev { n += 1; if n == 5 { c.cancel() } }
+            if case .finished(let s) = ev { reason = s.stopReason }
+        }
+        #expect(reason == "cancelled")
+        #expect(n < 20)
+    }
+
+    @Test(.enabled(if: installedModel(qwen3) != nil))
     func longConversationIsTrimmedToFitContext() async throws {
         let engine = InferenceEngine()
         _ = try await engine.load(directory: installedModel(Self.qwen3)!, contextLength: 256)

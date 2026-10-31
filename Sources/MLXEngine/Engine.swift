@@ -130,7 +130,7 @@ public final class InferenceEngine: @unchecked Sendable {
     private var stopIds: Set<Int> = []
     private var cachedTokens: [Int] = []
     private let cancelLock = NSLock()
-    private var cancelled = false
+    private var currentToken: CancelToken?
     public private(set) var info: LoadedModelInfo?
 
     public init() {}
@@ -186,48 +186,43 @@ public final class InferenceEngine: @unchecked Sendable {
         }
     }
 
+    /// Stops whichever request is currently generating (queued requests are unaffected).
     public func cancel() {
-        cancelLock.lock(); cancelled = true; cancelLock.unlock()
+        cancelLock.lock(); let t = currentToken; cancelLock.unlock()
+        t?.cancel()
     }
 
-    private var isCancelled: Bool {
-        cancelLock.lock(); defer { cancelLock.unlock() }
-        return cancelled
-    }
-
-    /// Streams a chat completion.
-    public func chat(_ messages: [ChatMessage], parameters: SamplingParameters = .init(), enableThinking: Bool = true)
-        -> AsyncThrowingStream<GenerationEvent, Error> {
-        AsyncThrowingStream { cont in
-            cancelLock.lock(); cancelled = false; cancelLock.unlock()
-            queue.async {
-                guard let tok = self.tokenizer, let tpl = self.template else {
-                    cont.finish(throwing: EngineError.invalidFile("No model loaded"))
-                    return
-                }
-                do {
-                    let tokens = self.fitToContext(messages, template: tpl, tokenizer: tok,
-                                                   reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking)
-                    try self.run(tokens: tokens, parameters: parameters) { cont.yield($0) }
-                    cont.finish()
-                } catch {
-                    cont.finish(throwing: error)
-                }
-            }
+    /// Streams a chat completion. Cancel with `token`, or simply stop consuming the stream.
+    public func chat(_ messages: [ChatMessage], parameters: SamplingParameters = .init(), enableThinking: Bool = true,
+                     token: CancelToken = CancelToken()) -> AsyncThrowingStream<GenerationEvent, Error> {
+        stream(token, parameters: parameters) { tok, tpl in
+            guard let tpl else { throw EngineError.invalidFile("No model loaded") }
+            return self.fitToContext(messages, template: tpl, tokenizer: tok,
+                                     reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking)
         }
     }
 
     /// Streams a raw completion for a prompt string (special tokens are parsed).
-    public func complete(_ prompt: String, parameters: SamplingParameters = .init()) -> AsyncThrowingStream<GenerationEvent, Error> {
+    public func complete(_ prompt: String, parameters: SamplingParameters = .init(),
+                         token: CancelToken = CancelToken()) -> AsyncThrowingStream<GenerationEvent, Error> {
+        stream(token, parameters: parameters) { tok, _ in tok.encode(prompt) }
+    }
+
+    private func stream(_ token: CancelToken, parameters: SamplingParameters,
+                        _ makeTokens: @escaping (Tokenizer, ChatTemplate?) throws -> [Int]) -> AsyncThrowingStream<GenerationEvent, Error> {
         AsyncThrowingStream { cont in
-            cancelLock.lock(); cancelled = false; cancelLock.unlock()
+            cont.onTermination = { _ in token.cancel() }
             queue.async {
+                guard !token.isCancelled else { cont.finish(); return }
                 guard let tok = self.tokenizer else {
                     cont.finish(throwing: EngineError.invalidFile("No model loaded"))
                     return
                 }
+                self.cancelLock.lock(); self.currentToken = token; self.cancelLock.unlock()
+                defer { self.cancelLock.lock(); self.currentToken = nil; self.cancelLock.unlock() }
                 do {
-                    try self.run(tokens: tok.encode(prompt), parameters: parameters) { cont.yield($0) }
+                    let tokens = try makeTokens(tok, self.template)
+                    try self.run(tokens: tokens, parameters: parameters, token: token) { cont.yield($0) }
                     cont.finish()
                 } catch {
                     cont.finish(throwing: error)
@@ -262,7 +257,7 @@ public final class InferenceEngine: @unchecked Sendable {
         return tokens
     }
 
-    private func run(tokens: [Int], parameters: SamplingParameters, emit: (GenerationEvent) -> Void) throws {
+    private func run(tokens: [Int], parameters: SamplingParameters, token: CancelToken, emit: (GenerationEvent) -> Void) throws {
         guard let model, let tok = tokenizer else { throw EngineError.invalidFile("No model loaded") }
         var stats = GenerationStats()
         stats.promptTokens = tokens.count
@@ -291,7 +286,7 @@ public final class InferenceEngine: @unchecked Sendable {
         stats.stopReason = "length"
         let maxNew = min(parameters.maxTokens, model.maxSeq - tokens.count)
         for _ in 0..<max(0, maxNew) {
-            if isCancelled { stats.stopReason = "cancelled"; break }
+            if token.isCancelled { stats.stopReason = "cancelled"; break }
             let window = history.suffix(parameters.repetitionWindow)
             let next = sampler.sample(logits, count: min(model.vocabSize, tok.vocabularySize), recent: window)
             if stopIds.contains(next) { stats.stopReason = "stop"; break }
@@ -330,4 +325,13 @@ extension InferenceEngine {
             throw EngineError.unsupported("needs \(f.string(fromByteCount: Int64(need))) (weights + \(ctx)-token KV cache) but the GPU can use about \(f.string(fromByteCount: Int64(budget))). Try a smaller quantization or a shorter context length.")
         }
     }
+}
+
+/// Cancels one generation request. Thread-safe.
+public final class CancelToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+    public init() {}
+    public func cancel() { lock.lock(); flag = true; lock.unlock() }
+    public var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return flag }
 }

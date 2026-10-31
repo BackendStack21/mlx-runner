@@ -211,19 +211,20 @@ public final class OpenAIServer: @unchecked Sendable {
         let id = (chat ? "chatcmpl-" : "cmpl-") + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24).lowercased()
         let created = Int(Date().timeIntervalSince1970)
         let model = info.name
-        let events = chat ? engine.chat(messages, parameters: params, enableThinking: enableThinking)
-            : engine.complete(prompt, parameters: params)
+        let cancelToken = CancelToken()
+        let events = chat ? engine.chat(messages, parameters: params, enableThinking: enableThinking, token: cancelToken)
+            : engine.complete(prompt, parameters: params, token: cancelToken)
         var filter = StopFilter(stops: stops)
         var stats = GenerationStats()
         var stoppedBySequence = false
 
         if stream {
             // Watch for client disconnect while we stream.
-            conn.onClientGone = { engine.cancel() }
+            conn.onClientGone = { cancelToken.cancel() }
             guard await conn.sendHead(status: 200, headers: [
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache",
-            ]) else { engine.cancel(); await Self.drain(events); return 499 }
+            ]) else { cancelToken.cancel(); await Self.drain(events); return 499 }
             conn.watchForDisconnect()
 
             func chunk(delta: [String: Any]?, text: String?, finish: String?) -> [String: Any] {
@@ -240,7 +241,7 @@ public final class OpenAIServer: @unchecked Sendable {
             if chat { alive = await send(chunk(delta: ["role": "assistant", "content": ""], text: nil, finish: nil)) }
             do {
                 for try await ev in events {
-                    guard alive else { engine.cancel(); continue }
+                    guard alive else { cancelToken.cancel(); continue }
                     switch ev {
                     case .promptProcessed(let s): stats = s
                     case .text(let t):
@@ -249,7 +250,7 @@ public final class OpenAIServer: @unchecked Sendable {
                         if !out.isEmpty {
                             alive = await send(chunk(delta: ["content": out], text: out, finish: nil))
                         }
-                        if hit { stoppedBySequence = true; engine.cancel() }
+                        if hit { stoppedBySequence = true; cancelToken.cancel() }
                     case .finished(let s): stats = s
                     }
                 }
@@ -277,7 +278,7 @@ public final class OpenAIServer: @unchecked Sendable {
         }
 
         // Non-streaming.
-        conn.onClientGone = { engine.cancel() }
+        conn.onClientGone = { cancelToken.cancel() }
         conn.watchForDisconnect()
         var text = ""
         do {
@@ -288,7 +289,7 @@ public final class OpenAIServer: @unchecked Sendable {
                     guard !stoppedBySequence else { continue }
                     let (out, hit) = filter.feed(t)
                     text += out
-                    if hit { stoppedBySequence = true; engine.cancel() }
+                    if hit { stoppedBySequence = true; cancelToken.cancel() }
                 case .finished(let s): stats = s
                 }
             }

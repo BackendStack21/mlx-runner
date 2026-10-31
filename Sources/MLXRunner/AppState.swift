@@ -72,6 +72,7 @@ final class AppState {
 
     @ObservationIgnored private var activeDownloads: [String: ModelDownload] = [:]
     @ObservationIgnored private var generationTask: Task<Void, Never>?
+    @ObservationIgnored private var generationToken: CancelToken?
     @ObservationIgnored private var saveTask: Task<Void, Never>?
     let engine = InferenceEngine.shared
 
@@ -246,7 +247,7 @@ final class AppState {
     }
 
     func stopGeneration() {
-        engine.cancel()
+        generationToken?.cancel()
     }
 
     private func generate(in id: UUID) {
@@ -269,6 +270,8 @@ final class AppState {
         let params = sampling
         let thinking = enableThinking
         let replyID = reply.id
+        let token = CancelToken()
+        generationToken = token
 
         generationTask = Task {
             var raw = ""
@@ -298,7 +301,7 @@ final class AppState {
                 }
             }
             do {
-                for try await ev in engine.chat(history, parameters: params, enableThinking: thinking) {
+                for try await ev in engine.chat(history, parameters: params, enableThinking: thinking, token: token) {
                     switch ev {
                     case .promptProcessed(let s):
                         genStart = Date()
