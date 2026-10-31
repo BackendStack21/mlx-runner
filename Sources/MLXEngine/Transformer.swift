@@ -164,15 +164,26 @@ final class Linear {
 
     // Embedding-table access (row lookup) for quantized or dense weights.
     func encodeLookup(_ enc: MTLComputeCommandEncoder, ids: MTLBuffer, out: MTLBuffer, T: Int) throws {
-        if let s = scales, let b = biases, let sfx = s.dtype.suffix {
-            enc.setComputePipelineState(try GPU.shared.pipeline("qembed_\(bits)_\(sfx)"))
+        encodeLookup(enc, pso: try lookupPipeline(), ids: ids, out: out, T: T)
+    }
+
+    /// The row-lookup pipeline for this table; resolve it once rather than on every step.
+    func lookupPipeline() throws -> MTLComputePipelineState {
+        if scales != nil, biases != nil, let sfx = scales?.dtype.suffix { return try GPU.shared.pipeline("qembed_\(bits)_\(sfx)") }
+        guard let sfx = weight.dtype.suffix else { throw EngineError.unsupported("embedding dtype \(weight.dtype)") }
+        return try GPU.shared.pipeline("dembed_\(sfx)")
+    }
+
+    /// `pso` must come from `lookupPipeline()` of this layer.
+    func encodeLookup(_ enc: MTLComputeCommandEncoder, pso: MTLComputePipelineState, ids: MTLBuffer, out: MTLBuffer, T: Int) {
+        enc.setComputePipelineState(pso)
+        if let s = scales, let b = biases, s.dtype.suffix != nil {
             enc.set(weight, 0); enc.set(s, 1); enc.set(b, 2)
             enc.set(ids, 0, 3); enc.set(out, 0, 4)
             enc.params(MMParams(K: Int32(inDim), O: Int32(outDim), T: Int32(T), gs: Int32(groupSize), xStride: 0, yStride: 0), 5)
             enc.dispatchThreads(MTLSize(width: inDim / 8, height: T, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: min(256, inDim / 8), height: 1, depth: 1))
         } else {
-            enc.setComputePipelineState(try GPU.shared.pipeline("dembed_\(weight.dtype.suffix!)"))
             enc.set(weight, 0); enc.set(ids, 0, 3); enc.set(out, 0, 4)
             enc.params(MMParams(K: Int32(inDim), O: Int32(outDim), T: Int32(T), gs: 0, xStride: 0, yStride: 0), 5)
             enc.dispatchThreads(MTLSize(width: inDim, height: T, depth: 1),
@@ -287,6 +298,11 @@ public final class Transformer {
     private let prefillQB: Int
     private let siluPSO: MTLComputePipelineState
     private let addPSO: MTLComputePipelineState
+    private let embedPSO: MTLComputePipelineState
+    /// The next decode step (T = 1, at `offset`), encoded while the previous one ran on the GPU.
+    /// Encoding does not depend on the token id (read from `ids` at execution time), only on
+    /// the position, so it is committed only for an exact (T = 1, offset) match.
+    private var prepared: (cb: MTLCommandBuffer, offset: Int)?
 
     private let qkvCols: Int
     public private(set) var lastGPUTime: Double = 0
@@ -347,6 +363,7 @@ public final class Transformer {
         }
         siluPSO = try gpu.pipeline("silu_mul")
         addPSO = try gpu.pipeline("add_inplace")
+        embedPSO = try embed.lookupPipeline()
     }
 
     /// Runs `tokens` at positions offset..<offset+count, updating the KV cache.
@@ -373,17 +390,42 @@ public final class Transformer {
     }
 
     private func step(_ tokens: [Int32], offset: Int, computeLogits: Bool, allLogits: Bool = false) throws {
-        let c = config
         let T = tokens.count
+        // A prepared buffer is exactly what encode(T: 1, offset:, computeLogits: true, allLogits: false)
+        // returns now, so using it changes nothing on the GPU. Any other call shape discards it.
+        var ready: MTLCommandBuffer?
+        if T == 1, computeLogits, !allLogits, let p = prepared, p.offset == offset { ready = p.cb }
+        prepared = nil
+        let cb = try ready ?? encode(T: T, offset: offset, computeLogits: computeLogits, allLogits: allLogits)
+        // The previous step has completed (waited below), so `ids` is free to overwrite.
+        tokens.withUnsafeBytes { raw in ids.contents().copyMemory(from: raw.baseAddress!, byteCount: raw.count) }
+        cb.commit()
+        // Overlap CPU encoding of the likely next decode step (the following position) with this
+        // step's GPU work. It is only committed after this buffer completes, on an exact match.
+        if computeLogits, offset + T < maxSeq, let next = try? encode(T: 1, offset: offset + T, computeLogits: true, allLogits: false) {
+            prepared = (next, offset + T)
+        }
+        cb.waitUntilCompleted()
+        lastGPUTime = cb.gpuEndTime - cb.gpuStartTime
+        if let err = cb.error {
+            prepared = nil
+            throw EngineError.kernelCompile("GPU error: \(err.localizedDescription)")
+        }
+    }
+
+    /// Encodes one forward pass over T tokens at positions offset..<offset+T. Token ids are read from
+    /// `ids` when the buffer executes, so the encoding depends only on (T, offset, computeLogits, allLogits).
+    private func encode(T: Int, offset: Int, computeLogits: Bool, allLogits: Bool) throws -> MTLCommandBuffer {
+        let c = config
         let H = c.hiddenSize, D = c.headDim, I = c.intermediateSize
         let nH = c.numHeads, nKV = c.numKVHeads
-        tokens.withUnsafeBytes { raw in ids.contents().copyMemory(from: raw.baseAddress!, byteCount: raw.count) }
+        guard T > 0, T <= maxBatch, offset >= 0, offset + T <= maxSeq else { throw EngineError.contextFull }
 
         guard let cb = GPU.shared.queue.makeCommandBufferWithUnretainedReferences(),
               let enc = cb.makeComputeCommandEncoder(dispatchType: .serial) else {
             throw EngineError.noMetalDevice
         }
-        try embed.encodeLookup(enc, ids: ids, out: h, T: T)
+        embed.encodeLookup(enc, pso: embedPSO, ids: ids, out: h, T: T)
         layers[0].inputNorm.encode(enc, x: h, y: xn, dim: H, rows: T, rowStride: H)
 
         let kCol = nH * D, vCol = (nH + nKV) * D
@@ -462,10 +504,7 @@ public final class Transformer {
             lmHead.encode(enc, x: xn, xOffset: (T - 1) * H * 4, xStride: H, y: logits, yStride: lmHead.outDim, T: 1)
         }
         enc.endEncoding()
-        cb.commit()
-        cb.waitUntilCompleted()
-        lastGPUTime = cb.gpuEndTime - cb.gpuStartTime
-        if let err = cb.error { throw EngineError.kernelCompile("GPU error: \(err.localizedDescription)") }
+        return cb
     }
 
     func add(_ enc: MTLComputeCommandEncoder, _ a: MTLBuffer, _ b: MTLBuffer, _ n: Int) {
