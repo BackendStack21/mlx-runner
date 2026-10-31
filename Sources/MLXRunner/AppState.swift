@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import MLXEngine
 import Observation
@@ -15,6 +16,10 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     var date = Date()
     var error: String?
     var reasoningSeconds: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case id, role, content, reasoning, stats, model, date, error, reasoningSeconds
+    }
 }
 
 struct Conversation: Codable, Identifiable, Hashable {
@@ -24,6 +29,51 @@ struct Conversation: Codable, Identifiable, Hashable {
     var created = Date()
     var updated = Date()
     var systemPrompt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, messages, created, updated, systemPrompt
+    }
+}
+
+// Tolerant decoding (in extensions so the memberwise initializers stay): missing or
+// reshaped fields fall back to defaults instead of failing the whole chats.json.
+extension StoredMessage {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decodeIfPresent(UUID.self, forKey: .id)) ?? UUID()
+        role = (try? c.decodeIfPresent(ChatMessage.Role.self, forKey: .role)) ?? .assistant
+        content = (try? c.decodeIfPresent(String.self, forKey: .content)) ?? ""
+        reasoning = try? c.decodeIfPresent(String.self, forKey: .reasoning)
+        stats = try? c.decodeIfPresent(GenerationStats.self, forKey: .stats)
+        model = try? c.decodeIfPresent(String.self, forKey: .model)
+        date = (try? c.decodeIfPresent(Date.self, forKey: .date)) ?? Date()
+        error = try? c.decodeIfPresent(String.self, forKey: .error)
+        reasoningSeconds = try? c.decodeIfPresent(Double.self, forKey: .reasoningSeconds)
+    }
+}
+
+extension Conversation {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decodeIfPresent(UUID.self, forKey: .id)) ?? UUID()
+        title = (try? c.decodeIfPresent(String.self, forKey: .title)) ?? "New Chat"
+        messages = (try? c.decodeIfPresent([StoredMessage].self, forKey: .messages)) ?? []
+        created = (try? c.decodeIfPresent(Date.self, forKey: .created)) ?? Date()
+        updated = (try? c.decodeIfPresent(Date.self, forKey: .updated)) ?? created
+        systemPrompt = try? c.decodeIfPresent(String.self, forKey: .systemPrompt)
+    }
+}
+
+/// Serializes chats.json writes; a stale snapshot never overwrites a newer one.
+final class ChatWriter: @unchecked Sendable {
+    let queue = DispatchQueue(label: "de.21no.mlxrunner.chats", qos: .utility)
+    private var lastSeq = 0  // only touched on `queue`
+
+    func write(_ snapshot: [Conversation], seq: Int, to url: URL) {
+        guard seq > lastSeq, let data = try? JSONEncoder().encode(snapshot) else { return }
+        lastSeq = seq
+        try? data.write(to: url, options: .atomic)
+    }
 }
 
 enum SidebarItem: Hashable {
@@ -62,6 +112,8 @@ final class AppState {
     var draft: String = ""
     var liveTokens = 0
     var liveTokensPerSecond: Double = 0
+    /// Non-fatal persistence problem to show the user (e.g. an unreadable chats.json).
+    var persistenceError: String?
 
     // Settings (persisted in UserDefaults)
     var sampling = SamplingParameters() { didSet { saveSettings() } }
@@ -74,6 +126,11 @@ final class AppState {
     @ObservationIgnored private var generationTask: Task<Void, Never>?
     @ObservationIgnored private var generationToken: CancelToken?
     @ObservationIgnored private var saveTask: Task<Void, Never>?
+    @ObservationIgnored private var saveSeq = 0
+    /// Set when an unreadable chats.json could not be moved aside: never overwrite it.
+    @ObservationIgnored private var chatsSaveBlocked = false
+    @ObservationIgnored private let chatWriter = ChatWriter()
+    @ObservationIgnored private var terminateObserver: NSObjectProtocol?
     let engine = InferenceEngine.shared
 
     static let supportDir: URL = {
@@ -89,6 +146,12 @@ final class AppState {
         loadChats()
         refreshModels()
         if let first = conversations.first { selection = .chat(first.id) }
+        // Flush pending chat edits synchronously before the process exits.
+        terminateObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.saveNow(synchronously: true) }
+        }
         // Compile Metal kernels in the background so the first load is instant.
         Task.detached(priority: .utility) { GPU.prepare() }
     }
@@ -150,7 +213,12 @@ final class AppState {
 
     func download(_ details: HubModelDetails) {
         guard activeDownloads[details.id] == nil else { return }
-        let dl = ModelDownload(details: details, destination: ModelStore.directory(for: details.id))
+        let destination: URL
+        do { destination = try ModelStore.directory(for: details.id) } catch {
+            downloads[details.id] = DownloadState(error: error.localizedDescription)
+            return
+        }
+        let dl = ModelDownload(details: details, destination: destination)
         activeDownloads[details.id] = dl
         downloads[details.id] = DownloadState(total: Int64(details.downloadSize))
         let repo = details.id
@@ -228,6 +296,8 @@ final class AppState {
             conversations[i].title = String(trimmed.split(separator: "\n").first ?? "").prefix(48).description
         }
         generate(in: id)
+        // Persist the user's message right away, not only when generation finishes.
+        saveNow()
     }
 
     func regenerate(in id: UUID) {
@@ -301,7 +371,8 @@ final class AppState {
                 }
             }
             do {
-                for try await ev in engine.chat(history, parameters: params, enableThinking: thinking, token: token) {
+                for try await ev in engine.chat(history, parameters: params, enableThinking: thinking,
+                                                 conversationID: id.uuidString, token: token) {
                     switch ev {
                     case .promptProcessed(let s):
                         genStart = Date()
@@ -331,22 +402,63 @@ final class AppState {
 
     // MARK: Persistence
 
+    /// Debounced save (coalesces bursts of edits).
     func scheduleSave() {
-        guard !DevSnapshot.isActive else { return }
+        guard !DevSnapshot.isActive, !chatsSaveBlocked else { return }
         saveTask?.cancel()
+        saveSeq += 1
+        let seq = saveSeq
         let snapshot = conversations
         let url = chatsURL
+        let writer = chatWriter
         saveTask = Task.detached(priority: .background) {
             try? await Task.sleep(nanoseconds: 400_000_000)
             guard !Task.isCancelled else { return }
-            if let data = try? JSONEncoder().encode(snapshot) { try? data.write(to: url, options: .atomic) }
+            writer.queue.async { writer.write(snapshot, seq: seq, to: url) }
+        }
+    }
+
+    /// Writes chats now. `synchronously` blocks until the file is on disk (used at termination).
+    func saveNow(synchronously: Bool = false) {
+        guard !DevSnapshot.isActive, !chatsSaveBlocked else { return }
+        saveTask?.cancel()
+        saveTask = nil
+        saveSeq += 1
+        let seq = saveSeq
+        let snapshot = conversations
+        let url = chatsURL
+        let writer = chatWriter
+        if synchronously {
+            writer.queue.sync { writer.write(snapshot, seq: seq, to: url) }
+        } else {
+            writer.queue.async { writer.write(snapshot, seq: seq, to: url) }
         }
     }
 
     private func loadChats() {
-        guard let data = try? Data(contentsOf: chatsURL),
-              let c = try? JSONDecoder().decode([Conversation].self, from: data) else { return }
-        conversations = c.sorted { $0.updated > $1.updated }
+        if DevSnapshot.isActive {
+            // Snapshot runs never touch the user's files, not even to quarantine a bad one.
+            if let data = try? Data(contentsOf: chatsURL),
+               let c = try? JSONDecoder().decode([Conversation].self, from: data) {
+                conversations = c.sorted { $0.updated > $1.updated }
+            }
+            return
+        }
+        switch SafeJSONFile.load([Conversation].self, from: chatsURL) {
+        case .missing:
+            return
+        case .loaded(let c):
+            conversations = c.sorted { $0.updated > $1.updated }
+        case .corrupt(let error, let movedTo):
+            if let movedTo {
+                persistenceError = "Your chat history could not be read (\(error.localizedDescription)). "
+                    + "It was kept as \(movedTo.lastPathComponent) in \(movedTo.deletingLastPathComponent().path), and a new history was started."
+            } else {
+                chatsSaveBlocked = true
+                persistenceError = "Your chat history could not be read (\(error.localizedDescription)) and could not be moved aside. "
+                    + "Chats will not be saved this session so \(chatsURL.path) is not overwritten."
+            }
+        }
     }
 
     private func loadSettings() {

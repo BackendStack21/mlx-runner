@@ -30,12 +30,16 @@ public enum ModelStore {
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/huggingface/hub")
     }
 
-    public static func directory(for repo: String) -> URL {
-        root.appendingPathComponent(repo, isDirectory: true)
+    /// Library folder for a repo id. Throws `HubError.invalidRepoID` unless `repo` is a plain
+    /// `owner/name` id, so a crafted id can never escape `root`.
+    public static func directory(for repo: String) throws -> URL {
+        try RepoID.validate(repo)
+        return root.appendingPathComponent(repo, isDirectory: true)
     }
 
     public static func isInstalled(_ repo: String) -> Bool {
-        FileManager.default.fileExists(atPath: directory(for: repo).appendingPathComponent(".complete").path)
+        guard let dir = try? directory(for: repo) else { return false }
+        return FileManager.default.fileExists(atPath: dir.appendingPathComponent(".complete").path)
     }
 
     /// Lists models in the app library and in the Hugging Face cache.
@@ -98,5 +102,44 @@ public enum ModelStore {
         return LocalModel(repo: repo, directory: dir, sizeBytes: size,
                           modelType: (cfg["model_type"] as? String)?.lowercased(),
                           bits: (q?["bits"] as? NSNumber)?.intValue, source: source)
+    }
+}
+
+/// Loads JSON documents without ever losing the user's data: a file that fails to decode is
+/// moved aside to `<name>.corrupt-<timestamp>.<ext>` instead of being silently overwritten.
+public enum SafeJSONFile {
+    public enum LoadResult<T> {
+        /// No file yet.
+        case missing
+        case loaded(T)
+        /// Decoding failed. `movedTo` is the quarantined copy, or nil if moving it aside failed
+        /// (callers must then avoid overwriting the original).
+        case corrupt(error: Error, movedTo: URL?)
+    }
+
+    public static func load<T: Decodable>(_ type: T.Type, from url: URL, decoder: JSONDecoder = JSONDecoder(),
+                                          now: Date = Date()) -> LoadResult<T> {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else { return .missing }
+        do {
+            let data = try Data(contentsOf: url)
+            return .loaded(try decoder.decode(T.self, from: data))
+        } catch {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = "yyyyMMdd-HHmmss"
+            let ext = url.pathExtension
+            let stem = url.deletingPathExtension().lastPathComponent
+            var target = url.deletingLastPathComponent()
+                .appendingPathComponent("\(stem).corrupt-\(f.string(from: now))" + (ext.isEmpty ? "" : ".\(ext)"))
+            var n = 1
+            while fm.fileExists(atPath: target.path) {
+                target = url.deletingLastPathComponent()
+                    .appendingPathComponent("\(stem).corrupt-\(f.string(from: now))-\(n)" + (ext.isEmpty ? "" : ".\(ext)"))
+                n += 1
+            }
+            let moved = (try? fm.moveItem(at: url, to: target)) != nil
+            return .corrupt(error: error, movedTo: moved ? target : nil)
+        }
     }
 }

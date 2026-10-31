@@ -69,6 +69,43 @@ struct RootView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .modifier(SafeLinkHandling())
+        .alert("Chat history", isPresented: Binding(
+            get: { state.persistenceError != nil },
+            set: { if !$0 { state.persistenceError = nil } })
+        ) {
+            Button("Show in Finder") { NSWorkspace.shared.open(AppState.supportDir) }
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(state.persistenceError ?? "")
+        }
+    }
+}
+
+/// Routes every link opened from SwiftUI views (Markdown model cards, model output) through
+/// `LinkPolicy`: https huggingface.co opens directly, other http(s)/mailto links ask first and
+/// show the real URL, and every other scheme (file:, smb:, custom app schemes) is discarded.
+struct SafeLinkHandling: ViewModifier {
+    @State private var pending: URL?
+
+    func body(content: Content) -> some View {
+        content
+            .environment(\.openURL, OpenURLAction { url in
+                switch LinkPolicy.decide(url) {
+                case .open: return .systemAction
+                case .confirm:
+                    pending = url
+                    return .handled
+                case .discard: return .discarded
+                }
+            })
+            .alert("Open this link?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } }),
+                   presenting: pending) { url in
+                Button("Open") { NSWorkspace.shared.open(url) }
+                Button("Cancel", role: .cancel) {}
+            } message: { url in
+                Text(url.absoluteString)
+            }
     }
 }
 

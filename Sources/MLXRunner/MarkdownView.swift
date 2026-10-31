@@ -1,4 +1,5 @@
 import AppKit
+import MLXEngine
 import SwiftUI
 
 /// Block-level Markdown renderer: headings, lists, quotes, code fences, tables, rules.
@@ -56,7 +57,9 @@ struct MarkdownView: View {
 
     private func inline(_ s: String) -> Text {
         if let a = try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
-            return Text(a)
+            // file:, smb:, custom app schemes etc. are never clickable; the rest goes through
+            // the OpenURLAction installed by SafeLinkHandling at the window root.
+            return Text(LinkPolicy.sanitize(a))
         }
         return Text(s)
     }
