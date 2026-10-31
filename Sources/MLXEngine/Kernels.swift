@@ -375,6 +375,103 @@ kernel void qgemm(device const uchar* w      [[buffer(0)]],
     gemm_store(Xs, C, y, p, tBase, oBase, sm, sn, tid);
 }
 
+// ---------------------------------------------------------------------------
+// Short prompts (5..16 tokens): qgemm pads every batch to a 32-token tile, so
+// 5 tokens cost as much MMA work as 32. This variant uses a BM = 8 or 16 token
+// tile. Each output element sees exactly the same chain as in qgemm (fp32
+// dequant s * q + b, x zero-padded, 8×8×8 multiply-accumulates with k ascending
+// in steps of 8, rows and columns 8-aligned), so results match qgemm.
+// 4 simdgroups each own 8 of the tile's 32 output columns. K-step 64 halves the
+// barriers per MMA, and the next step's weights / activations are fetched into
+// registers before the current step's MMAs run. Requires K % 64 == 0.
+// ---------------------------------------------------------------------------
+#define SBK 64
+
+template <int BITS, typename T>
+inline void gemm_dequant8(device const uchar* wrow, device const T* srow, device const T* brow,
+                          int k, int gs, bool ok, thread float4& qa, thread float4& qb) {
+    qa = float4(0); qb = float4(0);
+    if (ok) {
+        unpack8<BITS>(wrow + ulong(k) * BITS / 8, qa, qb);
+        const int g = k / gs;
+        const float s = float(srow[g]), b = float(brow[g]);
+        qa = qa * s + b; qb = qb * s + b;
+    }
+}
+
+template <int BITS, typename T, int BM>
+kernel void qgemms(device const uchar* w      [[buffer(0)]],
+                   device const T*     scales [[buffer(1)]],
+                   device const T*     biases [[buffer(2)]],
+                   device const float* x      [[buffer(3)]],
+                   device float*       y      [[buffer(4)]],
+                   constant MMParams&  p      [[buffer(5)]],
+                   uint2 tgid [[threadgroup_position_in_grid]],
+                   uint  tid  [[thread_index_in_threadgroup]],
+                   uint  sgid [[simdgroup_index_in_threadgroup]]) {
+    static_assert(BM == 8 || BM == 16, "token tile");
+    constexpr int XV = BM * SBK / 4 / 128;      // float4s of x staged per thread per step (1 or 2)
+    threadgroup float Xs[BM * SBK];             // also the output staging area (BM × GBN floats)
+    threadgroup float Ws[GBN * SBK];
+    const int oBase = int(tgid.x) * GBN, tBase = int(tgid.y) * BM;
+    const int sn = int(sgid);                   // output columns sn*8 ..< sn*8+8 of the tile
+    simdgroup_matrix<float, 8, 8> C[BM / 8];
+    for (int i = 0; i < BM / 8; i++) C[i] = simdgroup_matrix<float, 8, 8>(0);
+    const ulong rowBytes = ulong(p.K) * BITS / 8;
+    const int gpr = p.K / p.gs;
+    // Dequantization: thread → weight row tid / 4, 8-value chunks (tid % 4) and (tid % 4) + 4.
+    const int wr = int(tid) / 4, wc = int(tid) % 4;
+    const int orow = oBase + wr;
+    const bool rowOK = orow < p.O;
+    const ulong srcRow = rowOK ? ulong(orow) : 0ul;
+    device const uchar* wrow = w + srcRow * rowBytes;
+    device const T* srow = scales + srcRow * ulong(gpr);
+    device const T* brow = biases + srcRow * ulong(gpr);
+    // Activations: float4 index tid + 128 v → token row idx / 16, column (idx % 16) * 4.
+    int xr[XV], xc[XV];
+    bool xok[XV];
+    for (int v = 0; v < XV; v++) {
+        const int idx = int(tid) + 128 * v;
+        xr[v] = idx / (SBK / 4); xc[v] = (idx % (SBK / 4)) * 4;
+        xok[v] = tBase + xr[v] < p.T;
+    }
+    float4 wq[4], xq[XV];
+    gemm_dequant8<BITS, T>(wrow, srow, brow, wc * 8, p.gs, rowOK, wq[0], wq[1]);
+    gemm_dequant8<BITS, T>(wrow, srow, brow, (wc + 4) * 8, p.gs, rowOK, wq[2], wq[3]);
+    for (int v = 0; v < XV; v++)
+        xq[v] = xok[v] ? *(device const float4*)(x + (tBase + xr[v]) * p.xStride + xc[v]) : float4(0);
+    for (int k0 = 0; k0 < p.K; k0 += SBK) {
+        for (int v = 0; v < XV; v++) *(threadgroup float4*)(Xs + xr[v] * SBK + xc[v]) = xq[v];
+        *(threadgroup float4*)(Ws + wr * SBK + wc * 8) = wq[0];
+        *(threadgroup float4*)(Ws + wr * SBK + wc * 8 + 4) = wq[1];
+        *(threadgroup float4*)(Ws + wr * SBK + (wc + 4) * 8) = wq[2];
+        *(threadgroup float4*)(Ws + wr * SBK + (wc + 4) * 8 + 4) = wq[3];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int kn = k0 + SBK;
+        if (kn < p.K) {                         // prefetch the next step while this one multiplies
+            gemm_dequant8<BITS, T>(wrow, srow, brow, kn + wc * 8, p.gs, rowOK, wq[0], wq[1]);
+            gemm_dequant8<BITS, T>(wrow, srow, brow, kn + (wc + 4) * 8, p.gs, rowOK, wq[2], wq[3]);
+            for (int v = 0; v < XV; v++)
+                xq[v] = xok[v] ? *(device const float4*)(x + (tBase + xr[v]) * p.xStride + kn + xc[v]) : float4(0);
+        }
+        for (int kk = 0; kk < SBK; kk += 8) {
+            simdgroup_matrix<float, 8, 8> A, B;
+            simdgroup_load(B, Ws + (sn * 8) * SBK + kk, SBK, ulong2(0, 0), true);
+            for (int i = 0; i < BM / 8; i++) {
+                simdgroup_load(A, Xs + (i * 8) * SBK + kk, SBK);
+                simdgroup_multiply_accumulate(C[i], A, B, C[i]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int i = 0; i < BM / 8; i++) simdgroup_store(C[i], Xs + (i * 8) * GBN + sn * 8, GBN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int idx = int(tid); idx < BM * GBN; idx += 128) {
+        const int r = idx / GBN, c = idx % GBN;
+        if (tBase + r < p.T && oBase + c < p.O) y[(tBase + r) * p.yStride + oBase + c] = Xs[idx];
+    }
+}
+
 template <typename T>
 kernel void dgemm(device const T*     w [[buffer(0)]],
                   device const float* x [[buffer(3)]],
@@ -587,8 +684,44 @@ kernel void add_rms_norm(device float*       hbuf [[buffer(0)]],
 }
 
 // Causal attention over the KV cache with grouped-query heads.
-// One threadgroup per (head, query token); simdgroups split the keys and
-// keep an online softmax, then merge their partial results.
+// One threadgroup per (head, query token); ANSG simdgroups split the keys
+// (simdgroup s takes keys s, s+ANSG, ...) and keep an online softmax, then
+// merge their partial results in simdgroup order. AU keys' K/V rows can be
+// loaded up front (same arithmetic order as one key at a time); measured on an
+// M2 Pro, AU = 4 was no faster than 1 at 16 tokens of context, so it stays 1.
+#define AU 1
+
+// One online-softmax step for one key: k/v are this lane's E elements.
+template <int E>
+inline void attn_update(thread const float* qr, thread float* acc, thread float& m, thread float& l,
+                        thread const half* k, thread const half* v) {
+    float s = 0.0f;
+    for (int e = 0; e < E; e++) s += qr[e] * float(k[e]);
+    s = simd_sum(s);
+    const float mn = max(m, s);
+    const float cr = exp(m - mn), pe = exp(s - mn);
+    l = l * cr + pe;
+    for (int e = 0; e < E; e++) acc[e] = acc[e] * cr + pe * float(v[e]);
+    m = mn;
+}
+
+// Merges N partial (max, sum, acc) results in order 0..N-1 and writes the output row.
+template <int E, int N, typename P>
+inline void attn_merge(P tm, P tl, P ta, uint lane, device float* op) {
+    float M = -1e30f;
+    for (int s = 0; s < N; s++) M = max(M, tm[s]);
+    float Ls = 0.0f;
+    float o[E];
+    for (int e = 0; e < E; e++) o[e] = 0.0f;
+    for (int s = 0; s < N; s++) {
+        const float f = exp(tm[s] - M);
+        Ls += tl[s] * f;
+        for (int e = 0; e < E; e++) o[e] += ta[s * E * 32 + e * 32 + lane] * f;
+    }
+    const float inv = 1.0f / Ls;
+    for (int e = 0; e < E; e++) op[e * 32 + lane] = o[e] * inv;
+}
+
 template <int E, int ANSG>
 kernel void attention(device const float* qkv [[buffer(0)]],
                       device const half*  kc  [[buffer(1)]],
@@ -607,38 +740,89 @@ kernel void attention(device const float* qkv [[buffer(0)]],
     const int L = p.offset + t + 1;
     device const half* kb = kc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
     device const half* vb = vc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
-    for (int j = int(sg); j < L; j += ANSG) {
-        device const half* kp = kb + ulong(j) * ulong(p.D);
-        float s = 0.0f;
-        for (int e = 0; e < E; e++) s += qr[e] * float(kp[e * 32 + lane]);
-        s = simd_sum(s);
-        const float mn = max(m, s);
-        const float cr = exp(m - mn), pe = exp(s - mn);
-        l = l * cr + pe;
-        device const half* vp = vb + ulong(j) * ulong(p.D);
-        for (int e = 0; e < E; e++) acc[e] = acc[e] * cr + pe * float(vp[e * 32 + lane]);
-        m = mn;
+    for (int j0 = int(sg); j0 < L; j0 += ANSG * AU) {
+        half kh[AU][E], vh[AU][E];
+        for (int u = 0; u < AU; u++) {
+            const int j = min(j0 + u * ANSG, L - 1);   // clamped: rows past L are loaded but unused
+            device const half* kp = kb + ulong(j) * ulong(p.D);
+            device const half* vp = vb + ulong(j) * ulong(p.D);
+            for (int e = 0; e < E; e++) { kh[u][e] = kp[e * 32 + lane]; vh[u][e] = vp[e * 32 + lane]; }
+        }
+        for (int u = 0; u < AU; u++)
+            if (j0 + u * ANSG < L) attn_update<E>(qr, acc, m, l, kh[u], vh[u]);
     }
     threadgroup float tm[ANSG], tl[ANSG];
     threadgroup float ta[ANSG * E * 32];
     if (lane == 0) { tm[sg] = m; tl[sg] = l; }
     for (int e = 0; e < E; e++) ta[sg * E * 32 + e * 32 + lane] = acc[e];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-        float M = -1e30f;
-        for (int s = 0; s < ANSG; s++) M = max(M, tm[s]);
-        float Ls = 0.0f;
-        float o[E];
-        for (int e = 0; e < E; e++) o[e] = 0.0f;
-        for (int s = 0; s < ANSG; s++) {
-            const float f = exp(tm[s] - M);
-            Ls += tl[s] * f;
-            for (int e = 0; e < E; e++) o[e] += ta[s * E * 32 + e * 32 + lane] * f;
-        }
-        device float* op = out + t * p.outStride + h * p.D;
-        const float inv = 1.0f / Ls;
-        for (int e = 0; e < E; e++) op[e * 32 + lane] = o[e] * inv;
+    if (sg == 0) attn_merge<E, ANSG>((threadgroup const float*)tm, (threadgroup const float*)tl,
+                                     (threadgroup const float*)ta, lane, out + t * p.outStride + h * p.D);
+}
+
+// Long-context decode (T = 1), split across threadgroups. The work is the
+// `attention<E, ASPLIT_V>` kernel's, re-arranged without changing any result:
+// virtual simdgroup v = tg.y * ASPLIT_NSG + sg takes keys v, v+ASPLIT_V, ...
+// for all G query heads of KV head tg.x (each K/V row is read once per GQA
+// group), and writes its partial (max, sum, acc) per head. attention_combine
+// then merges the ASPLIT_V partials per head in the same order.
+// Partials layout (floats): pm[nH*V] | pl[nH*V] | pa[nH*V*D], row = h*V + v.
+#define ASPLIT_V 32
+#define ASPLIT_NSG 4
+template <int E, int G>
+kernel void attention_split(device const float* qkv  [[buffer(0)]],
+                            device const half*  kc   [[buffer(1)]],
+                            device const half*  vc   [[buffer(2)]],
+                            device float*       part [[buffer(3)]],
+                            constant AttnParams& p   [[buffer(4)]],
+                            uint2 tg   [[threadgroup_position_in_grid]],
+                            uint  sg   [[simdgroup_index_in_threadgroup]],
+                            uint  lane [[thread_index_in_simdgroup]]) {
+    const int kvh = int(tg.x);
+    const int v = int(tg.y) * ASPLIT_NSG + int(sg);
+    const int h0 = kvh * G;
+    float qr[G][E], acc[G][E], m[G], l[G];
+    for (int g = 0; g < G; g++) {
+        device const float* q = qkv + (h0 + g) * p.D;
+        for (int e = 0; e < E; e++) { qr[g][e] = q[e * 32 + lane] * p.scale; acc[g][e] = 0.0f; }
+        m[g] = -1e30f; l[g] = 0.0f;
     }
+    const int L = p.offset + 1;
+    device const half* kb = kc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
+    device const half* vb = vc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
+    for (int j0 = v; j0 < L; j0 += ASPLIT_V * AU) {
+        half kh[AU][E], vh[AU][E];
+        for (int u = 0; u < AU; u++) {
+            const int j = min(j0 + u * ASPLIT_V, L - 1);
+            device const half* kp = kb + ulong(j) * ulong(p.D);
+            device const half* vp = vb + ulong(j) * ulong(p.D);
+            for (int e = 0; e < E; e++) { kh[u][e] = kp[e * 32 + lane]; vh[u][e] = vp[e * 32 + lane]; }
+        }
+        for (int u = 0; u < AU; u++)
+            if (j0 + u * ASPLIT_V < L)
+                for (int g = 0; g < G; g++) attn_update<E>(qr[g], acc[g], m[g], l[g], kh[u], vh[u]);
+    }
+    // Virtual simdgroups with no keys still write (-1e30, 0, 0), exactly like the fused kernel.
+    const int rows = p.nH * ASPLIT_V;
+    for (int g = 0; g < G; g++) {
+        const int r = (h0 + g) * ASPLIT_V + v;
+        if (lane == 0) { part[r] = m[g]; part[rows + r] = l[g]; }
+        device float* pa = part + 2 * rows + r * p.D;
+        for (int e = 0; e < E; e++) pa[e * 32 + lane] = acc[g][e];
+    }
+}
+
+// One simdgroup per head: merge the ASPLIT_V partials of attention_split.
+template <int E>
+kernel void attention_combine(device const float* part [[buffer(0)]],
+                              device float*       out  [[buffer(1)]],
+                              constant AttnParams& p   [[buffer(2)]],
+                              uint h    [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    const int rows = p.nH * ASPLIT_V;
+    const int r = int(h) * ASPLIT_V;
+    attn_merge<E, ASPLIT_V>((device const float*)(part + r), (device const float*)(part + rows + r),
+                            (device const float*)(part + 2 * rows + r * p.D), lane, out + int(h) * p.D);
 }
 
 // Prefill attention: one threadgroup per (head, block of QB queries). Each K/V
@@ -863,7 +1047,9 @@ kernel void add_bias(device float*      y [[buffer(0)]],
     constant MMParams&, uint2, uint, uint);
 #define INST_QNEW(B, T, TN) \
   template [[host_name("qmv_" #B "_" #TN)]] kernel void qmv<B, T>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const T*, device const uchar*, device const T*, device const T*, device const T*, device const T*, device const T*, uint2, uint, uint); \
-  template [[host_name("qgemm_" #B "_" #TN)]] kernel void qgemm<B, T>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, uint2, uint, uint);
+  template [[host_name("qgemm_" #B "_" #TN)]] kernel void qgemm<B, T>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, uint2, uint, uint); \
+  template [[host_name("qgemms_" #B "_" #TN "_8")]] kernel void qgemms<B, T, 8>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, uint2, uint, uint); \
+  template [[host_name("qgemms_" #B "_" #TN "_16")]] kernel void qgemms<B, T, 16>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, uint2, uint, uint);
 #define INST_QMM_ALL(B) \
   INST_QNEW(B, half, f16) INST_QNEW(B, bfloat, bf16) INST_QNEW(B, float, f32) \
   INST_QMM(B, half, f16, 1) INST_QMM(B, half, f16, 8) \
@@ -910,6 +1096,15 @@ INST_ATTN(4)
 INST_ATTN(5)
 INST_ATTN(6)
 INST_ATTN(8)
+#define INST_ASPLIT(E, G) \
+  template [[host_name("attention_split_" #E "_" #G)]] kernel void attention_split<E, G>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint);
+INST_ASPLIT(2, 1) INST_ASPLIT(2, 2) INST_ASPLIT(2, 3) INST_ASPLIT(2, 4)
+INST_ASPLIT(2, 5) INST_ASPLIT(2, 6) INST_ASPLIT(2, 7) INST_ASPLIT(2, 8)
+INST_ASPLIT(3, 1) INST_ASPLIT(3, 2) INST_ASPLIT(3, 3) INST_ASPLIT(3, 4)
+INST_ASPLIT(4, 1) INST_ASPLIT(4, 2) INST_ASPLIT(4, 3) INST_ASPLIT(4, 4)
+#define INST_ACOMB(E) \
+  template [[host_name("attention_combine_" #E)]] kernel void attention_combine<E>(device const float*, device float*, constant AttnParams&, uint, uint);
+INST_ACOMB(2) INST_ACOMB(3) INST_ACOMB(4)
 #define INST_ATTNP(E, QB) \
   template [[host_name("attention_prefill_" #E)]] kernel void attention_prefill<E, QB>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint, uint);
 INST_ATTNP(1, 8)

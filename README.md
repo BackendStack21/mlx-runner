@@ -106,13 +106,13 @@ Measured with `mlxr bench` on an **M2 Pro (16 GB)**. Decode is measured with gre
 
 | Model (4-bit) | Weights | Prefill (512 tok) | Decode @16 | Decode @1K ctx |
 |---|---|---|---|---|
-| Qwen2.5 0.5B Instruct | 278 MB | 2,970 tok/s | 285 tok/s | 258 tok/s |
-| Qwen3 0.6B | 336 MB | 2,030 tok/s | 247 tok/s | 204 tok/s |
-| Llama 3.2 1B Instruct | 695 MB | 1,170 tok/s | 183 tok/s | 165 tok/s |
-| Phi-3.5 mini | 2.15 GB | 320 tok/s | 65 tok/s | 57 tok/s |
-| Mistral 7B v0.3 | 4.08 GB | 166 tok/s | 38.6 tok/s | 36.6 tok/s |
+| Qwen2.5 0.5B Instruct | 278 MB | 2,960 tok/s | 307 tok/s | 260 tok/s |
+| Qwen3 0.6B | 336 MB | 2,040 tok/s | 252 tok/s | 214 tok/s |
+| Llama 3.2 1B Instruct | 695 MB | 1,180 tok/s | 187 tok/s | 174 tok/s |
+| Phi-3.5 mini | 2.15 GB | 320 tok/s | 67 tok/s | 59 tok/s |
+| Mistral 7B v0.3 | 4.08 GB | 166 tok/s | 39.4 tok/s | 37.9 tok/s |
 
-**The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 38.6 tok/s, about 82% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a 3-bit model (which would raise the ceiling to about 60 tok/s, but only 4-bit has an optimized decode kernel so far), or speculative decoding (see Limitations).
+**The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 39.4 tok/s, about 82% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a 3-bit model (which would raise the ceiling to about 60 tok/s, but only 4-bit has an optimized decode kernel so far), or speculative decoding (see Limitations).
 
 Load times stay short because the weights are `mmap`ed and wrapped in Metal buffers with no copy: about 0.5 s for the small models, 1.6 s for Phi-3.5 and 3.3 s for Mistral 7B. Those figures include a warm-up pass that pages the weights in.
 
