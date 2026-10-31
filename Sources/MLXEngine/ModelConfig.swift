@@ -68,6 +68,24 @@ public struct ModelConfig {
         maxPositionEmbeddings = int("max_position_embeddings") ?? 4096
         originalMaxPosition = int("original_max_position_embeddings") ?? maxPositionEmbeddings
 
+        // config.json is untrusted: bound every dimension so later size math cannot overflow.
+        let dims: [(String, Int, ClosedRange<Int>)] = [
+            ("hidden_size", hiddenSize, 1...65536), ("intermediate_size", intermediateSize, 1...262_144),
+            ("num_hidden_layers", numLayers, 1...512), ("num_attention_heads", numHeads, 1...1024),
+            ("num_key_value_heads", numKVHeads, 1...1024), ("head_dim", headDim, 1...1024),
+            ("max_position_embeddings", maxPositionEmbeddings, 1...(1 << 24)),
+        ]
+        for (name, v, range) in dims where !range.contains(v) {
+            throw EngineError.invalidFile("config.json: \(name) = \(v) is out of range")
+        }
+        guard numHeads % numKVHeads == 0 else {
+            throw EngineError.invalidFile("config.json: num_attention_heads must be a multiple of num_key_value_heads")
+        }
+        guard rmsNormEps.isFinite, rmsNormEps > 0, ropeTheta.isFinite, ropeTheta > 0,
+              partialRotaryFactor > 0, partialRotaryFactor <= 1 else {
+            throw EngineError.invalidFile("config.json: invalid rms_norm_eps, rope_theta or partial_rotary_factor")
+        }
+
         var eos: [Int] = []
         if let e = obj["eos_token_id"] as? NSNumber { eos.append(e.intValue) }
         if let e = obj["eos_token_id"] as? [NSNumber] { eos += e.map(\.intValue) }

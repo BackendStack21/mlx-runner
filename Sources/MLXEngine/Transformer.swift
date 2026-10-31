@@ -25,16 +25,27 @@ final class Linear {
     private var biasPSO: MTLComputePipelineState?
     let description: String
 
-    convenience init(_ store: WeightStore, _ prefix: String, inDim: Int) throws {
+    convenience init(_ store: WeightStore, _ prefix: String, inDim: Int, outDim: Int? = nil) throws {
         let s = store.get(prefix + ".scales")
         let b = store.get(prefix + ".biases")
         if s != nil && b == nil { throw EngineError.missingTensor(prefix + ".biases") }
         try self.init(weight: try store.require(prefix + ".weight"), scales: s, biases: b,
-                      bias: store.get(prefix + ".bias"), inDim: inDim, name: prefix)
+                      bias: store.get(prefix + ".bias"), inDim: inDim, outDim: outDim, name: prefix)
     }
 
-    init(weight: Tensor, scales: Tensor?, biases: Tensor?, bias: Tensor?, inDim: Int, name prefix: String) throws {
+    init(weight: Tensor, scales: Tensor?, biases: Tensor?, bias: Tensor?, inDim: Int, outDim expectOut: Int? = nil, name prefix: String) throws {
         let gpu = GPU.shared
+        // Shapes come from an untrusted file: validate them so no kernel can index out of bounds.
+        func bad(_ what: String) -> EngineError { .invalidFile("\(prefix): \(what)") }
+        guard weight.shape.count == 2, weight.shape[0] > 0, weight.shape[1] > 0, inDim > 0 else { throw bad("weight must be a 2-D tensor") }
+        if let e = expectOut, weight.shape[0] != e { throw bad("expected \(e) output rows, found \(weight.shape[0])") }
+        if let bias, bias.shape != [weight.shape[0]] { throw bad("bias shape \(bias.shape)") }
+        if let s = scales, let b = biases {
+            guard s.shape.count == 2, s.shape[0] == weight.shape[0], s.shape[1] > 0, inDim % s.shape[1] == 0, b.shape == s.shape,
+                  (weight.shape[1] * weight.dtype.size * 8) % inDim == 0 else { throw bad("inconsistent quantization tensors") }
+        } else if weight.shape[1] != inDim {
+            throw bad("expected \(inDim) input columns, found \(weight.shape[1])")
+        }
         self.weight = weight
         self.inDim = inDim
         outDim = weight.shape[0]
@@ -167,8 +178,9 @@ final class RMSNorm {
     let addPSO: MTLComputePipelineState
     let eps: Float
 
-    init(_ store: WeightStore, _ name: String, eps: Float) throws {
+    init(_ store: WeightStore, _ name: String, eps: Float, dim: Int) throws {
         weight = try store.require(name)
+        guard weight.shape == [dim] else { throw EngineError.invalidFile("\(name): expected shape [\(dim)], found \(weight.shape)") }
         guard let sfx = weight.dtype.suffix else { throw EngineError.unsupported("\(name) dtype") }
         pso = try GPU.shared.pipeline("rms_norm_\(sfx)")
         addPSO = try GPU.shared.pipeline("add_rms_norm_\(sfx)")
@@ -206,28 +218,31 @@ final class TransformerLayer {
 
     init(_ s: WeightStore, _ i: Int, _ c: ModelConfig, maxSeq: Int) throws {
         let p = "model.layers.\(i)"
-        inputNorm = try RMSNorm(s, "\(p).input_layernorm.weight", eps: c.rmsNormEps)
-        postNorm = try RMSNorm(s, "\(p).post_attention_layernorm.weight", eps: c.rmsNormEps)
-        qNorm = s.has("\(p).self_attn.q_norm.weight") ? try RMSNorm(s, "\(p).self_attn.q_norm.weight", eps: c.rmsNormEps) : nil
-        kNorm = s.has("\(p).self_attn.k_norm.weight") ? try RMSNorm(s, "\(p).self_attn.k_norm.weight", eps: c.rmsNormEps) : nil
+        let H = c.hiddenSize, D = c.headDim, I = c.intermediateSize
+        inputNorm = try RMSNorm(s, "\(p).input_layernorm.weight", eps: c.rmsNormEps, dim: H)
+        postNorm = try RMSNorm(s, "\(p).post_attention_layernorm.weight", eps: c.rmsNormEps, dim: H)
+        qNorm = s.has("\(p).self_attn.q_norm.weight") ? try RMSNorm(s, "\(p).self_attn.q_norm.weight", eps: c.rmsNormEps, dim: D) : nil
+        kNorm = s.has("\(p).self_attn.k_norm.weight") ? try RMSNorm(s, "\(p).self_attn.k_norm.weight", eps: c.rmsNormEps, dim: D) : nil
         if s.has("\(p).self_attn.qkv_proj.weight") {
-            qkv = [try Linear(s, "\(p).self_attn.qkv_proj", inDim: c.hiddenSize)]
+            qkv = [try Linear(s, "\(p).self_attn.qkv_proj", inDim: H, outDim: (c.numHeads + 2 * c.numKVHeads) * D)]
         } else {
-            qkv = try ["q_proj", "k_proj", "v_proj"].map { try Linear(s, "\(p).self_attn.\($0)", inDim: c.hiddenSize) }
+            qkv = try [("q_proj", c.numHeads), ("k_proj", c.numKVHeads), ("v_proj", c.numKVHeads)].map {
+                try Linear(s, "\(p).self_attn.\($0.0)", inDim: H, outDim: $0.1 * D)
+            }
         }
-        o = try Linear(s, "\(p).self_attn.o_proj", inDim: c.numHeads * c.headDim)
+        o = try Linear(s, "\(p).self_attn.o_proj", inDim: c.numHeads * D, outDim: H)
         if s.has("\(p).mlp.gate_up_proj.weight") {
-            gateUp = [try Linear(s, "\(p).mlp.gate_up_proj", inDim: c.hiddenSize)]
+            gateUp = [try Linear(s, "\(p).mlp.gate_up_proj", inDim: H, outDim: 2 * I)]
         } else {
-            gateUp = try ["gate_proj", "up_proj"].map { try Linear(s, "\(p).mlp.\($0)", inDim: c.hiddenSize) }
+            gateUp = try ["gate_proj", "up_proj"].map { try Linear(s, "\(p).mlp.\($0)", inDim: H, outDim: I) }
         }
-        down = try Linear(s, "\(p).mlp.down_proj", inDim: c.intermediateSize)
+        down = try Linear(s, "\(p).mlp.down_proj", inDim: I, outDim: H)
         qkvFusable = qkv.count > 1 && Linear.fusable(qkv)
         gateUpFusable = gateUp.count > 1 && Linear.fusable(gateUp)
         qkvPostPSO = try GPU.shared.pipeline("qkv_post_\(qNorm?.weight.dtype.suffix ?? "f32")")
         let cacheBytes = c.numKVHeads * maxSeq * c.headDim * 2
-        kCache = GPU.shared.buffer(cacheBytes)
-        vCache = GPU.shared.buffer(cacheBytes)
+        kCache = try GPU.shared.buffer(cacheBytes)
+        vCache = try GPU.shared.buffer(cacheBytes)
     }
 }
 
@@ -279,7 +294,7 @@ public final class Transformer {
         }
         embed = try Linear(store, "model.embed_tokens", inDim: c.hiddenSize)
         layers = try (0..<c.numLayers).map { try TransformerLayer(store, $0, c, maxSeq: seq) }
-        norm = try RMSNorm(store, "model.norm.weight", eps: c.rmsNormEps)
+        norm = try RMSNorm(store, "model.norm.weight", eps: c.rmsNormEps, dim: c.hiddenSize)
         if store.has("lm_head.weight") {
             lmHead = try Linear(store, "lm_head", inDim: c.hiddenSize)
         } else {
@@ -289,15 +304,15 @@ public final class Transformer {
 
         qkvCols = (c.numHeads + 2 * c.numKVHeads) * c.headDim
         let H = c.hiddenSize, I = c.intermediateSize, B = maxBatch
-        ids = gpu.buffer(B * 4)
-        h = gpu.buffer(B * H * 4)
-        xn = gpu.buffer(B * H * 4)
-        qkvBuf = gpu.buffer(B * qkvCols * 4)
-        attnBuf = gpu.buffer(B * c.numHeads * c.headDim * 4)
-        guBuf = gpu.buffer(B * 2 * I * 4)
-        mlpBuf = gpu.buffer(B * I * 4)
-        tmp = gpu.buffer(B * H * 4)
-        logits = gpu.buffer(lmHead.outDim * 4)
+        ids = try gpu.buffer(B * 4)
+        h = try gpu.buffer(B * H * 4)
+        xn = try gpu.buffer(B * H * 4)
+        qkvBuf = try gpu.buffer(B * qkvCols * 4)
+        attnBuf = try gpu.buffer(B * c.numHeads * c.headDim * 4)
+        guBuf = try gpu.buffer(B * 2 * I * 4)
+        mlpBuf = try gpu.buffer(B * I * 4)
+        tmp = try gpu.buffer(B * H * 4)
+        logits = try gpu.buffer(lmHead.outDim * 4)
         let f = c.inverseFrequencies()
         invFreq = gpu.device.makeBuffer(bytes: f, length: max(16, f.count * 4), options: .storageModeShared)!
 
@@ -317,10 +332,15 @@ public final class Transformer {
 
     /// Runs `tokens` at positions offset..<offset+count, updating the KV cache.
     /// Returns a pointer to the logits of the last token (valid until the next call).
-    public func forward(_ tokens: [Int32], offset: Int) throws -> UnsafeMutablePointer<Float> {
+    public func forward(_ tokens: [Int32], offset: Int, isCancelled: (() -> Bool)? = nil) throws -> UnsafeMutablePointer<Float> {
         guard offset + tokens.count <= maxSeq else { throw EngineError.contextFull }
+        let rows = embed.outDim
+        guard tokens.allSatisfy({ $0 >= 0 && Int($0) < rows }) else {
+            throw EngineError.invalidFile("token id outside the embedding table (\(rows) rows)")
+        }
         var start = 0
         while start < tokens.count {
+            if start > 0, isCancelled?() == true { throw EngineError.cancelled }
             let n = min(maxBatch, tokens.count - start)
             let last = start + n == tokens.count
             try step(Array(tokens[start..<start + n]), offset: offset + start, computeLogits: last)

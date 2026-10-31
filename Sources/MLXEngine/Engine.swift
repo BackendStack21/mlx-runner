@@ -61,7 +61,7 @@ struct Sampler {
     mutating func sample(_ logits: UnsafeMutablePointer<Float>, count: Int, recent: ArraySlice<Int>) -> Int {
         if params.repetitionPenalty != 1, !recent.isEmpty {
             let p = params.repetitionPenalty
-            for t in Set(recent) where t < count {
+            for t in Set(recent) where t >= 0 && t < count {
                 logits[t] = logits[t] > 0 ? logits[t] / p : logits[t] * p
             }
         }
@@ -69,7 +69,7 @@ struct Sampler {
             var best = 0
             var bestV = -Float.infinity
             for i in 0..<count where logits[i] > bestV { bestV = logits[i]; best = i }
-            return best
+            return bestV.isFinite ? best : -1
         }
         // Top-k candidates by partial selection (k capped to keep this O(V)).
         let k = params.topK > 0 ? min(params.topK, count) : min(512, count)
@@ -93,6 +93,7 @@ struct Sampler {
         if cand.count < k { cand.sort { $0.1 > $1.1 } }
         let invT = 1 / params.temperature
         let maxV = cand[0].1
+        guard maxV.isFinite else { return -1 }  // NaN or infinite logits
         var probs = cand.map { exp(($0.1 - maxV) * invT) }
         var total = probs.reduce(0, +)
         // min-p and top-p filtering
@@ -131,8 +132,15 @@ public final class InferenceEngine: @unchecked Sendable {
     private var cachedTokens: [Int] = []
     private let cancelLock = NSLock()
     private var currentToken: CancelToken?
-    private var trimState: (anchor: String, dropped: Int)?
-    public private(set) var info: LoadedModelInfo?
+    /// Sticky trim cut per conversation (key: caller-supplied id, else the first turn).
+    private var trimState: [String: Int] = [:]
+    private let infoLock = NSLock()
+    private var _info: LoadedModelInfo?
+    /// The loaded model; safe to read from any thread.
+    public private(set) var info: LoadedModelInfo? {
+        get { infoLock.lock(); defer { infoLock.unlock() }; return _info }
+        set { infoLock.lock(); _info = newValue; infoLock.unlock() }
+    }
 
     public init() {}
 
@@ -147,6 +155,7 @@ public final class InferenceEngine: @unchecked Sendable {
                     self.tokenizer = nil
                     self.info = nil
                     self.cachedTokens = []
+                    self.trimState = [:]
                     let tok = try Tokenizer(directory: directory)
                     try Self.checkMemory(directory: directory, contextLength: contextLength)
                     let model = try Transformer(directory: directory, contextLength: contextLength)
@@ -184,6 +193,7 @@ public final class InferenceEngine: @unchecked Sendable {
             self.template = nil
             self.info = nil
             self.cachedTokens = []
+            self.trimState = [:]
         }
     }
 
@@ -194,19 +204,26 @@ public final class InferenceEngine: @unchecked Sendable {
     }
 
     /// Streams a chat completion. Cancel with `token`, or simply stop consuming the stream.
+    /// `conversationID` keeps context trimming stable across turns of the same chat.
     public func chat(_ messages: [ChatMessage], parameters: SamplingParameters = .init(), enableThinking: Bool = true,
-                     token: CancelToken = CancelToken()) -> AsyncThrowingStream<GenerationEvent, Error> {
+                     conversationID: String? = nil, token: CancelToken = CancelToken()) -> AsyncThrowingStream<GenerationEvent, Error> {
         stream(token, parameters: parameters) { tok, tpl in
             guard let tpl else { throw EngineError.invalidFile("No model loaded") }
             return self.fitToContext(messages, template: tpl, tokenizer: tok,
-                                     reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking)
+                                     reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking,
+                                     conversationID: conversationID)
         }
     }
 
     /// Streams a raw completion for a prompt string (special tokens are parsed).
     public func complete(_ prompt: String, parameters: SamplingParameters = .init(),
                          token: CancelToken = CancelToken()) -> AsyncThrowingStream<GenerationEvent, Error> {
-        stream(token, parameters: parameters) { tok, _ in tok.encode(prompt) }
+        stream(token, parameters: parameters) { tok, _ in
+            var ids = tok.encode(prompt)
+            // Models such as Llama and Mistral expect BOS on raw prompts (add_bos_token).
+            if tok.addBosToken, let b = tok.bosToken, let id = tok.tokenId(b), ids.first != id { ids.insert(id, at: 0) }
+            return ids
+        }
     }
 
     private func stream(_ token: CancelToken, parameters: SamplingParameters,
@@ -247,15 +264,15 @@ public final class InferenceEngine: @unchecked Sendable {
     /// share a stable prefix, so the KV cache keeps being reused instead of re-prefilling
     /// the whole window on every turn.
     private func fitToContext(_ messages: [ChatMessage], template: ChatTemplate, tokenizer: Tokenizer,
-                              reserve: Int, enableThinking: Bool) -> [Int] {
+                              reserve: Int, enableThinking: Bool, conversationID: String?) -> [Int] {
         let limit = (model?.maxSeq ?? Int.max) - reserve
         let system = messages.filter { $0.role == .system }
         let turns = messages.filter { $0.role != .system }
         guard let first = turns.first else {
             return tokenizer.encode(template.render(messages, enableThinking: enableThinking))
         }
-        let anchor = first.role.rawValue + "\u{0}" + first.content
-        var dropped = (trimState?.anchor == anchor) ? min(trimState!.dropped, turns.count - 1) : 0
+        let key = conversationID ?? (first.role.rawValue + "\u{0}" + first.content)
+        if trimState.count > 256 { trimState = [:] }
 
         func render(_ d: Int) -> [Int] {
             tokenizer.encode(template.render(system + turns[d...], enableThinking: enableThinking))
@@ -266,7 +283,13 @@ public final class InferenceEngine: @unchecked Sendable {
             while n < turns.count - 1 && turns[n].role != .user { n += 1 }
             return n < turns.count ? n : nil
         }
-        var tokens = render(dropped)
+        // Whole conversation fits: never trim (a stale cut must not drop history).
+        var tokens = render(0)
+        var dropped = 0
+        if tokens.count > limit {
+            dropped = min(trimState[key] ?? 0, turns.count - 1)
+            if dropped > 0 { tokens = render(dropped) }
+        }
         if tokens.count > limit {
             let target = Int(Double(limit) * 0.7)
             while tokens.count > target, let n = advance(dropped), n <= turns.count - 1 {
@@ -275,7 +298,7 @@ public final class InferenceEngine: @unchecked Sendable {
                 if dropped == turns.count - 1 { break }
             }
         }
-        trimState = (anchor, dropped)
+        trimState[key] = dropped
         return tokens
     }
 
@@ -294,7 +317,14 @@ public final class InferenceEngine: @unchecked Sendable {
 
         cachedTokens = Array(tokens[0..<common])
         let t0 = Date()
-        var logits = try model.forward(tokens[common...].map { Int32($0) }, offset: common)
+        var logits: UnsafeMutablePointer<Float>
+        do {
+            logits = try model.forward(tokens[common...].map { Int32($0) }, offset: common, isCancelled: { token.isCancelled })
+        } catch EngineError.cancelled {
+            stats.stopReason = "cancelled"
+            emit(.finished(stats))
+            return
+        }
         var history = tokens
         cachedTokens = tokens
         let tPrompt = Date().timeIntervalSince(t0)
@@ -312,6 +342,7 @@ public final class InferenceEngine: @unchecked Sendable {
             if token.isCancelled { stats.stopReason = "cancelled"; break }
             let window = history.suffix(parameters.repetitionWindow)
             let next = sampler.sample(logits, count: min(model.vocabSize, tok.vocabularySize), recent: window)
+            guard next >= 0 else { throw EngineError.invalidOutput("non-finite logits") }
             if stopIds.contains(next) { stats.stopReason = "stop"; break }
             stats.generatedTokens += 1
             var text = decoder.append(tok.bytes(for: next))

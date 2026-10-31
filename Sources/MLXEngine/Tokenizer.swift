@@ -16,7 +16,15 @@ public final class Tokenizer: @unchecked Sendable {
     private var preRegex: NSRegularExpression?
     private var ignoreMerges = false
     private var byteFallback = false
+    /// SentencePiece word-boundary prefix: Metaspace `first` (first segment only, if missing),
+    /// Metaspace `always` (every segment, if missing), or a `Prepend` normalizer (every segment).
     private var spPrepend = true
+    private var spPrependEverySegment = false
+    private var spPrependUnconditional = false
+    /// Added tokens that swallow adjacent whitespace (`lstrip` / `rstrip` in tokenizer.json).
+    private var addedStrip: [String: (left: Bool, right: Bool)] = [:]
+    /// The model expects a BOS token at the start of raw prompts.
+    public private(set) var addBosToken = false
     private var nfc = false
     private var unkId: Int?
     private var cache: [String: [Int]] = [:]
@@ -58,7 +66,13 @@ public final class Tokenizer: @unchecked Sendable {
         }
         var maxId = 0
         vocab.reserveCapacity(v.count)
-        for (k, id) in v { let i = id.intValue; vocab[k] = i; maxId = max(maxId, i) }
+        // Ids index arrays and GPU tables: reject anything out of range (untrusted file).
+        let idRange = 0..<(1 << 21)
+        for (k, id) in v {
+            let i = id.intValue
+            guard idRange.contains(i) else { throw EngineError.invalidFile("tokenizer.json: token id \(i) is out of range") }
+            vocab[k] = i; maxId = max(maxId, i)
+        }
 
         if let merges = model["merges"] as? [Any] {
             mergeRanks.reserveCapacity(merges.count)
@@ -79,9 +93,12 @@ public final class Tokenizer: @unchecked Sendable {
         var added: [(String, Int)] = []
         for t in (json["added_tokens"] as? [[String: Any]]) ?? [] {
             guard let content = t["content"] as? String, let id = (t["id"] as? NSNumber)?.intValue else { continue }
+            guard idRange.contains(id) else { throw EngineError.invalidFile("tokenizer.json: added token id \(id) is out of range") }
             vocab[content] = id
             maxId = max(maxId, id)
             addedTokens[content] = id
+            let l = t["lstrip"] as? Bool ?? false, r = t["rstrip"] as? Bool ?? false
+            if l || r { addedStrip[content] = (l, r) }
             added.append((content, id))
             if t["special"] as? Bool ?? false { specialIds.insert(id) }
         }
@@ -112,6 +129,7 @@ public final class Tokenizer: @unchecked Sendable {
             case "Metaspace":
                 let scheme = p["prepend_scheme"] as? String ?? ((p["add_prefix_space"] as? Bool ?? true) ? "always" : "never")
                 spPrepend = scheme != "never"
+                spPrependEverySegment = scheme == "always"
             default: break
             }
         }
@@ -124,7 +142,7 @@ public final class Tokenizer: @unchecked Sendable {
             switch n["type"] as? String {
             case "Sequence": for sub in (n["normalizers"] as? [[String: Any]]) ?? [] { visitNorm(sub) }
             case "NFC": nfc = true
-            case "Prepend": spPrepend = true
+            case "Prepend": spPrepend = true; spPrependEverySegment = true; spPrependUnconditional = true
             default: break
             }
         }
@@ -145,6 +163,7 @@ public final class Tokenizer: @unchecked Sendable {
                 return nil
             }
             bosToken = tok("bos_token")
+            addBosToken = cfg["add_bos_token"] as? Bool ?? false
             eosToken = tok("eos_token")
             if let t = cfg["chat_template"] as? String { chatTemplate = t }
             else if let arr = cfg["chat_template"] as? [[String: Any]] {
@@ -179,18 +198,26 @@ public final class Tokenizer: @unchecked Sendable {
         var firstSegment = true
         let matches = addedRegex?.matches(in: text, range: NSRange(location: 0, length: ns.length)) ?? []
         for m in matches {
-            if m.range.location > cursor {
-                encodeOrdinary(ns.substring(with: NSRange(location: cursor, length: m.range.location - cursor)),
+            let strip = addedStrip[ns.substring(with: m.range)]
+            var segEnd = m.range.location
+            if strip?.left == true { while segEnd > cursor && Self.isSpace(ns.character(at: segEnd - 1)) { segEnd -= 1 } }
+            if segEnd > cursor {
+                encodeOrdinary(ns.substring(with: NSRange(location: cursor, length: segEnd - cursor)),
                                first: firstSegment, into: &out)
             }
             if let id = addedTokens[ns.substring(with: m.range)] { out.append(id) }
             cursor = m.range.location + m.range.length
+            if strip?.right == true { while cursor < ns.length && Self.isSpace(ns.character(at: cursor)) { cursor += 1 } }
             firstSegment = false
         }
         if cursor < ns.length {
             encodeOrdinary(ns.substring(from: cursor), first: firstSegment, into: &out)
         }
         return out
+    }
+
+    private static func isSpace(_ c: unichar) -> Bool {
+        c == 0x20 || c == 0x0A || c == 0x09 || c == 0x0D || c == 0x0B || c == 0x0C
     }
 
     private func encodeOrdinary(_ text: String, first: Bool, into out: inout [Int]) {
@@ -202,7 +229,7 @@ public final class Tokenizer: @unchecked Sendable {
             }
         case .sentencePiece:
             var s = text.replacingOccurrences(of: " ", with: "▁")
-            if first && spPrepend && !s.hasPrefix("▁") { s = "▁" + s }
+            if spPrepend && (first || spPrependEverySegment) && (spPrependUnconditional || !s.hasPrefix("▁")) { s = "▁" + s }
             // Split into words that begin at a ▁ following non-▁ text, keeping runs of ▁ attached.
             var words: [String] = []
             var cur = ""

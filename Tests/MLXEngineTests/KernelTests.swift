@@ -135,7 +135,7 @@ struct MatmulKernelTests {
                     var rng = RNG(s: UInt64(T * 31 + bits))
                     let x = (0..<(T * K)).map { _ in rng.float() }
                     let xb = makeBuffer(x)
-                    let yb = GPU.shared.buffer(T * O * 4)
+                    let yb = try GPU.shared.buffer(T * O * 4)
                     runGPU { fx.linear.encode($0, x: xb, xStride: K, y: yb, yStride: O, T: T) }
                     assertClose(readFloats(yb, T * O), fx.reference(x, T: T, K: K),
                                 "bits \(bits) gs \(gs) \(scaleType) T \(T)")
@@ -153,7 +153,7 @@ struct MatmulKernelTests {
         var rng = RNG(s: 99)
         let x = (0..<K).map { _ in rng.float() }
         let xb = makeBuffer(x)
-        let yb = GPU.shared.buffer(96 * 4)
+        let yb = try GPU.shared.buffer(96 * 4)
         runGPU { Linear.encodeFusedDecode($0, parts.map(\.linear), x: xb, y: yb) }
         let ref = parts.flatMap { $0.reference(x, T: 1, K: K) }
         assertClose(readFloats(yb, 96), ref, "fused q/k/v")
@@ -167,7 +167,7 @@ struct MatmulKernelTests {
                              scales: nil, biases: nil, bias: nil, inDim: K, name: "dense")
         for T in [1, 3, 40] {
             let x = (0..<(T * K)).map { _ in rng.float() }
-            let yb = GPU.shared.buffer(T * O * 4)
+            let yb = try GPU.shared.buffer(T * O * 4)
             runGPU { lin.encode($0, x: makeBuffer(x), xStride: K, y: yb, yStride: O, T: T) }
             var ref = [Float](repeating: 0, count: T * O)
             for t in 0..<T { for o in 0..<O { for k in 0..<K { ref[t * O + o] += Float(w[o * K + k]) * x[t * K + k] } } }
@@ -179,7 +179,7 @@ struct MatmulKernelTests {
         let K = 128, V = 16
         let fx = try QuantFixture(O: V, K: K, bits: 4, gs: 64)
         let ids: [Int32] = [3, 0, 15, 7]
-        let out = GPU.shared.buffer(ids.count * K * 4)
+        let out = try GPU.shared.buffer(ids.count * K * 4)
         try runGPU { try fx.linear.encodeLookup($0, ids: makeBuffer(ids), out: out, T: ids.count) }
         let got = readFloats(out, ids.count * K)
         let ref = ids.flatMap { fx.dense[Int($0)] }

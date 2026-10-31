@@ -139,4 +139,33 @@ struct ModelTests {
         // 12 tokens = system prompt only (the old, non-sticky behaviour); more means history is reused.
         #expect(cached > 15, "trimmed conversation should still hit the prefix cache (got \(cached))")
     }
+
+    @Test(.enabled(if: installedModel(qwen3) != nil))
+    func trimmingOfOneConversationDoesNotLeakIntoAnother() async throws {
+        let engine = InferenceEngine()
+        _ = try await engine.load(directory: installedModel(Self.qwen3)!, contextLength: 256)
+        var p = SamplingParameters()
+        p.temperature = 0
+        p.maxTokens = 4
+        let filler = String(repeating: "This is an old message about nothing in particular. ", count: 20)
+        var long = [ChatMessage(role: .user, content: "Start.")]
+        for _ in 0..<6 { long += [ChatMessage(role: .assistant, content: "Ok."), ChatMessage(role: .user, content: filler)] }
+        for try await _ in engine.chat(long, parameters: p, enableThinking: false) {}
+        // A short chat with the same first turn fits entirely and must not inherit the cut.
+        let short = [ChatMessage(role: .user, content: "Start."), ChatMessage(role: .assistant, content: "Ok."),
+                     ChatMessage(role: .user, content: "Say hi.")]
+        let full = engine.encode(engine.renderChat(short, enableThinking: false)).count
+        var prompt = 0
+        for try await ev in engine.chat(short, parameters: p, enableThinking: false) {
+            if case .promptProcessed(let s) = ev { prompt = s.promptTokens }
+        }
+        #expect(prompt == full)
+    }
+
+    @Test(.enabled(if: installedModel(phi) != nil))
+    func phiAddedTokensStripWhitespaceAndPrependPerSegment() throws {
+        let tok = try Tokenizer(directory: installedModel(Self.phi)!)
+        // rstrip=true on the role tags and a Prepend("▁") normalizer applied to every segment.
+        #expect(tok.encode("<|user|>\nHello there<|end|>\n<|assistant|>\n") == [32010, 15043, 727, 32007, 32001])
+    }
 }

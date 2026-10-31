@@ -36,11 +36,25 @@ public struct ChatTemplate: Sendable {
     /// The template supports Qwen3-style `enable_thinking`.
     public let supportsThinkingToggle: Bool
     let bos: String
+    /// System prompt the template injects when the conversation has none (Qwen2.5).
+    let defaultSystem: String?
+    /// Llama 3.1+ templates always open with a system block carrying the knowledge cutoff and date.
+    let llamaDatePreamble: Bool
 
     public init(template: String?, modelType: String, bosToken: String?) {
         format = ChatFormat.detect(template: template, modelType: modelType)
         supportsThinkingToggle = template?.contains("enable_thinking") ?? false
         bos = bosToken ?? ""
+        let qwen = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+        defaultSystem = format == .chatML && (template?.contains(qwen) ?? false) ? qwen : nil
+        llamaDatePreamble = format == .llama3 && (template?.contains("Cutting Knowledge Date") ?? false)
+    }
+
+    static func todayString() -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "dd MMM yyyy"
+        return f.string(from: Date())
     }
 
     /// Renders messages as a prompt ending with the assistant turn opener.
@@ -48,6 +62,9 @@ public struct ChatTemplate: Sendable {
         var s = ""
         switch format {
         case .chatML:
+            if let d = defaultSystem, messages.first?.role != .system {
+                s += "<|im_start|>system\n\(d)<|im_end|>\n"
+            }
             for m in messages {
                 s += "<|im_start|>\(m.role.rawValue)\n\(m.content)<|im_end|>\n"
             }
@@ -55,7 +72,13 @@ public struct ChatTemplate: Sendable {
             if supportsThinkingToggle && !enableThinking { s += "<think>\n\n</think>\n\n" }
         case .llama3:
             s += "<|begin_of_text|>"
-            for m in messages {
+            var rest = messages[...]
+            if llamaDatePreamble {
+                var system = ""
+                if rest.first?.role == .system { system = rest.removeFirst().content.trimmingCharacters(in: .whitespacesAndNewlines) }
+                s += "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: \(Self.todayString())\n\n\(system)<|eot_id|>"
+            }
+            for m in rest {
                 s += "<|start_header_id|>\(m.role.rawValue)<|end_header_id|>\n\n\(m.content.trimmingCharacters(in: .whitespacesAndNewlines))<|eot_id|>"
             }
             s += "<|start_header_id|>assistant<|end_header_id|>\n\n"
@@ -68,7 +91,7 @@ public struct ChatTemplate: Sendable {
                 if m.role == .user {
                     var content = m.content
                     if let system, i == lastUser { content = system + "\n\n" + content }
-                    s += "[INST] \(content) [/INST]"
+                    s += "[INST] \(content)[/INST]"  // mistral-common v3: [INST]▁content[/INST]
                 } else {
                     s += " \(m.content)</s>"
                 }

@@ -9,10 +9,16 @@ public enum EngineError: LocalizedError {
     case missingTensor(String)
     case unsupported(String)
     case contextFull
+    case outOfMemory(String)
+    case cancelled
+    case invalidOutput(String)
 
     public var errorDescription: String? {
         switch self {
         case .noMetalDevice: return "No Metal GPU available."
+        case .outOfMemory(let s): return "Not enough memory: \(s)"
+        case .cancelled: return "Cancelled."
+        case .invalidOutput(let s): return "The model produced invalid output: \(s)"
         case .kernelCompile(let s): return "Metal kernel compilation failed: \(s)"
         case .missingPipeline(let s): return "Missing Metal kernel: \(s)"
         case .invalidFile(let s): return "Invalid model file: \(s)"
@@ -73,8 +79,12 @@ public final class GPU: @unchecked Sendable {
         return p
     }
 
-    func buffer(_ length: Int) -> MTLBuffer {
-        device.makeBuffer(length: max(length, 16), options: .storageModeShared)!
+    func buffer(_ length: Int) throws -> MTLBuffer {
+        guard length >= 0, length <= device.maxBufferLength,
+              let b = device.makeBuffer(length: max(length, 16), options: .storageModeShared) else {
+            throw EngineError.outOfMemory("cannot allocate a \(length)-byte GPU buffer")
+        }
+        return b
     }
 
     public var recommendedMaxWorkingSetSize: UInt64 { device.recommendedMaxWorkingSetSize }
@@ -157,21 +167,46 @@ final class SafeTensorFile {
         }
         buffer = buf
         let base = ptr.assumingMemoryBound(to: UInt8.self)
-        guard size >= 8 else { throw EngineError.invalidFile(url.lastPathComponent) }
+        let file = url.lastPathComponent
+        guard size >= 8 else { throw EngineError.invalidFile("\(file) is truncated") }
         var headerLen: UInt64 = 0
         memcpy(&headerLen, base, 8)
-        guard Int(headerLen) + 8 <= size else { throw EngineError.invalidFile("bad header in \(url.lastPathComponent)") }
-        let headerData = Data(bytes: base + 8, count: Int(headerLen))
-        guard let header = try JSONSerialization.jsonObject(with: headerData) as? [String: Any] else {
-            throw EngineError.invalidFile("bad header JSON in \(url.lastPathComponent)")
+        // Untrusted input: every size and offset is validated before use (the engine
+        // is built with -Ounchecked, so arithmetic must not be allowed to overflow).
+        guard headerLen <= UInt64(min(100 << 20, size - 8)) else { throw EngineError.invalidFile("bad header length in \(file)") }
+        let hLen = Int(headerLen)
+        let headerData = Data(bytes: base + 8, count: hLen)
+        guard let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any] else {
+            throw EngineError.invalidFile("bad header JSON in \(file)")
         }
-        let dataStart = 8 + Int(headerLen)
+        let dataStart = 8 + hLen
+        let dataSize = size - dataStart
         for (name, value) in header where name != "__metadata__" {
-            guard let d = value as? [String: Any],
-                  let dt = d["dtype"] as? String, let dtype = DType(rawValue: dt),
-                  let shape = (d["shape"] as? [NSNumber])?.map({ $0.intValue }),
-                  let offs = (d["data_offsets"] as? [NSNumber])?.map({ $0.intValue }), offs.count == 2 else { continue }
-            infos[name] = (dtype, shape, dataStart + offs[0], dataStart + offs[1])
+            guard let d = value as? [String: Any], let dt = d["dtype"] as? String else {
+                throw EngineError.invalidFile("bad entry '\(name)' in \(file)")
+            }
+            guard let dtype = DType(rawValue: dt) else { continue }  // unused dtypes (e.g. I64 buffers)
+            guard                   let shapeN = d["shape"] as? [NSNumber], shapeN.count <= 8,
+                  let offsN = d["data_offsets"] as? [NSNumber], offsN.count == 2 else {
+                throw EngineError.invalidFile("bad entry '\(name)' in \(file)")
+            }
+            let shape = shapeN.map { $0.int64Value }
+            let offs = offsN.map { $0.int64Value }
+            guard shape.allSatisfy({ $0 >= 0 && $0 <= Int64(Int32.max) }),
+                  offs[0] >= 0, offs[0] <= offs[1], offs[1] <= Int64(dataSize) else {
+                throw EngineError.invalidFile("tensor '\(name)' is out of bounds in \(file)")
+            }
+            var count = 1
+            for s in shape {
+                let (m, o) = count.multipliedReportingOverflow(by: Int(s))
+                guard !o else { throw EngineError.invalidFile("tensor '\(name)' is too large in \(file)") }
+                count = m
+            }
+            let (bytes, o) = count.multipliedReportingOverflow(by: dtype.size)
+            guard !o, bytes == Int(offs[1] - offs[0]) else {
+                throw EngineError.invalidFile("tensor '\(name)' size does not match its shape in \(file)")
+            }
+            infos[name] = (dtype, shape.map { Int($0) }, dataStart + Int(offs[0]), dataStart + Int(offs[1]))
         }
     }
 

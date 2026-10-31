@@ -33,7 +33,7 @@ struct TextTests {
         let t = ChatTemplate(template: "[INST]", modelType: "mistral", bosToken: "<s>")
         let s = t.render([ChatMessage(role: .system, content: "S"), ChatMessage(role: .user, content: "A"),
                           ChatMessage(role: .assistant, content: "B"), ChatMessage(role: .user, content: "C")])
-        #expect(s == "<s>[INST] A [/INST] B</s>[INST] S\n\nC [/INST]")
+        #expect(s == "<s>[INST] A[/INST] B</s>[INST] S\n\nC[/INST]")
     }
 }
 
@@ -118,5 +118,62 @@ struct SafetensorsTests {
         let got = Array(UnsafeBufferPointer(start: (tb.buffer.contents() + tb.offset).bindMemory(to: Float.self, capacity: 4), count: 4))
         #expect(got == b)
         #expect(store.get("missing") == nil)
+    }
+
+    private func write(_ header: String, payload: Int) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("st-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var data = Data()
+        var len = UInt64(header.utf8.count)
+        data.append(Data(bytes: &len, count: 8))
+        data.append(header.data(using: .utf8)!)
+        data.append(Data(count: payload))
+        try data.write(to: dir.appendingPathComponent("model.safetensors"))
+        return dir
+    }
+
+    @Test(arguments: [
+        #"{"a":{"dtype":"F32","shape":[4],"data_offsets":[0,1000]}}"#,          // past end of file
+        #"{"a":{"dtype":"F32","shape":[4],"data_offsets":[8,0]}}"#,             // start > end
+        #"{"a":{"dtype":"F32","shape":[4],"data_offsets":[-16,0]}}"#,           // negative
+        #"{"a":{"dtype":"F32","shape":[5],"data_offsets":[0,16]}}"#,            // shape/bytes mismatch
+        #"{"a":{"dtype":"F32","shape":[4611686018427387904,4],"data_offsets":[0,16]}}"#, // overflow
+        #"{"a":{"dtype":"F32","shape":[-4],"data_offsets":[0,16]}}"#,           // negative dim
+        "not json",
+    ])
+    func rejectsMalformedHeaders(header: String) throws {
+        let dir = try write(header, payload: 16)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect(throws: EngineError.self) { _ = try WeightStore(directory: dir, device: GPU.shared.device) }
+    }
+
+    @Test func rejectsHugeHeaderLength() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("st-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var data = Data()
+        var len = UInt64.max - 4
+        data.append(Data(bytes: &len, count: 8))
+        data.append(Data(count: 64))
+        try data.write(to: dir.appendingPathComponent("model.safetensors"))
+        #expect(throws: EngineError.self) { _ = try WeightStore(directory: dir, device: GPU.shared.device) }
+    }
+}
+
+@Suite("Model config validation")
+struct ConfigValidationTests {
+    @Test(arguments: [
+        #"{"model_type":"llama","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":0}"#,
+        #"{"model_type":"llama","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":3}"#,
+        #"{"model_type":"llama","hidden_size":-64,"num_hidden_layers":2,"num_attention_heads":4}"#,
+        #"{"model_type":"llama","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,"head_dim":99999999}"#,
+        #"{"model_type":"llama","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,"rms_norm_eps":0}"#,
+    ])
+    func rejectsInvalidDimensions(json: String) throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("cfg-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try json.data(using: .utf8)!.write(to: dir.appendingPathComponent("config.json"))
+        #expect(throws: EngineError.self) { _ = try ModelConfig(directory: dir) }
     }
 }
