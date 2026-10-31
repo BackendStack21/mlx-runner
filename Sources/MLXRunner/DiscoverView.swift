@@ -16,6 +16,7 @@ struct DiscoverView: View {
         HSplitView {
             VStack(spacing: 0) {
                 header
+                if query.isEmpty { RecommendedStrip(selected: $selected) }
                 Divider()
                 list
             }
@@ -73,7 +74,7 @@ struct DiscoverView: View {
     }
 
     private var visible: [HubModel] {
-        supportedOnly ? results.filter { $0.modelTypeTag != nil } : results
+        supportedOnly ? results.filter(\.isRunnable) : results
     }
 
     @ViewBuilder
@@ -106,7 +107,9 @@ struct DiscoverView: View {
         do {
             results = try await HubClient.search(query, sort: sort, limit: 100)
             error = nil
-            if selected == nil { selected = visible.first?.id }
+            if selected == nil {
+                selected = query.isEmpty ? (RecommendedModel.forThisMac.first?.id ?? visible.first?.id) : visible.first?.id
+            }
         } catch is CancellationError {
         } catch let e as URLError where e.code == .cancelled {
         } catch {
@@ -139,17 +142,18 @@ struct HubRow: View {
                     }
                 }
                 HStack(spacing: 8) {
-                    Text(model.author).foregroundStyle(.secondary)
+                    Text(model.author).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                     Label(Fmt.count(model.downloads), systemImage: "arrow.down.circle")
                     Label(Fmt.count(model.likes), systemImage: "heart")
                 }
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .labelStyle(CompactLabel())
+                .lineLimit(1)
             }
             Spacer()
             if let q = model.quantizationHint { Badge(text: q, color: Theme.accent) }
-            if let t = model.modelTypeTag { Badge(text: t, color: Theme.accent2) }
+            if let t = model.modelType { Badge(text: t, color: model.isRunnable ? Theme.accent2 : .orange) }
         }
         .padding(.vertical, 4)
     }

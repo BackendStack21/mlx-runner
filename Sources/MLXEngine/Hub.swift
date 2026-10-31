@@ -9,10 +9,29 @@ public struct HubModel: Codable, Identifiable, Hashable, Sendable {
     public let createdAt: String?
     public let tags: [String]?
     public let pipelineTag: String?
+    public let config: HubConfig?
+    public let safetensors: HubSafetensors?
 
     enum CodingKeys: String, CodingKey {
-        case id, downloads, likes, lastModified, createdAt, tags
+        case id, downloads, likes, lastModified, createdAt, tags, config, safetensors
         case pipelineTag = "pipeline_tag"
+    }
+
+    public struct HubConfig: Codable, Hashable, Sendable {
+        public let model_type: String?
+        public let quantization_config: Quant?
+        public struct Quant: Codable, Hashable, Sendable { public let bits: Int? }
+    }
+    public struct HubSafetensors: Codable, Hashable, Sendable { public let total: Int? }
+
+    /// Exact architecture from config.json when the listing includes it.
+    public var modelType: String? { config?.model_type?.lowercased() ?? modelTypeTag }
+    public var isRunnable: Bool { SupportedArchitectures.isSupported(modelType) }
+
+    /// Parameter count, e.g. "7.6B" (for quantized repos this counts packed elements).
+    public var parameterLabel: String? {
+        guard let n = safetensors?.total, n > 0 else { return nil }
+        return n >= 1_000_000_000 ? String(format: "%.1fB", Double(n) / 1e9) : String(format: "%.0fM", Double(n) / 1e6)
     }
 
     public var author: String { id.split(separator: "/").first.map(String.init) ?? "" }
@@ -25,6 +44,7 @@ public struct HubModel: Codable, Identifiable, Hashable, Sendable {
 
     /// Quantization guessed from the repo name, e.g. "4bit", "8bit", "bf16".
     public var quantizationHint: String? {
+        if let b = config?.quantization_config?.bits { return "\(b)bit" }
         let n = name.lowercased()
         for q in ["2bit", "3bit", "4bit", "5bit", "6bit", "8bit", "bf16", "fp16"] where n.contains(q) { return q }
         if n.contains("dwq") { return "dwq" }
@@ -108,7 +128,12 @@ public enum HubClient {
             URLQueryItem(name: "sort", value: sort.rawValue),
             URLQueryItem(name: "direction", value: "-1"),
             URLQueryItem(name: "limit", value: String(limit)),
-            URLQueryItem(name: "full", value: "true"),
+            URLQueryItem(name: "expand[]", value: "config"),
+            URLQueryItem(name: "expand[]", value: "downloads"),
+            URLQueryItem(name: "expand[]", value: "likes"),
+            URLQueryItem(name: "expand[]", value: "tags"),
+            URLQueryItem(name: "expand[]", value: "pipeline_tag"),
+            URLQueryItem(name: "expand[]", value: "lastModified"),
         ]
         if textGenerationOnly { items.append(URLQueryItem(name: "pipeline_tag", value: "text-generation")) }
         let q = query.trimmingCharacters(in: .whitespaces)

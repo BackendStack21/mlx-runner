@@ -316,6 +316,8 @@ struct MessageRow: View {
                     }
                     if !generating {
                         footer
+                    } else if state.liveTokens > 0 {
+                        LiveStats(tps: state.liveTokensPerSecond, tokens: state.liveTokens)
                     } else if let s = message.stats, s.promptTokens > 0, message.content.isEmpty, message.reasoning == nil {
                         Text("Processed \(s.promptTokens) prompt tokens in \(String(format: "%.2f", s.timeToFirstToken))s")
                             .font(.system(size: 11)).foregroundStyle(.tertiary)
@@ -615,5 +617,26 @@ struct SliderRow: View {
             }
             Slider(value: $value, in: range, step: step).controlSize(.small)
         }
+    }
+}
+
+/// Pulsing live throughput readout shown while tokens stream in.
+struct LiveStats: View {
+    let tps: Double
+    let tokens: Int
+    @State private var pulse = false
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle().fill(Theme.gradient).frame(width: 7, height: 7)
+                .scaleEffect(pulse ? 1.25 : 0.8)
+                .opacity(pulse ? 1 : 0.6)
+                .animation(.easeInOut(duration: 0.7).repeatForever(), value: pulse)
+            Text(String(format: "%.0f tok/s", tps))
+                .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                .foregroundStyle(Theme.gradient)
+                .contentTransition(.numericText())
+            Text("\(tokens) tokens").font(.system(size: 11).monospacedDigit()).foregroundStyle(.tertiary)
+        }
+        .onAppear { pulse = true }
     }
 }

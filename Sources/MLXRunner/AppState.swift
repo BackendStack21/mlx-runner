@@ -60,6 +60,8 @@ final class AppState {
     var generatingConversation: UUID?
     var showInspector = true
     var draft: String = ""
+    var liveTokens = 0
+    var liveTokensPerSecond: Double = 0
 
     // Settings (persisted in UserDefaults)
     var sampling = SamplingParameters() { didSet { saveSettings() } }
@@ -274,6 +276,10 @@ final class AppState {
             var lastFlush = Date()
             var thinkStart: Date?
             var thinkEnd: Date?
+            var genStart: Date?
+            var tokenCount = 0
+            liveTokens = 0
+            liveTokensPerSecond = 0
             @MainActor func flush(_ final: Bool = false) {
                 raw += pending
                 pending = ""
@@ -281,6 +287,10 @@ final class AppState {
                 let parsed = ThinkParser.split(raw)
                 if parsed.reasoning != nil && thinkStart == nil { thinkStart = Date() }
                 if parsed.reasoningComplete && thinkEnd == nil, thinkStart != nil { thinkEnd = Date() }
+                if let g = genStart {
+                    liveTokens = tokenCount
+                    liveTokensPerSecond = Double(tokenCount) / max(Date().timeIntervalSince(g), 0.001)
+                }
                 update(id, replyID) { m in
                     m.content = final ? parsed.content.trimmingCharacters(in: .whitespacesAndNewlines) : parsed.content
                     m.reasoning = parsed.reasoning
@@ -291,9 +301,11 @@ final class AppState {
                 for try await ev in engine.chat(history, parameters: params, enableThinking: thinking) {
                     switch ev {
                     case .promptProcessed(let s):
+                        genStart = Date()
                         update(id, replyID) { $0.stats = s }
                     case .text(let t):
                         pending += t
+                        tokenCount += 1
                         if Date().timeIntervalSince(lastFlush) > 0.033 { flush() }
                     case .finished(let s):
                         flush(true)
