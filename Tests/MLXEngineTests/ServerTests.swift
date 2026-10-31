@@ -480,7 +480,10 @@ struct ServerNoModelTests {
         let s = try makeServer { $0.maxConnections = 2; $0.headerTimeout = 5 }; defer { s.stop() }
         let port = s.boundPort
         let a = rawConnect(port), b = rawConnect(port)
-        defer { close(a); close(b) }
+        // Close each socket exactly once: a second close() could hit a descriptor number that
+        // Network.framework has reused (guarded fd → EXC_GUARD kills the process).
+        var open = true
+        defer { if open { close(a); close(b) } }
         #expect(a >= 0 && b >= 0)
         // Wait until the server has registered both (a fixed sleep races on slow CI runners).
         let deadline = Date().addingTimeInterval(20)
@@ -488,7 +491,7 @@ struct ServerNoModelTests {
         #expect(s.openConnections == 2)
         let third = await httpRequest(port, "GET", "/")
         expectErrorSchema(third, status: 503, code: "server_busy")
-        close(a); close(b)
+        close(a); close(b); open = false
         let freed = Date().addingTimeInterval(20)
         while s.openConnections > 0, Date() < freed { try await Task.sleep(nanoseconds: 50_000_000) }
         #expect(await httpRequest(port, "GET", "/").status == 200)
