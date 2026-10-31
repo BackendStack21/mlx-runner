@@ -20,7 +20,7 @@ struct DiscoverView: View {
                 Divider()
                 list
             }
-            .frame(minWidth: 380, idealWidth: 440)
+            .frame(minWidth: 340, idealWidth: 420)
 
             Group {
                 if let id = selected {
@@ -37,7 +37,7 @@ struct DiscoverView: View {
                     }
                 }
             }
-            .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+            .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
         }
         .navigationTitle("Discover")
         .task { await search() }
@@ -188,13 +188,13 @@ struct ModelDetailView: View {
                         .textSelection(.enabled)
                 }
                 if let d = details {
-                    HStack(spacing: 6) {
-                        if let t = d.modelType { Badge(text: t, color: d.isSupported ? Theme.accent2 : .orange, systemImage: "cpu") }
-                        if let b = d.bits { Badge(text: "\(b)-bit", color: Theme.accent, systemImage: "square.stack.3d.down.right") }
-                        Badge(text: Fmt.bytes(d.downloadSize), color: .secondary, systemImage: "internaldrive")
-                        if let l = d.license { Badge(text: l, color: .secondary, systemImage: "doc.text") }
-                        Badge(text: Fmt.count(d.downloads), color: .secondary, systemImage: "arrow.down.circle")
-                        Badge(text: Fmt.count(d.likes), color: .secondary, systemImage: "heart")
+                    // One row when it fits, two when the pane is narrow.
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 6) { modelBadges(d); statBadges(d) }
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 6) { modelBadges(d) }
+                            HStack(spacing: 6) { statBadges(d) }
+                        }
                     }
                     actionCard(d)
                 } else if let error {
@@ -216,6 +216,18 @@ struct ModelDetailView: View {
             } catch { self.error = error.localizedDescription }
             if let r = await HubClient.readme(repo) { readme = Self.stripFrontMatter(r) }
         }
+    }
+
+    @ViewBuilder private func modelBadges(_ d: HubModelDetails) -> some View {
+        if let t = d.modelType { Badge(text: t, color: d.isSupported ? Theme.accent2 : .orange, systemImage: "cpu") }
+        if let b = d.bits { Badge(text: "\(b)-bit", color: Theme.accent, systemImage: "square.stack.3d.down.right") }
+        Badge(text: Fmt.bytes(d.downloadSize), color: .secondary, systemImage: "internaldrive")
+    }
+
+    @ViewBuilder private func statBadges(_ d: HubModelDetails) -> some View {
+        if let l = d.license { Badge(text: l, color: .secondary, systemImage: "doc.text") }
+        Badge(text: Fmt.count(d.downloads), color: .secondary, systemImage: "arrow.down.circle")
+        Badge(text: Fmt.count(d.likes), color: .secondary, systemImage: "heart")
     }
 
     @ViewBuilder

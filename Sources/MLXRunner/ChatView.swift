@@ -22,6 +22,7 @@ struct ChatView: View {
                 Composer(conversationID: conversationID)
             }
         }
+        .frame(minWidth: WindowLayout.chatMin)
         .inspector(isPresented: $state.showInspector) {
             InspectorView(conversationID: conversationID)
                 .inspectorColumnWidth(min: 260, ideal: 290, max: 360)

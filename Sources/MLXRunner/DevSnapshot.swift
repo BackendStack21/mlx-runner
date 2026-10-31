@@ -24,7 +24,21 @@ enum DevSnapshot {
         ]
         Task { @MainActor in
             loadShowcaseModel(state)
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            // MLXRUNNER_SNAPSHOT_SIZE=WxH asks for that content size, clamped to the window's minimum
+            // (setContentSize doesn't enforce it), so a tiny size shows the most compressed layout a
+            // user can reach.
+            if let window = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil }) {
+                let opened = window.frame.size
+                if let parts = env["MLXRUNNER_SNAPSHOT_SIZE"]?.split(separator: "x", omittingEmptySubsequences: false),
+                   parts.count == 2, let w = Double(parts[0]), let h = Double(parts[1]),
+                   w.isFinite, h.isFinite, w > 0, h > 0 {
+                    let min = window.contentMinSize
+                    window.setContentSize(NSSize(width: max(w, min.width), height: max(h, min.height)))
+                }
+                FileHandle.standardError.write(Data("snapshot window: opened \(opened), now \(window.frame.size), contentMinSize \(window.contentMinSize)\n".utf8))
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
             for (name, select) in screens {
                 select()
                 try? await Task.sleep(nanoseconds: 2_500_000_000)

@@ -50,7 +50,7 @@ struct Badge: View {
     var body: some View {
         HStack(spacing: 3) {
             if let systemImage { Image(systemName: systemImage).font(.system(size: 9, weight: .bold)) }
-            Text(text).font(.system(size: 10, weight: .semibold, design: .rounded))
+            Text(text).font(.system(size: 10, weight: .semibold, design: .rounded)).lineLimit(1)
         }
         .padding(.horizontal, 7)
         .padding(.vertical, 3)

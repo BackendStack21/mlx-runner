@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1
+
+- The window opens at 1280×820 on first launch instead of at its minimum width, which squeezed the Discover screen and the chat.
+- The sidebar keeps at least 240 pt and the main area at least 820 pt (chat 560 + settings inspector 260). The window can't shrink below the sum, so neither side gets compressed.
+- Discover's model badges move to a second row when the pane is narrow instead of breaking mid-word.
+
 ## 1.0.0
 
 First public release.
