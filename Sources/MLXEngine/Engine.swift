@@ -147,6 +147,7 @@ public final class InferenceEngine: @unchecked Sendable {
                     self.info = nil
                     self.cachedTokens = []
                     let tok = try Tokenizer(directory: directory)
+                    try Self.checkMemory(directory: directory, contextLength: contextLength)
                     let model = try Transformer(directory: directory, contextLength: contextLength)
                     let tpl = ChatTemplate(template: tok.chatTemplate, modelType: model.config.modelType, bosToken: tok.bosToken)
                     var stops = Set(model.config.eosTokenIds)
@@ -204,9 +205,10 @@ public final class InferenceEngine: @unchecked Sendable {
                     cont.finish(throwing: EngineError.invalidFile("No model loaded"))
                     return
                 }
-                let prompt = tpl.render(messages, enableThinking: enableThinking)
                 do {
-                    try self.run(tokens: tok.encode(prompt), parameters: parameters) { cont.yield($0) }
+                    let tokens = self.fitToContext(messages, template: tpl, tokenizer: tok,
+                                                   reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking)
+                    try self.run(tokens: tokens, parameters: parameters) { cont.yield($0) }
                     cont.finish()
                 } catch {
                     cont.finish(throwing: error)
@@ -239,6 +241,25 @@ public final class InferenceEngine: @unchecked Sendable {
     public func decode(_ ids: [Int]) -> String { queue.sync { tokenizer?.decode(ids) ?? "" } }
     public func renderChat(_ messages: [ChatMessage], enableThinking: Bool = true) -> String {
         queue.sync { template?.render(messages, enableThinking: enableThinking) ?? "" }
+    }
+
+    /// Encodes the conversation, dropping the oldest turns (never the system prompt or the
+    /// latest message) until it fits in the context window with room to answer.
+    private func fitToContext(_ messages: [ChatMessage], template: ChatTemplate, tokenizer: Tokenizer,
+                              reserve: Int, enableThinking: Bool) -> [Int] {
+        let limit = (model?.maxSeq ?? Int.max) - reserve
+        var msgs = messages
+        var tokens = tokenizer.encode(template.render(msgs, enableThinking: enableThinking))
+        while tokens.count > limit {
+            guard let drop = msgs.firstIndex(where: { $0.role != .system }), drop < msgs.count - 1 else { break }
+            msgs.remove(at: drop)
+            // keep turns paired: never start the history with an assistant reply
+            if let next = msgs.firstIndex(where: { $0.role != .system }), msgs[next].role == .assistant, next < msgs.count - 1 {
+                msgs.remove(at: next)
+            }
+            tokens = tokenizer.encode(template.render(msgs, enableThinking: enableThinking))
+        }
+        return tokens
     }
 
     private func run(tokens: [Int], parameters: SamplingParameters, emit: (GenerationEvent) -> Void) throws {
@@ -287,5 +308,26 @@ public final class InferenceEngine: @unchecked Sendable {
         let dt = Date().timeIntervalSince(tGen)
         stats.tokensPerSecond = Double(stats.generatedTokens) / max(dt, 1e-6)
         emit(.finished(stats))
+    }
+}
+
+extension InferenceEngine {
+    /// Refuses to load a model whose weights plus KV cache would not fit in GPU-addressable memory.
+    static func checkMemory(directory: URL, contextLength: Int) throws {
+        let fm = FileManager.default
+        var weights = 0
+        for f in (try? fm.contentsOfDirectory(atPath: directory.path)) ?? [] where f.hasSuffix(".safetensors") {
+            let p = directory.appendingPathComponent(f).resolvingSymlinksInPath().path
+            weights += (try? fm.attributesOfItem(atPath: p)[.size] as? Int) ?? 0
+        }
+        let cfg = try ModelConfig(directory: directory)
+        let ctx = min(contextLength, max(cfg.maxPositionEmbeddings, 256))
+        let kv = cfg.numLayers * 2 * cfg.numKVHeads * cfg.headDim * 2 * ctx
+        let need = UInt64(weights + kv)
+        let budget = GPU.shared.device.recommendedMaxWorkingSetSize
+        guard need < budget else {
+            let f = ByteCountFormatter()
+            throw EngineError.unsupported("needs \(f.string(fromByteCount: Int64(need))) (weights + \(ctx)-token KV cache) but the GPU can use about \(f.string(fromByteCount: Int64(budget))). Try a smaller quantization or a shorter context length.")
+        }
     }
 }

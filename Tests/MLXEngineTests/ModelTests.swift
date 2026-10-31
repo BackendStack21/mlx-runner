@@ -74,4 +74,25 @@ struct ModelTests {
         }
         #expect(cached > 10, "second turn should reuse the KV cache prefix")
     }
+
+    @Test(.enabled(if: installedModel(qwen3) != nil))
+    func longConversationIsTrimmedToFitContext() async throws {
+        let engine = InferenceEngine()
+        _ = try await engine.load(directory: installedModel(Self.qwen3)!, contextLength: 256)
+        var p = SamplingParameters()
+        p.temperature = 0
+        p.maxTokens = 16
+        let filler = String(repeating: "This is an old message about nothing in particular. ", count: 20)
+        var msgs = [ChatMessage(role: .system, content: "You are terse.")]
+        for _ in 0..<6 {
+            msgs.append(ChatMessage(role: .user, content: filler))
+            msgs.append(ChatMessage(role: .assistant, content: "Ok."))
+        }
+        msgs.append(ChatMessage(role: .user, content: "Say hi."))
+        var finished = false
+        for try await ev in engine.chat(msgs, parameters: p, enableThinking: false) {
+            if case .finished = ev { finished = true }
+        }
+        #expect(finished)
+    }
 }
