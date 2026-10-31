@@ -73,7 +73,7 @@ enum WindowLayout {
     static let sidebarMax: CGFloat = 340
     /// The conversation column alone.
     static let chatMin: CGFloat = 560
-    /// Chat with the inspector open (560 + 260); also fits Discover's two panes (340 + 400 + divider).
+    /// Chat with the inspector open (560 + 260); also fits Discover's two panes (380 + 400 + divider).
     static let detailMin: CGFloat = chatMin + 260
     static let windowMinWidth: CGFloat = sidebarMin + detailMin
 }
