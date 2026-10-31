@@ -1,12 +1,18 @@
 import Foundation
 
 public struct ChatMessage: Codable, Hashable, Sendable {
-    public enum Role: String, Codable, Sendable { case system, user, assistant }
+    public enum Role: String, Codable, Sendable { case system, user, assistant, tool }
     public var role: Role
     public var content: String
-    public init(role: Role, content: String) {
+    /// Calls an assistant message made (OpenAI `tool_calls`).
+    public var toolCalls: [ToolCall]?
+    /// For `tool` messages: the call this is the result of.
+    public var toolCallID: String?
+    public init(role: Role, content: String, toolCalls: [ToolCall]? = nil, toolCallID: String? = nil) {
         self.role = role
         self.content = content
+        self.toolCalls = toolCalls
+        self.toolCallID = toolCallID
     }
 }
 
@@ -40,14 +46,52 @@ public struct ChatTemplate: Sendable {
     let defaultSystem: String?
     /// Llama 3.1+ templates always open with a system block carrying the knowledge cutoff and date.
     let llamaDatePreamble: Bool
+    /// The template defines native tool calling (Hermes `<tool_call>`, Llama 3.1+ `ipython`,
+    /// Mistral v3 `[AVAILABLE_TOOLS]`).
+    public let supportsTools: Bool
+    /// Qwen2.5's template prints its tool-call example with doubled braces (`{{"name": …}}`, a
+    /// Jinja quirk the model was trained with); Qwen3's prints single braces.
+    let hermesDoubleBraces: Bool
 
-    public init(template: String?, modelType: String, bosToken: String?) {
+    /// `toolTemplate`: a separate tool-use template, when the model ships one (checked for tool support).
+    public init(template: String?, modelType: String, bosToken: String?, toolTemplate: String? = nil) {
         format = ChatFormat.detect(template: template, modelType: modelType)
         supportsThinkingToggle = template?.contains("enable_thinking") ?? false
         bos = bosToken ?? ""
         let qwen = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
         defaultSystem = format == .chatML && (template?.contains(qwen) ?? false) ? qwen : nil
         llamaDatePreamble = format == .llama3 && (template?.contains("Cutting Knowledge Date") ?? false)
+        let t = (template ?? "") + (toolTemplate ?? "")
+        hermesDoubleBraces = t.contains("{{\\\"name\\\": <function-name>")
+        switch format {
+        case .chatML: supportsTools = t.contains("<tool_call>")
+        case .llama3: supportsTools = llamaDatePreamble && t.contains("ipython")
+        case .mistral: supportsTools = t.contains("[AVAILABLE_TOOLS]")
+        case .phi3, .plain: supportsTools = false
+        }
+    }
+
+    /// Special tokens that start a tool call and must reach the output parser.
+    public var toolCallMarkerTokens: [String] {
+        switch format {
+        case .mistral: return ["[TOOL_CALLS]"]
+        case .llama3: return ["<|python_tag|>"]
+        case .chatML, .phi3, .plain: return []
+        }
+    }
+
+    /// Text that starts the assistant turn so the reply must be a tool call: any call for
+    /// `.required`, a call to the named function for `.function`. nil otherwise.
+    public static func toolCallPrefill(_ format: ChatFormat, _ choice: ToolChoice) -> String? {
+        switch (format, choice) {
+        case (.chatML, .required): return "<tool_call>\n{\"name\": \""
+        case (.chatML, .function(let n)): return "<tool_call>\n{\"name\": \"\(n)\", \"arguments\": "
+        case (.llama3, .required): return "{\"name\": \""
+        case (.llama3, .function(let n)): return "{\"name\": \"\(n)\", \"parameters\": "
+        case (.mistral, .required): return "[TOOL_CALLS] [{\"name\": \""
+        case (.mistral, .function(let n)): return "[TOOL_CALLS] [{\"name\": \"\(n)\", \"arguments\": "
+        default: return nil
+        }
     }
 
     static func todayString() -> String {
@@ -58,13 +102,17 @@ public struct ChatTemplate: Sendable {
     }
 
     /// Renders messages as a prompt ending with the assistant turn opener.
-    public func render(_ messages: [ChatMessage], enableThinking: Bool = true) -> String {
-        renderMarked(messages, enableThinking: enableThinking).text
+    public func render(_ messages: [ChatMessage], enableThinking: Bool = true, tools: [ToolDefinition] = [],
+                       prefill: String? = nil) -> String {
+        renderMarked(messages, enableThinking: enableThinking, tools: tools, prefill: prefill).text
     }
 
     /// Like `render`, plus the UTF-16 ranges holding message content. Those ranges must be
     /// tokenized as plain text so a message cannot inject control tokens (forged turns).
-    public func renderMarked(_ messages: [ChatMessage], enableThinking: Bool = true) -> (text: String, content: [NSRange]) {
+    /// `tools` are rendered the way the model's own template does; `prefill` (see
+    /// `toolCallPrefill`) is appended after the assistant turn opener.
+    public func renderMarked(_ messages: [ChatMessage], enableThinking: Bool = true, tools: [ToolDefinition] = [],
+                             prefill: String? = nil) -> (text: String, content: [NSRange]) {
         var s = ""
         var len = 0
         var ranges: [NSRange] = []
@@ -76,26 +124,80 @@ public struct ChatTemplate: Sendable {
         }
         switch format {
         case .chatML:
-            if let d = defaultSystem, messages.first?.role != .system {
+            var rest = messages[...]
+            if !tools.isEmpty {
+                // Hermes tool block, as in the Qwen2.5 / Qwen3 templates.
+                lit("<|im_start|>system\n")
+                if rest.first?.role == .system { content(rest.removeFirst().content); lit("\n\n") }
+                else if let d = defaultSystem { lit(d + "\n\n") }
+                lit("# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+                    + "You are provided with function signatures within <tools></tools> XML tags:\n<tools>")
+                for t in tools { lit("\n"); content(t.spec.serialized(.python)) }
+                lit("\n</tools>\n\nFor each function call, return a json object with function name and arguments within "
+                    + "<tool_call></tool_call> XML tags:\n<tool_call>\n"
+                    + (hermesDoubleBraces ? "{{\"name\": <function-name>, \"arguments\": <args-json-object>}}"
+                                          : "{\"name\": <function-name>, \"arguments\": <args-json-object>}")
+                    + "\n</tool_call><|im_end|>\n")
+            } else if let d = defaultSystem, rest.first?.role != .system {
                 lit("<|im_start|>system\n\(d)<|im_end|>\n")
             }
-            for m in messages {
-                lit("<|im_start|>\(m.role.rawValue)\n"); content(m.content); lit("<|im_end|>\n")
+            let list = Array(rest)
+            for (i, m) in list.enumerated() {
+                switch m.role {
+                case .tool:
+                    if i == 0 || list[i - 1].role != .tool { lit("<|im_start|>user") }
+                    lit("\n<tool_response>\n"); content(m.content); lit("\n</tool_response>")
+                    if i == list.count - 1 || list[i + 1].role != .tool { lit("<|im_end|>\n") }
+                case .assistant where !(m.toolCalls ?? []).isEmpty:
+                    lit("<|im_start|>assistant\n"); content(m.content)
+                    for (j, c) in (m.toolCalls ?? []).enumerated() {
+                        if j > 0 || !m.content.isEmpty { lit("\n") }
+                        lit("<tool_call>\n{\"name\": \""); content(c.name); lit("\", \"arguments\": ")
+                        content(c.argumentsValue.serialized(.python)); lit("}\n</tool_call>")
+                    }
+                    lit("<|im_end|>\n")
+                default:
+                    lit("<|im_start|>\(m.role.rawValue)\n"); content(m.content); lit("<|im_end|>\n")
+                }
             }
             lit("<|im_start|>assistant\n")
-            if supportsThinkingToggle && !enableThinking { lit("<think>\n\n</think>\n\n") }
+            if supportsThinkingToggle && (!enableThinking || prefill != nil) { lit("<think>\n\n</think>\n\n") }
         case .llama3:
             lit("<|begin_of_text|>")
             var rest = messages[...]
             if llamaDatePreamble {
                 var system = ""
                 if rest.first?.role == .system { system = rest.removeFirst().content.trimmingCharacters(in: .whitespacesAndNewlines) }
-                lit("<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: \(Self.todayString())\n\n")
+                lit("<|start_header_id|>system<|end_header_id|>\n\n")
+                if !tools.isEmpty { lit("Environment: ipython\n") }
+                lit("Cutting Knowledge Date: December 2023\nToday Date: \(Self.todayString())\n\n")
                 content(system); lit("<|eot_id|>")
+                // Llama 3.1+ puts custom tools in the first user message (tools_in_user_message).
+                if !tools.isEmpty, rest.first?.role == .user {
+                    let first = rest.removeFirst()
+                    lit("<|start_header_id|>user<|end_header_id|>\n\n")
+                    lit("Given the following functions, please respond with a JSON for a function call "
+                        + "with its proper arguments that best answers the given prompt.\n\n"
+                        + "Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}."
+                        + "Do not use variables.\n\n")
+                    for t in tools { content(t.spec.serialized(.pythonIndent(4))); lit("\n\n") }
+                    content(first.content.trimmingCharacters(in: .whitespacesAndNewlines)); lit("<|eot_id|>")
+                }
             }
             for m in rest {
-                lit("<|start_header_id|>\(m.role.rawValue)<|end_header_id|>\n\n")
-                content(m.content.trimmingCharacters(in: .whitespacesAndNewlines)); lit("<|eot_id|>")
+                if m.role == .assistant, let c = m.toolCalls?.first {
+                    // The template allows one call per assistant message.
+                    lit("<|start_header_id|>assistant<|end_header_id|>\n\n{\"name\": \""); content(c.name)
+                    lit("\", \"parameters\": "); content(c.argumentsValue.serialized(.python)); lit("}<|eot_id|>")
+                } else if m.role == .tool {
+                    // The template JSON-encodes tool results (a string is "iterable" to Jinja).
+                    var quoted = ""
+                    JSONValue.writeString(m.content, to: &quoted)
+                    lit("<|start_header_id|>ipython<|end_header_id|>\n\n"); content(quoted); lit("<|eot_id|>")
+                } else {
+                    lit("<|start_header_id|>\(m.role.rawValue)<|end_header_id|>\n\n")
+                    content(m.content.trimmingCharacters(in: .whitespacesAndNewlines)); lit("<|eot_id|>")
+                }
             }
             lit("<|start_header_id|>assistant<|end_header_id|>\n\n")
         case .mistral:
@@ -104,11 +206,26 @@ public struct ChatTemplate: Sendable {
             let turns = messages.filter { $0.role != .system }
             let lastUser = turns.lastIndex(where: { $0.role == .user })
             for (i, m) in turns.enumerated() {
-                if m.role == .user {
+                switch m.role {
+                case .user:
                     var c = m.content
                     if let system, i == lastUser { c = system + "\n\n" + c }
+                    if !tools.isEmpty, i == lastUser {
+                        // mistral-common v3: [AVAILABLE_TOOLS]▁[...][/AVAILABLE_TOOLS] before the last [INST].
+                        lit("[AVAILABLE_TOOLS] "); content(JSONValue.array(tools.map(\.spec)).serialized(.python)); lit("[/AVAILABLE_TOOLS]")
+                    }
                     lit("[INST] "); content(c); lit("[/INST]")  // mistral-common v3: [INST]▁content[/INST]
-                } else {
+                case .assistant where !(m.toolCalls ?? []).isEmpty:
+                    let calls = JSONValue.array((m.toolCalls ?? []).map {
+                        .object([("name", .string($0.name)), ("arguments", $0.argumentsValue), ("id", .string(ToolCall.mistralID($0.id)))])
+                    })
+                    lit("[TOOL_CALLS] "); content(calls.serialized(.python)); lit("</s>")
+                case .tool:
+                    // mistral-common sends JSON results as values, anything else as a string.
+                    let value = (try? JSONValue.parse(m.content)) ?? .string(m.content)
+                    let result = JSONValue.object([("content", value), ("call_id", .string(ToolCall.mistralID(m.toolCallID ?? "")))])
+                    lit("[TOOL_RESULTS] "); content(result.serialized(.python)); lit("[/TOOL_RESULTS]")
+                default:
                     lit(" "); content(m.content); lit("</s>")
                 }
             }
@@ -124,10 +241,13 @@ public struct ChatTemplate: Sendable {
                 case .system: content(m.content); lit("\n\n")
                 case .user: lit("User: "); content(m.content); lit("\n")
                 case .assistant: lit("Assistant: "); content(m.content); lit("\n")
+                case .tool: lit("Tool: "); content(m.content); lit("\n")
                 }
             }
             lit("Assistant:")
         }
+        // The prefill holds only markers and a validated function name.
+        if let prefill { lit(prefill) }
         return (s, ranges)
     }
 

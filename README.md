@@ -66,7 +66,8 @@ gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx
 **Local Server**
 - OpenAI-compatible: the Responses API (`POST /v1/responses`, with typed streaming events), Chat Completions (`developer` role, content parts, `max_completion_tokens`, `stream_options.include_usage`), legacy Completions, and `/v1/models`.
 - Qwen3 thinking is returned as `reasoning_content` (Chat Completions) or a `reasoning` item (Responses).
-- Features it can't honour (tools, JSON mode, images, logprobs) are rejected with an OpenAI-style 400 instead of being silently ignored.
+- Tool calling (function tools) in both APIs, streaming and non-streaming, for Qwen2.5, Qwen3, Llama 3.1+ and Mistral v0.3 models. Prompts are rendered in each model's native tool format, checked byte for byte against the official chat templates and `mistral-common`. `tool_choice` supports `auto`, `none`, `required` (the function name is constrained to the tools you defined) and a named function. `parallel_tool_calls` and the full call → `tool` result → answer loop are supported. Models without a tool format (Phi-3.5) answer tool requests with a 400.
+- Features it can't honour (JSON mode, images, logprobs, built-in tools such as web search) are rejected with an OpenAI-style 400 instead of being silently ignored.
 - Safe by default: binds to localhost, rejects other `Host` headers (DNS rebinding) and unknown browser `Origin`s, accepts JSON bodies only, and enforces timeouts plus connection, queue and size limits. An API key is optional on localhost and required in LAN mode.
 - Includes a request log.
 

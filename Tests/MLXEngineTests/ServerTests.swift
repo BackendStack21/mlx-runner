@@ -321,7 +321,10 @@ struct ServerNoModelTests {
         await check([:], "messages", messages: [])
         await check([:], "messages", messages: "hello")
         await check([:], "messages[0].role", messages: [["role": "wizard", "content": "x"]])
-        await check([:], "messages[0].role", messages: [["role": "tool", "content": "x", "tool_call_id": "1"]])
+        // A tool result must answer a call made earlier in the conversation.
+        await check([:], "messages[0].tool_call_id", messages: [["role": "tool", "content": "x", "tool_call_id": "1"]])
+        await check([:], "messages[0].tool_call_id", messages: [["role": "tool", "content": "x"]])
+        await check([:], "messages[0].role", messages: [["role": "function", "name": "f", "content": "x"]])
         await check([:], "messages[0].content[0]",
                     messages: [["role": "user", "content": [["type": "image_url", "image_url": ["url": "http://x/y.png"]]]]])
         await check([:], "messages[0].content[1]",
@@ -339,8 +342,35 @@ struct ServerNoModelTests {
         await check(["n": 1e300], "n")
         await check(["response_format": ["type": "json_object"]], "response_format")
         await check(["response_format": ["type": "json_schema", "json_schema": ["name": "x", "schema": [:]]]], "response_format")
-        await check(["tools": [["type": "function", "function": ["name": "f"]]]], "tools")
+        // Tools.
+        let fn: [String: Any] = ["type": "function", "function": ["name": "f", "parameters": ["type": "object"]]]
+        await check(["tools": "f"], "tools")
+        await check(["tools": [["type": "web_search"]]], "tools[0].type")
+        await check(["tools": [["type": "function"]]], "tools[0].function")
+        await check(["tools": [["type": "function", "function": ["name": "bad name!"]]]], "tools[0].function.name")
+        await check(["tools": [["type": "function", "function": ["name": String(repeating: "a", count: 65)]]]], "tools[0].function.name")
+        await check(["tools": [fn, fn]], "tools[1].function.name")
+        await check(["tools": [["type": "function", "function": ["name": "f", "parameters": "object"]]]], "tools[0].function.parameters")
+        await check(["tools": Array(repeating: fn, count: 129)], "tools")
         await check(["tool_choice": "required"], "tool_choice")
+        await check(["tools": [fn], "tool_choice": "sometimes"], "tool_choice")
+        await check(["tools": [fn], "tool_choice": ["type": "function", "function": ["name": "g"]]], "tool_choice")
+        await check(["tools": [fn], "parallel_tool_calls": "yes"], "parallel_tool_calls")
+        await check(["functions": [["name": "f"]]], "functions")
+        await check(["function_call": "auto"], "function_call")
+        let call: [String: Any] = ["id": "call_1", "type": "function", "function": ["name": "f", "arguments": "{\"a\":1}"]]
+        await check([:], "messages[1].tool_calls[0]", messages: [["role": "user", "content": "x"],
+            ["role": "assistant", "tool_calls": [["id": "call_1", "type": "function", "function": ["name": "f", "arguments": "not json"]]]]])
+        await check([:], "messages[1].tool_calls[0]", messages: [["role": "user", "content": "x"],
+            ["role": "assistant", "tool_calls": [["id": "call_1", "type": "function", "function": ["name": "f", "arguments": "[1]"]]]]])
+        await check([:], "messages[1].tool_calls[0]", messages: [["role": "user", "content": "x"],
+            ["role": "assistant", "tool_calls": [["type": "function", "function": ["name": "f", "arguments": "{}"]]]]])
+        await check([:], "messages[2].tool_call_id", messages: [["role": "user", "content": "x"],
+            ["role": "assistant", "tool_calls": [call]], ["role": "tool", "tool_call_id": "call_2", "content": "1"]])
+        // Deeply nested JSON Schema is refused rather than recursed into.
+        var deep: Any = ["type": "string"]
+        for _ in 0..<70 { deep = ["type": "array", "items": deep] }
+        await check(["tools": [["type": "function", "function": ["name": "f", "parameters": deep]]]], nil)
         await check(["logprobs": true], "logprobs")
         await check(["stop": 5], "stop")
         await check(["stream": "yes"], "stream")
@@ -357,6 +387,15 @@ struct ServerNoModelTests {
         let bodies: [[String: Any]] = [
             ["messages": [["role": "developer", "content": "be brief"], ["role": "user", "content": [["type": "text", "text": "hi"]]]]],
             ["messages": userMsg, "tools": [["type": "function", "function": ["name": "f"]]], "tool_choice": "none"],
+            ["messages": userMsg, "tools": [["type": "function", "function": ["name": "get_weather", "description": "d",
+                                                                                  "parameters": ["type": "object", "properties": ["city": ["type": "string"]]],
+                                                                                  "strict": true]]],
+             "tool_choice": ["type": "function", "function": ["name": "get_weather"]], "parallel_tool_calls": false],
+            ["messages": [["role": "user", "content": "x"],
+                          ["role": "assistant", "content": NSNull(),
+                           "tool_calls": [["id": "call_1", "type": "function", "function": ["name": "f", "arguments": "{\"a\": 1}"]]]],
+                          ["role": "tool", "tool_call_id": "call_1", "content": [["type": "text", "text": "42"]]]],
+             "tools": [["type": "function", "function": ["name": "f"]]], "tool_choice": "required"],
             ["messages": userMsg, "response_format": ["type": "text"], "stop": ["a", "b"], "seed": 7, "n": 1,
              "frequency_penalty": 0.5, "presence_penalty": -1, "stream": true, "stream_options": ["include_usage": true],
              "user": "u", "store": false, "metadata": ["a": "b"], "logprobs": false, "reasoning_effort": "none"],
@@ -416,12 +455,17 @@ struct ServerNoModelTests {
         await check(["input": "x", "previous_response_id": "resp_1"], "previous_response_id")
         await check(["input": "x", "conversation": "conv_1"], "conversation")
         await check(["input": "x", "background": true], "background")
-        await check(["input": "x", "tools": [["type": "web_search"]]], "tools")
+        await check(["input": "x", "tools": [["type": "web_search"]]], "tools[0].type")
+        await check(["input": "x", "tools": [["type": "function"]]], "tools[0].name")
+        await check(["input": "x", "tools": [["type": "function", "name": "f"]], "tool_choice": ["type": "function", "name": "g"]], "tool_choice")
+        await check(["input": [["type": "function_call", "call_id": "c", "name": "f", "arguments": "x"]]], "input[0]")
+        await check(["input": [["role": "tool", "content": "x"]]], "input[0].role")
         await check(["input": "x", "text": ["format": ["type": "json_schema", "name": "x", "schema": [:]]]], "text.format")
         await check(["input": "x", "max_output_tokens": 0], "max_output_tokens")
         await check(["input": "x", "temperature": 9], "temperature")
         await check(["input": [["role": "user", "content": [["type": "input_image", "image_url": "http://x"]]]]], "input[0].content[0]")
-        await check(["input": [["type": "function_call_output", "call_id": "c", "output": "x"]]], "input[0].type")
+        await check(["input": [["type": "function_call_output", "call_id": "c", "output": "x"]]], "input[0].call_id")
+        await check(["input": [["type": "item_reference", "id": "x"]]], "input[0].type")
         await check(["input": [["role": "system", "content": "only system"]]], "input")
         // Accepted shapes reach the model check.
         let ok: [[String: Any]] = [
@@ -429,6 +473,10 @@ struct ServerNoModelTests {
             ["input": [["role": "developer", "content": "x"], ["type": "message", "role": "user", "content": [["type": "input_text", "text": "hi"]]],
                        ["role": "assistant", "content": [["type": "output_text", "text": "hello"]]], ["role": "user", "content": "again"]]],
             ["input": "hi", "tools": [["type": "function", "name": "f"]], "tool_choice": "none", "reasoning": ["effort": "none"]],
+            ["input": [["role": "user", "content": "weather?"],
+                       ["type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{\"city\": \"Paris\"}"],
+                       ["type": "function_call_output", "call_id": "call_1", "output": "18 C"]],
+             "tools": [["type": "function", "name": "f", "parameters": ["type": "object"]]], "tool_choice": ["type": "function", "name": "f"]],
         ]
         for b in ok { #expect(await post(port, "/v1/responses", b).status == 503, "\(b)") }
     }
