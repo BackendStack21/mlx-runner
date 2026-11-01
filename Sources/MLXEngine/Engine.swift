@@ -400,11 +400,33 @@ public final class InferenceEngine: @unchecked Sendable {
         while common < limit && cachedTokens[common] == tokens[common] { common += 1 }
         stats.cachedPromptTokens = common
 
+        let vocab = model.vocabSize
+        let count = min(vocab, tok.vocabularySize)
+        let seed = parameters.seed ?? UInt64.random(in: 1...UInt64.max)
+        // Constrained name: the text generated so far while a forced tool-call name is open.
+        var nameText = ""
+        var nameOpen = !(nameChoices ?? []).isEmpty
+        let texts = nameOpen ? tokenTextIndex(tok) : nil
+        // Speculative decoding (prompt lookup): verifying k drafted tokens costs one batched
+        // pass, so every accepted draft is a token generated without its own weight read.
+        let speculative = (parameters.speculative ?? false) && model.supportsBatchedVerify && !nameOpen
+        // Plain decoding selects tokens on the GPU, so each step is queued before the previous one
+        // is read back and the GPU never waits for sampling or detokenisation.
+        let gpuSampling = !speculative && !nameOpen
+        let gpuParams = SampleParams(parameters, vocab: count)
+
         cachedTokens = Array(tokens[0..<common])
         let t0 = Date()
-        var logits: UnsafeMutablePointer<Float>
+        var logits: UnsafeMutablePointer<Float>?   // CPU sampling only
+        var firstToken: Int?
         do {
-            logits = try model.forward(tokens[common...].map { Int32($0) }, offset: common, isCancelled: { token.isCancelled })
+            let prompt = tokens[common...].map { Int32($0) }
+            if gpuSampling {
+                model.seedSampler(seed)
+                firstToken = try model.prefill(prompt, offset: common, sample: gpuParams, isCancelled: { token.isCancelled })
+            } else {
+                logits = try model.forward(prompt, offset: common, isCancelled: { token.isCancelled })
+            }
         } catch EngineError.cancelled {
             stats.stopReason = "cancelled"
             emit(.finished(stats))
@@ -417,22 +439,13 @@ public final class InferenceEngine: @unchecked Sendable {
         stats.promptTokensPerSecond = Double(tokens.count - common) / max(tPrompt, 1e-6)
         emit(.promptProcessed(stats))
 
-        var sampler = Sampler(params: parameters, rng: XorShift(seed: parameters.seed ?? UInt64.random(in: 1...UInt64.max)))
+        var sampler = Sampler(params: parameters, rng: XorShift(seed: seed))
         var decoder = StreamingDecoder()
         let tGen = Date()
         stats.stopReason = "length"
         let maxNew = min(parameters.maxTokens, model.maxSeq - tokens.count)
-        let vocab = model.vocabSize
-        let count = min(vocab, tok.vocabularySize)
         var atStart = true
         var drafted = 0, acceptedDrafts = 0
-        // Speculative decoding (prompt lookup): verifying k drafted tokens costs one batched
-        // pass, so every accepted draft is a token generated without its own weight read.
-        // Constrained name: the text generated so far while a forced tool-call name is open.
-        var nameText = ""
-        var nameOpen = !(nameChoices ?? []).isEmpty
-        let texts = nameOpen ? tokenTextIndex(tok) : nil
-        let speculative = (parameters.speculative ?? false) && model.supportsBatchedVerify && !nameOpen
         var draftLen = 4
 
         /// Emits a sampled token. Returns false when generation must stop.
@@ -467,19 +480,44 @@ public final class InferenceEngine: @unchecked Sendable {
             return d
         }
 
-        // Invariant: `history.last` (the pending token) is not yet in the KV cache;
-        // everything before it is, and `cachedTokens` mirrors exactly that.
         var running = maxNew > 0 && !token.isCancelled
-        if running { running = accept(sampler.draw(try dist(logits))) }
+        if let first = firstToken {
+            // GPU sampling: the step for the newest token is committed before the previous step is
+            // read back, so the GPU runs them back to back. A step that turns out to process a stop
+            // token only writes a K/V row that `cachedTokens` does not claim.
+            if running { running = accept(first) }
+            var cachedCount = tokens.count   // positions whose K/V rows the cache holds
+            var inflight: Transformer.DecodeStep? = running ? try model.beginDecodeStep(offset: history.count - 1, sample: gpuParams) : nil
+            while let cur = inflight {
+                inflight = nil
+                let nextOffset = cur.offset + 1
+                if !token.isCancelled, stats.generatedTokens + 1 < maxNew, nextOffset + 1 < model.maxSeq {
+                    do { inflight = try model.beginDecodeStep(offset: nextOffset, sample: gpuParams) }
+                    catch { _ = try? model.finish(cur); throw error }
+                }
+                let t: Int
+                do { t = try model.finish(cur) } catch { if let f = inflight { _ = try? model.finish(f) }; throw error }
+                cachedCount = cur.offset + 1
+                if token.isCancelled { stats.stopReason = "cancelled"; break }
+                if !accept(t) { break }
+            }
+            if let f = inflight, (try? model.finish(f)) != nil { cachedCount = f.offset + 1 }
+            cachedTokens = Array(history.prefix(min(history.count, cachedCount)))
+            running = false
+        }
+        // CPU sampling (speculative decoding, constrained tool names). Invariant: `history.last`
+        // (the pending token) is not yet in the KV cache; everything before it is, and
+        // `cachedTokens` mirrors exactly that.
+        if running, let logits { running = accept(sampler.draw(try dist(logits))) }
         while running {
             if token.isCancelled { stats.stopReason = "cancelled"; break }
             let pending = history[history.count - 1]
             let room = min(maxNew - stats.generatedTokens, model.maxSeq - history.count) - 1
             let draft = speculative ? NGramDraft.propose(history, maxTokens: min(draftLen, room, Transformer.maxVerifyTokens - 1)) : []
             if draft.isEmpty {
-                logits = try model.forward([Int32(pending)], offset: history.count - 1)
+                let row = try model.forward([Int32(pending)], offset: history.count - 1)
                 cachedTokens = history
-                running = accept(sampler.draw(try dist(logits)))
+                running = accept(sampler.draw(try dist(row)))
                 continue
             }
             let rows = try model.forward(([pending] + draft).map { Int32($0) }, offset: history.count - 1, allLogits: true)

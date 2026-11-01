@@ -103,17 +103,17 @@ Each checkpoint above passes end-to-end generation and the prefill-versus-decode
 
 ## Performance
 
-Measured with `mlxr bench` on an **M2 Pro (16 GB)**. Decode is measured with greedy sampling.
+Measured with `mlxr bench` on an **M2 Pro (16 GB)**. Decode is measured with greedy sampling, as generation runs it: the token is selected on the GPU and the next step is queued before the current one is read back, so these are also the rates the app and `mlxr run` reach.
 
 | Model (4-bit) | Weights | Prefill (512 tok) | Decode @16 | Decode @1K ctx |
 |---|---|---|---|---|
-| Qwen2.5 0.5B Instruct | 278 MB | 2,960 tok/s | 307 tok/s | 260 tok/s |
-| Qwen3 0.6B | 336 MB | 2,040 tok/s | 252 tok/s | 214 tok/s |
-| Llama 3.2 1B Instruct | 695 MB | 1,180 tok/s | 187 tok/s | 174 tok/s |
-| Phi-3.5 mini | 2.15 GB | 320 tok/s | 67 tok/s | 59 tok/s |
-| Mistral 7B v0.3 | 4.08 GB | 166 tok/s | 39.4 tok/s | 37.9 tok/s |
+| Qwen2.5 0.5B Instruct | 278 MB | 2,960 tok/s | 358 tok/s | 295 tok/s |
+| Qwen3 0.6B | 336 MB | 2,040 tok/s | 289 tok/s | 239 tok/s |
+| Llama 3.2 1B Instruct | 695 MB | 1,180 tok/s | 203 tok/s | 188 tok/s |
+| Phi-3.5 mini | 2.15 GB | 320 tok/s | 70 tok/s | 61 tok/s |
+| Mistral 7B v0.3 | 4.08 GB | 166 tok/s | 41.0 tok/s | 39.5 tok/s |
 
-**The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 39.4 tok/s, about 82% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a 3-bit model (which would raise the ceiling to about 60 tok/s, but only 4-bit has an optimized decode kernel so far), or speculative decoding (see Limitations).
+**The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 41.0 tok/s, about 85% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a 3-bit model (which would raise the ceiling to about 60 tok/s, but only 4-bit has an optimized decode kernel so far), or speculative decoding (see Limitations).
 
 Load times stay short because the weights are `mmap`ed and wrapped in Metal buffers with no copy: about 0.5 s for the small models, 1.6 s for Phi-3.5 and 3.3 s for Mistral 7B. Those figures include a warm-up pass that pages the weights in.
 
@@ -154,7 +154,7 @@ Sources/
     Transformer.swift   Model graph: one command buffer per step, fused kernels
     Tokenizer.swift     BPE from tokenizer.json (byte-level and SentencePiece)
     ChatTemplate.swift  ChatML / Llama 3 / Mistral / Phi-3 prompt formats
-    Engine.swift        Generation loop, sampler, KV-prefix reuse, cancellation, context fitting
+    Engine.swift        Generation loop, pipelined decode, KV-prefix reuse, cancellation, context fitting
     Hub.swift           Hugging Face API client and downloader
     ModelStore.swift    Local library and HF-cache scanning
     OpenAIServer.swift  OpenAI-compatible HTTP server (Network.framework)
@@ -170,6 +170,7 @@ How the engine works:
   - Per-head RMSNorm, RoPE and the KV-cache append run as a single kernel.
   - The residual add is fused with the next RMSNorm.
   - Attention uses online softmax across 16 to 32 simdgroups.
+  - The token is selected on the GPU at the end of the same command buffer (repetition penalty, exact top-k, min-p, top-p, one seeded draw) and written to a token-history buffer that the next step's embedding lookup reads. The next step is therefore committed before the current one is read back, and the GPU never waits for sampling or detokenization.
 - **Prefill:**
   - Quantized GEMMs on `simdgroup_matrix` tiles; each weight tile is dequantized once and shared by 32 tokens.
   - Flash attention on simdgroup matrices: 8×8 tensor ops for Q·Kᵀ and P·V, with the softmax rescale done as a diagonal-matrix multiply.
@@ -181,6 +182,7 @@ How the engine works:
 
 - GPU quantized matmul kernels for every bit width, group size and scale dtype, across all three code paths (decode matvec, small-batch, prefill GEMM), each compared against a CPU reference.
 - Fused multi-matrix decode with bias, dense f16 matmul, and the quantized embedding lookup.
+- GPU token selection against the CPU sampler: greedy (ties, repetition penalty), the drawn distribution for several top-k / top-p / min-p settings, ties at the top, tiny vocabularies and non-finite logits.
 - Tokenizer known ids and Unicode round-trips; chat templates; sampler behavior (greedy, repetition penalty, top-k, top-p, seeding); the safetensors loader, including misaligned tensors.
 - On real models:
   - Prefill and token-by-token decode produce the same next-token distribution, for all five architectures.

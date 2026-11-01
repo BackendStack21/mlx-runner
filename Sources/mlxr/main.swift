@@ -153,13 +153,35 @@ case "bench":
         let dt = Date().timeIntervalSince(s)
         print(String(format: "prefill %5d tokens: %7.1f tok/s", n, Double(n) / dt))
     }
-    for ctx in [16, 1024] {
-        var gpu = 0.0
-        let steps = 128
-        let s = Date()
-        for i in 0..<steps { _ = try t.forward([Int32(500 + i)], offset: ctx + i); gpu += t.lastGPUTime }
-        let dt = Date().timeIntervalSince(s)
-        print(String(format: "decode @%4d: %6.1f tok/s  (wall %.2f ms, gpu %.2f ms per token)", ctx, Double(steps) / dt, dt / Double(steps) * 1000, gpu / Double(steps) * 1000))
+    // Token selection cost on real logits (greedy, the app's default sampler, and top-k off).
+    // (ids from the regular vocabulary: Mistral's low ids are unused control tokens with zero embeddings)
+    _ = try t.forward((0..<32).map { Int32(1000 + $0 * 37) }, offset: 0)
+    var g = SamplingParameters(); g.temperature = 0; g.repetitionPenalty = 1
+    var wide = SamplingParameters(); wide.topK = 0
+    for p in [g, SamplingParameters(), wide] { print(t.profileSampler(p)) }
+    // Decode as generation runs it: token selection on the GPU, the next step queued before the
+    // current one is read back. "decode" is greedy; "sampled" uses the app's default sampler.
+    var greedyParams = SamplingParameters()
+    greedyParams.temperature = 0
+    greedyParams.repetitionPenalty = 1
+    for (label, params) in [("decode", greedyParams), ("sampled", SamplingParameters())] {
+        let sp = SampleParams(params, vocab: t.vocabSize)
+        for ctx in [16, 1024] {
+            var gpu = 0.0
+            let steps = 128
+            t.seedSampler(1)
+            _ = try t.prefill((0..<ctx).map { Int32($0 % 1000 + 100) }, offset: 0, sample: sp)
+            let s = Date()
+            var cur = try t.beginDecodeStep(offset: ctx, sample: sp)
+            for i in 0..<steps {
+                let next = i + 1 < steps ? try t.beginDecodeStep(offset: ctx + i + 1, sample: sp) : nil
+                _ = try t.finish(cur)
+                gpu += t.lastGPUTime
+                if let next { cur = next }
+            }
+            let dt = Date().timeIntervalSince(s)
+            print(String(format: "%@ @%4d: %6.1f tok/s  (wall %.2f ms, gpu %.2f ms per token)", label as NSString, ctx, Double(steps) / dt, dt / Double(steps) * 1000, gpu / Double(steps) * 1000))
+        }
     }
     // Speculative verification cost: one forward over T tokens with logits for every row.
     for T in 1...Transformer.maxVerifyTokens {
