@@ -112,6 +112,14 @@ final class AppState {
     var draft: String = ""
     var liveTokens = 0
     var liveTokensPerSecond: Double = 0
+    /// The reply being generated. Streamed here, not into `conversations`: every view that
+    /// reads `conversations` (sidebar, inspector with its AppKit sliders, the whole chat) would
+    /// otherwise re-render on every token, which froze the window for long replies. Only the
+    /// in-progress message row reads these; the final text is written to the conversation once.
+    var liveReplyID: UUID?
+    var liveContent = ""
+    var liveReasoning: String?
+    var liveReasoningSeconds: Double?
     /// Non-fatal persistence problem to show the user (e.g. an unreadable chats.json).
     var persistenceError: String?
 
@@ -347,12 +355,19 @@ final class AppState {
             var raw = ""
             var pending = ""
             var lastFlush = Date()
+            // What the previous update cost the main thread (state change through layout and
+            // display): the next one waits twice that, so the UI keeps most of its time.
+            var lastCost: TimeInterval = 0
             var thinkStart: Date?
             var thinkEnd: Date?
             var genStart: Date?
             var tokenCount = 0
             liveTokens = 0
             liveTokensPerSecond = 0
+            liveReplyID = replyID
+            liveContent = ""
+            liveReasoning = nil
+            liveReasoningSeconds = nil
             @MainActor func flush(_ final: Bool = false) {
                 raw += pending
                 pending = ""
@@ -364,10 +379,17 @@ final class AppState {
                     liveTokens = tokenCount
                     liveTokensPerSecond = Double(tokenCount) / max(Date().timeIntervalSince(g), 0.001)
                 }
-                update(id, replyID) { m in
-                    m.content = final ? parsed.content.trimmingCharacters(in: .whitespacesAndNewlines) : parsed.content
-                    m.reasoning = parsed.reasoning
-                    if let s = thinkStart { m.reasoningSeconds = (thinkEnd ?? Date()).timeIntervalSince(s) }
+                if final {
+                    update(id, replyID) { m in
+                        m.content = parsed.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                        m.reasoning = parsed.reasoning
+                        if let s = thinkStart { m.reasoningSeconds = (thinkEnd ?? Date()).timeIntervalSince(s) }
+                    }
+                    liveReplyID = nil
+                } else {
+                    liveContent = parsed.content
+                    liveReasoning = parsed.reasoning
+                    if let s = thinkStart { liveReasoningSeconds = (thinkEnd ?? Date()).timeIntervalSince(s) }
                 }
             }
             do {
@@ -380,7 +402,16 @@ final class AppState {
                     case .text(let t):
                         pending += t
                         tokenCount += 1
-                        if Date().timeIntervalSince(lastFlush) > 0.05 { flush() }   // 20 updates/s
+                        // Each update re-lays out and redraws the chat (tens of ms for a long reply),
+                        // so updates are paced by their measured cost: at most 20 a second, and
+                        // never more often than twice what the last one took.
+                        let interval = min(0.5, max(0.05, lastCost * 2))
+                        if Date().timeIntervalSince(lastFlush) > interval {
+                            let started = Date()
+                            flush()
+                            // Runs on the next run-loop turn, after this update's layout and display.
+                            DispatchQueue.main.async { lastCost = Date().timeIntervalSince(started) }
+                        }
                     case .finished(let s):
                         flush(true)
                         update(id, replyID) { $0.stats = s }

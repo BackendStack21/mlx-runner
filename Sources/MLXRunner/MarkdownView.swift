@@ -209,6 +209,30 @@ enum MDBlock {
 }
 
 enum MarkdownParser {
+    /// Splits streaming text into the blocks that are complete (up to the last blank line
+    /// outside a code fence) and the block still being written. The head changes only when a
+    /// new block starts, so a view keyed on it is not re-evaluated on every token; the tail is
+    /// the only part re-rendered per update.
+    static func splitStreaming(_ text: String) -> (head: String, tail: String) {
+        var fences = 0
+        var cut: String.Index?
+        var i = text.startIndex
+        var lineStart = true
+        while i < text.endIndex {
+            if lineStart, text[i...].hasPrefix("```") { fences += 1 }
+            if text[i] == "\n" {
+                let next = text.index(after: i)
+                if next < text.endIndex, text[next] == "\n", fences % 2 == 0 { cut = text.index(after: next) }
+                lineStart = true
+            } else {
+                lineStart = false
+            }
+            i = text.index(after: i)
+        }
+        guard let c = cut else { return ("", text) }
+        return (String(text[..<c]), String(text[c...]))
+    }
+
     static func parse(_ text: String) -> [MDBlock] {
         var blocks: [MDBlock] = []
         let lines = text.components(separatedBy: "\n")
