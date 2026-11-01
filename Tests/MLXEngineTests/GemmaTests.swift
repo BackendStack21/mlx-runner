@@ -178,6 +178,22 @@ struct GemmaModelTests {
         #expect(zip(pre, inc).map { abs($0 - $1) }.max()! < 0.1)
         #expect(model.reusablePrefix(900, previousLength: 1200) == 900)   // 300 newer rows: the window's rows survive
         #expect(model.reusablePrefix(500, previousLength: 1200) == 0)     // 700 newer rows overwrote them
+        // The model's own write mark counts what the caller's bookkeeping may have dropped
+        // (a cancelled prefill, rejected drafts): 1200 rows were written whatever the caller says.
+        #expect(model.writtenHigh == 1200)
+        #expect(model.reusablePrefix(500, previousLength: 500) == 0)
+        model.resetWriteTracking()
+        #expect(model.reusablePrefix(500, previousLength: 500) == 500)
+        #expect(model.scratchAllocated <= Transformer.scratchBytes(config: model.config))
+    }
+
+    /// The load-time scratch estimate covers what the engine allocates, on every installed checkpoint.
+    @Test(arguments: installed)
+    func scratchEstimateCoversAllocations(repo: String) throws {
+        guard let dir = installedModel(repo) else { return }
+        let model = try Transformer(directory: dir, contextLength: 512)
+        #expect(model.scratchAllocated <= Transformer.scratchBytes(config: model.config))
+        #expect(Transformer.scratchBytes(config: model.config) < 2 * model.scratchAllocated + (1 << 20))   // and is not wildly loose
     }
 
     /// Prefill and token-by-token decode agree past the sliding window (512 tokens for Gemma 3

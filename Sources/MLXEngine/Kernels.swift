@@ -1126,10 +1126,12 @@ kernel void flash_prefill(device const float* qkv [[buffer(0)]],
     const int qFirst = attn_first_key(p, p.offset + t0);       // first key of the block's first query
     for (int j0 = qFirst / BK * BK; j0 < L; j0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // D is a power of two: row / column from i are shifts; the ring slot costs a modulo only
+        // for positions past the cache length.
         for (int i = int(tid); i < BK * D; i += 128) {
-            const int j = j0 + i / D;
+            const int r = i / D, j = j0 + r;
             const bool ok = j < L;
-            const ulong src = ulong(kv_slot(j, p.maxSeq)) * D + i % D;
+            const ulong src = ulong(kv_slot(j, p.maxSeq)) * D + (i - r * D);
             Ks[i] = ok ? float(kb[src]) : 0.0f;
             Vs[i] = ok ? float(vb[src]) : 0.0f;
         }

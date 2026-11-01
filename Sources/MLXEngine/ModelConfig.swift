@@ -97,10 +97,14 @@ public struct ModelConfig {
     public var perLayerInputSize = 0
     public var valueNorm = false
 
+    /// Largest batch of positions one forward pass writes (the engine's scratch buffers and
+    /// the ring caches are sized for it).
+    public static let maxBatch = 512
+
     /// Rows a layer's K/V cache holds for a context: all of it, or for a sliding-window layer
     /// the window plus one batch of new positions (see `TransformerLayer.cacheLen`).
     static func cacheRows(_ spec: LayerSpec, context: Int, window: Int) -> Int {
-        spec.sliding && window > 0 ? min(context, window + 512) : context
+        spec.sliding && window > 0 ? min(context, window + maxBatch) : context
     }
     func cacheRows(_ spec: LayerSpec, context: Int) -> Int { Self.cacheRows(spec, context: context, window: slidingWindow) }
 

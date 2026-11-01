@@ -399,6 +399,7 @@ public final class InferenceEngine: @unchecked Sendable {
         let limit = min(cachedTokens.count, tokens.count - 1)
         while common < limit && cachedTokens[common] == tokens[common] { common += 1 }
         common = model.reusablePrefix(common, previousLength: cachedTokens.count)
+        if common == 0 { model.resetWriteTracking() }
         stats.cachedPromptTokens = common
 
         let vocab = model.vocabSize
@@ -593,11 +594,7 @@ extension InferenceEngine {
         let cfg = try ModelConfig(directory: directory)
         let ctx = min(contextLength, max(cfg.maxPositionEmbeddings, 256))
         let kv = cfg.kvCacheBytes(context: ctx)
-        // Scratch buffers for a 512-token batch (hidden, projections, MLP, logits), see Transformer.init.
-        let H = cfg.hiddenSize, I = cfg.intermediateSize * (cfg.isGemma4 ? 2 : 1)
-        let qkv = cfg.layers.map { (cfg.numHeads + 2 * $0.numKVHeads) * $0.headDim }.max() ?? 0
-        let attn = cfg.layers.map { cfg.numHeads * $0.headDim }.max() ?? 0
-        let scratch = 512 * 4 * (4 * H + 3 * I + qkv + attn) + 6 * cfg.vocabSize * 4
+        let scratch = Transformer.scratchBytes(config: cfg)
         let need = UInt64(weights + kv + scratch)
         let budget = GPU.shared.device.recommendedMaxWorkingSetSize
         guard need < budget else {
