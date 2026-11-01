@@ -181,17 +181,22 @@ extension MTLComputeCommandEncoder {
 
 // MARK: - Safetensors
 
-/// One safetensors shard as a Metal buffer. The kernels use 16-byte vector loads, so every
+/// One safetensors shard in Metal buffers. The kernels use 16-byte vector loads, so every
 /// tensor must start on a 16-byte boundary. A file whose tensors all do is wrapped in place
 /// (mmap, zero-copy). MLX-written files never do (the header is padded to 8 bytes, and 2-byte
 /// tensors such as Gemma 4's `layer_scalar` shift everything after them), so their tensors are
-/// copied once, in file order, into one 16-byte-padded arena and the mapping is released: the
-/// GPU then holds exactly one copy of the weights. (Copying each tensor into its own buffer
-/// while the mapping stayed referenced doubled the working set — a 9 GB model needed 18 GB.)
+/// copied once, in file order, each into its own buffer, and the mapping is released: the GPU
+/// then holds exactly one copy of the weights. (Copying while the mapping stayed referenced
+/// doubled the working set — a 9 GB model needed 18 GB. One arena for all tensors measured
+/// 6% slower at 1K context on the smallest model, so each tensor keeps its own buffer.)
 final class SafeTensorFile {
-    let buffer: MTLBuffer
+    /// The mapped file (zero-copy) or, for copied files, a buffer per tensor.
+    private let buffer: MTLBuffer?
+    private var buffers: [String: MTLBuffer] = [:]
     private(set) var infos: [String: (dtype: DType, shape: [Int], start: Int, end: Int)] = [:]
     let url: URL
+    /// Bytes of weights held in Metal buffers.
+    private(set) var byteCount = 0
 
     init(url: URL, device: MTLDevice) throws {
         self.url = url
@@ -258,35 +263,26 @@ final class SafeTensorFile {
                 munmap(p, len)
             }) else { throw EngineError.invalidFile("cannot wrap \(file) in a Metal buffer") }
             buffer = buf
+            byteCount = size
             mappingOwned = false
             return
         }
-        // Arena: tensors in file order, each on a page boundary (what separate buffers gave; a
-        // 16-byte packing measured a few percent slower on the smallest model).
-        let align = page
-        let ordered = infos.sorted { $0.value.start < $1.value.start }
-        var total = 0
-        var placed: [String: Int] = [:]
-        for (name, i) in ordered {
-            placed[name] = total
-            let (next, o) = total.addingReportingOverflow((i.end - i.start) + align - 1)
-            guard !o else { throw EngineError.invalidFile("\(file) is too large") }
-            total = next / align * align
+        // Copy in file order (sequential read), one buffer per tensor.
+        buffer = nil
+        for (name, i) in infos.sorted(by: { $0.value.start < $1.value.start }) {
+            let len = i.end - i.start
+            guard let b = device.makeBuffer(bytes: base + i.start, length: max(len, 16), options: .storageModeShared) else {
+                throw EngineError.outOfMemory("could not allocate \(ByteCountFormatter.string(fromByteCount: Int64(len), countStyle: .file)) for \(name) in \(file)")
+            }
+            buffers[name] = b
+            byteCount += len
+            infos[name] = (i.dtype, i.shape, 0, len)
         }
-        guard let arena = device.makeBuffer(length: max(total, 16), options: .storageModeShared) else {
-            throw EngineError.outOfMemory("could not allocate \(ByteCountFormatter.string(fromByteCount: Int64(total), countStyle: .file)) for \(file)")
-        }
-        let dst = arena.contents()
-        for (name, i) in ordered {
-            memcpy(dst + placed[name]!, base + i.start, i.end - i.start)
-            infos[name] = (i.dtype, i.shape, placed[name]!, placed[name]! + (i.end - i.start))
-        }
-        buffer = arena
     }
 
     func tensor(_ name: String) -> Tensor? {
-        guard let i = infos[name] else { return nil }
-        return Tensor(buffer: buffer, offset: i.start, dtype: i.dtype, shape: i.shape)
+        guard let i = infos[name], let b = buffer ?? buffers[name] else { return nil }
+        return Tensor(buffer: b, offset: i.start, dtype: i.dtype, shape: i.shape)
     }
 }
 
@@ -347,5 +343,5 @@ final class WeightStore {
         return t
     }
 
-    var totalBytes: Int { files.reduce(0) { $0 + $1.buffer.length } }
+    var totalBytes: Int { files.reduce(0) { $0 + $1.byteCount } }
 }
