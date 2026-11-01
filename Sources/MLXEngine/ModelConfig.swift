@@ -97,8 +97,17 @@ public struct ModelConfig {
     public var perLayerInputSize = 0
     public var valueNorm = false
 
-    /// KV cache bytes per token of context (f16 K and V, layers with their own cache).
-    public var kvBytesPerToken: Int { layers.reduce(0) { $0 + ($1.hasOwnKV ? 2 * $1.numKVHeads * $1.headDim * 2 : 0) } }
+    /// Rows a layer's K/V cache holds for a context: all of it, or for a sliding-window layer
+    /// the window plus one batch of new positions (see `TransformerLayer.cacheLen`).
+    static func cacheRows(_ spec: LayerSpec, context: Int, window: Int) -> Int {
+        spec.sliding && window > 0 ? min(context, window + 512) : context
+    }
+    func cacheRows(_ spec: LayerSpec, context: Int) -> Int { Self.cacheRows(spec, context: context, window: slidingWindow) }
+
+    /// KV cache bytes for a context (f16 K and V, layers with their own cache).
+    public func kvCacheBytes(context: Int) -> Int {
+        layers.reduce(0) { $0 + ($1.hasOwnKV ? 2 * $1.numKVHeads * $1.headDim * 2 * cacheRows($1, context: context) : 0) }
+    }
 
     public init(directory: URL) throws {
         let url = directory.appendingPathComponent("config.json")

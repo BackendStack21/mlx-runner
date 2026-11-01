@@ -300,6 +300,10 @@ final class TransformerLayer {
     /// nil for a KV-shared layer (it attends over `spec.kvSource`'s cache).
     let kCache: MTLBuffer?
     let vCache: MTLBuffer?
+    /// Rows in the K/V cache: the whole context, or for a sliding-window layer the window plus
+    /// one batch (position p lives at row p mod cacheLen; a batch's T new rows must not land
+    /// on rows its own queries still read).
+    let cacheLen: Int
     /// Gemma 4 per-layer input: gate (H → P), projection (P → H) and its norm.
     let pleGate: Linear?
     let pleProj: Linear?
@@ -367,13 +371,26 @@ final class TransformerLayer {
         qkvFusable = qkv.count > 1 && Linear.fusable(qkv)
         gateUpFusable = gateUp.count > 1 && Linear.fusable(gateUp)
         qkvPostPSO = try GPU.shared.pipeline("qkv_post_\(qNorm?.weight.dtype.suffix ?? "f32")")
+        cacheLen = c.cacheRows(spec, context: maxSeq)
         if spec.hasOwnKV {
-            let cacheBytes = nKV * maxSeq * D * 2
+            let cacheBytes = nKV * cacheLen * D * 2
             kCache = try GPU.shared.buffer(cacheBytes)
             vCache = try GPU.shared.buffer(cacheBytes)
         } else {
             kCache = nil; vCache = nil
         }
+    }
+}
+
+extension EngineError {
+    /// The engine error for a failed command buffer: an out-of-memory failure gets an
+    /// actionable message, anything else is reported as a GPU error.
+    static func gpu(_ err: Error) -> EngineError {
+        let d = err.localizedDescription
+        if d.contains("OutOfMemory") || d.lowercased().contains("insufficient memory") {
+            return .outOfMemory("the GPU ran out of memory while running the model. Lower the context length (Settings) or use a smaller model.")
+        }
+        return .kernelCompile("GPU error: \(d)")
     }
 }
 
@@ -389,7 +406,8 @@ public final class Transformer {
     let quantDescription: String
 
     // Scratch buffers sized for `maxBatch` tokens.
-    let maxBatch = 512
+    static let maxBatch = 512
+    let maxBatch = Transformer.maxBatch
     /// Token ids by position (maxSeq + 1 entries): the CPU writes prompt tokens, the GPU sampler
     /// appends generated ones, and every step's embedding lookup reads its tokens from here.
     private let hist: MTLBuffer
@@ -653,7 +671,7 @@ public final class Transformer {
         lastGPUTime = cb.gpuEndTime - cb.gpuStartTime
         if let err = cb.error {
             prepared = nil
-            throw EngineError.kernelCompile("GPU error: \(err.localizedDescription)")
+            throw EngineError.gpu(err)
         }
     }
 
@@ -668,6 +686,17 @@ public final class Transformer {
         let cb: MTLCommandBuffer
         /// Position of the token this step processed; the sampled token lands at `offset + 1`.
         public let offset: Int
+    }
+
+    /// How much of a previous run's KV cache (positions 0..<previousLength) a new run sharing its
+    /// first `common` tokens can keep. Sliding-window layers hold only the latest rows, so once
+    /// the previous run went on for more than a batch past the divergence point, the rows the
+    /// resumed run would read have been overwritten: the prompt is processed from the start.
+    public func reusablePrefix(_ common: Int, previousLength: Int) -> Int {
+        for l in layers where l.spec.hasOwnKV && l.cacheLen < maxSeq {
+            if previousLength - common > l.cacheLen - config.slidingWindow + 1 { return 0 }
+        }
+        return common
     }
 
     /// Seeds the GPU sampler's xorshift64 generator. Call before `prefill` (nothing may be in flight).
@@ -697,7 +726,7 @@ public final class Transformer {
             cb.commit()
             cb.waitUntilCompleted()
             lastGPUTime = cb.gpuEndTime - cb.gpuStartTime
-            if let err = cb.error { throw EngineError.kernelCompile("GPU error: \(err.localizedDescription)") }
+            if let err = cb.error { throw EngineError.gpu(err) }
             start += n
         }
         return try sampledToken(at: offset + tokens.count)
@@ -719,7 +748,7 @@ public final class Transformer {
     public func finish(_ step: DecodeStep) throws -> Int {
         step.cb.waitUntilCompleted()
         lastGPUTime = step.cb.gpuEndTime - step.cb.gpuStartTime
-        if let err = step.cb.error { throw EngineError.kernelCompile("GPU error: \(err.localizedDescription)") }
+        if let err = step.cb.error { throw EngineError.gpu(err) }
         return try sampledToken(at: step.offset + 1)
     }
 
@@ -790,7 +819,7 @@ public final class Transformer {
                 enc.set(ropeFreqs[li], 0, 4); enc.set(ropeFreqs[li], 0, 5)
             }
             enc.params(QKVPostParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), rowStride: Int32(qkvCols),
-                                     offset: Int32(offset), maxSeq: Int32(maxSeq), traditional: c.ropeTraditional ? 1 : 0,
+                                     offset: Int32(offset), maxSeq: Int32(kv.cacheLen), traditional: c.ropeTraditional ? 1 : 0,
                                      rotDim: Int32(spec.rotDim), eps: c.rmsNormEps, hasNorm: layer.qNorm != nil ? 1 : 0,
                                      vNorm: c.valueNorm ? 1 : 0, kEqV: spec.kEqV ? 1 : 0), 6)
             // A KV-shared layer only prepares its queries.
@@ -799,7 +828,7 @@ public final class Transformer {
             }
 
             let attnParams = AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(qkvCols),
-                                        maxSeq: Int32(maxSeq), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor * c.queryScale,
+                                        maxSeq: Int32(kv.cacheLen), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor * c.queryScale,
                                         outStride: Int32(nH * D), T: Int32(T), window: Int32(spec.sliding ? c.slidingWindow : 0),
                                         softcap: c.attnLogitSoftcap)
             if skipAttn {

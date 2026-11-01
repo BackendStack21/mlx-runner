@@ -396,6 +396,53 @@ struct AttentionKernelTests {
         return out
     }
 
+    /// Decode over a ring cache: 64 rows hold positions 81...100 at row j mod 64, with a window
+    /// of 20; the result equals attention over the positions themselves.
+    @Test(arguments: [128, 256])
+    func decodeOverRingCacheMatchesReference(D: Int) throws {
+        let nH = 4, nKV = 2, rows = 64, window = 20, offset = 100, e = D / 32
+        var rng = RNG(s: UInt64(D))
+        // Logical K/V by position (only the window's positions are ever read).
+        let k = (0..<(nKV * (offset + 1) * D)).map { _ in Float(Float16(rng.float())) }
+        let v = (0..<(nKV * (offset + 1) * D)).map { _ in Float(Float16(rng.float())) }
+        var kc = [Float16](repeating: 9, count: nKV * rows * D), vc = kc   // junk outside the window
+        for h in 0..<nKV {
+            for j in (offset - window + 1)...offset {
+                for d in 0..<D {
+                    kc[(h * rows + j % rows) * D + d] = Float16(k[(h * (offset + 1) + j) * D + d])
+                    vc[(h * rows + j % rows) * D + d] = Float16(v[(h * (offset + 1) + j) * D + d])
+                }
+            }
+        }
+        let q = (0..<(nH * D)).map { _ in rng.float() }
+        let scale = 3 / Float(D).squareRoot()
+        let ref = reference(q: q, k: k, v: v, D: D, nH: nH, nKV: nKV, maxSeq: offset + 1, offset: offset, T: 1,
+                            scale: scale, window: window, softcap: 0)
+        let p = AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(nH * D), maxSeq: Int32(rows),
+                           offset: Int32(offset), scale: scale, outStride: Int32(nH * D), T: 1, window: Int32(window), softcap: 0)
+        let sg = e >= 8 ? 16 : 32
+        let out = try GPU.shared.buffer(nH * D * 4)
+        try runGPU { enc in
+            enc.setComputePipelineState(try GPU.shared.pipeline("attention_\(e)_\(sg)"))
+            enc.set(makeBuffer(q), 0, 0); enc.set(makeBuffer(kc), 0, 1); enc.set(makeBuffer(vc), 0, 2); enc.set(out, 0, 3); enc.params(p, 4)
+            enc.dispatchThreadgroups(MTLSize(width: nH, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: sg * 32, height: 1, depth: 1))
+        }
+        assertClose(readFloats(out, nH * D), ref, "ring decode D=\(D)")
+        // Split decode over the same ring.
+        let G = nH / nKV, gSub = e <= 4 ? G : min(G, 2)
+        let V = Transformer.attnSplitVirtualSG, NSG = Transformer.attnSplitSG
+        let part = try GPU.shared.buffer(nH * V * (D + 2) * 4), out2 = try GPU.shared.buffer(nH * D * 4)
+        try runGPU { enc in
+            enc.setComputePipelineState(try GPU.shared.pipeline("attention_split_\(e)_\(gSub)"))
+            enc.set(makeBuffer(q), 0, 0); enc.set(makeBuffer(kc), 0, 1); enc.set(makeBuffer(vc), 0, 2); enc.set(part, 0, 3); enc.params(p, 4)
+            enc.dispatchThreadgroups(MTLSize(width: nKV, height: V / NSG, depth: G / gSub), threadsPerThreadgroup: MTLSize(width: NSG * 32, height: 1, depth: 1))
+            enc.setComputePipelineState(try GPU.shared.pipeline("attention_combine_\(e)"))
+            enc.set(part, 0, 0); enc.set(out2, 0, 1); enc.params(p, 2)
+            enc.dispatchThreadgroups(MTLSize(width: nH, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        }
+        assertClose(readFloats(out2, nH * D), ref, "ring split decode D=\(D)")
+    }
+
     @Test(arguments: cases)
     func kernelsMatchReference(c: Case) throws {
         let D = c.D, nH = c.nH, nKV = c.nKV, maxSeq = 128, e = D / 32
