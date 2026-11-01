@@ -216,7 +216,9 @@ struct MessageList: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: 22) {
+                // A plain stack: a lazy one could be left scrolled past its (stale) content when a
+                // reply's layout changed at the end of generation, showing an empty transcript.
+                VStack(spacing: 22) {
                     Color.clear.frame(height: 8)
                     ForEach(conversation.messages) { m in
                         MessageRow(message: m, conversationID: conversation.id,
@@ -231,8 +233,12 @@ struct MessageList: View {
             }
             .scrollContentBackground(.hidden)
             .defaultScrollAnchor(.bottom)
-            .onChange(of: conversation.messages.last?.content) { _, _ in
+            // The streaming reply lives in the live state (not in the message) until it is final.
+            .onChange(of: state.liveContent.count) { _, _ in
                 if state.generatingConversation == conversation.id { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            .onChange(of: conversation.messages.last?.content) { _, _ in
+                proxy.scrollTo("bottom", anchor: .bottom)
             }
             .onChange(of: conversation.messages.count) { _, _ in
                 withAnimation(.snappy) { proxy.scrollTo("bottom", anchor: .bottom) }
@@ -291,6 +297,11 @@ struct MessageRow: View {
             }
             .onHover { hovering = $0 }
         } else {
+            // While this reply streams, its text lives in the state's live properties.
+            let live = generating && state.liveReplyID == message.id
+            let content = live ? state.liveContent : message.content
+            let reasoning = live ? state.liveReasoning : message.reasoning
+            let reasoningSeconds = live ? state.liveReasoningSeconds : message.reasoningSeconds
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: "sparkles")
                     .font(.system(size: 13, weight: .bold))
@@ -299,9 +310,9 @@ struct MessageRow: View {
                     .background(Theme.gradient, in: Circle())
                     .shadow(color: Theme.accent.opacity(0.4), radius: 6, y: 2)
                 VStack(alignment: .leading, spacing: 10) {
-                    if let r = message.reasoning, !r.isEmpty {
-                        ReasoningView(text: r, seconds: message.reasoningSeconds,
-                                      inProgress: generating && message.content.isEmpty)
+                    if let r = reasoning, !r.isEmpty {
+                        ReasoningView(text: r, seconds: reasoningSeconds,
+                                      inProgress: generating && content.isEmpty)
                     }
                     if let err = message.error {
                         Label(err, systemImage: "exclamationmark.triangle.fill")
@@ -310,23 +321,32 @@ struct MessageRow: View {
                             .padding(10)
                             .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
                     }
-                    if message.content.isEmpty && message.reasoning == nil && generating {
+                    if content.isEmpty && reasoning == nil && generating {
                         TypingIndicator()
-                    } else if !message.content.isEmpty {
-                        MarkdownView(text: message.content)
+                    } else if !content.isEmpty {
+                        if generating {
+                            // Finished blocks keep their view; only the block being written re-renders.
+                            let parts = MarkdownParser.splitStreaming(content)
+                            if !parts.head.isEmpty { MarkdownView(text: parts.head, selectable: false) }
+                            if !parts.tail.isEmpty { MarkdownView(text: parts.tail, selectable: false) }
+                        } else {
+                            MarkdownView(text: content)
+                        }
                     }
                     if !generating {
                         footer
                     } else if state.liveTokens > 0 {
                         LiveStats(tps: state.liveTokensPerSecond, tokens: state.liveTokens)
-                    } else if let s = message.stats, s.promptTokens > 0, message.content.isEmpty, message.reasoning == nil {
+                    } else if let s = message.stats, s.promptTokens > 0, content.isEmpty, reasoning == nil {
                         Text("Processed \(s.promptTokens) prompt tokens in \(String(format: "%.2f", s.timeToFirstToken))s")
                             .font(.system(size: 11)).foregroundStyle(.tertiary)
                     }
                 }
                 Spacer(minLength: 40)
             }
-            .onHover { hovering = $0 }
+            // No hover tracking while the reply streams: a tracking area makes AppKit
+            // re-hit-test the whole window on every update.
+            .onHover { if !generating { hovering = $0 } }
         }
     }
 
@@ -412,10 +432,13 @@ struct ReasoningView: View {
             }
             .buttonStyle(.plain)
             if expanded || inProgress {
-                Text(inProgress ? String(text.suffix(1200)) : text)
+                let body = Text(inProgress ? String(text.suffix(1200)) : text)
                     .font(.system(size: 12.5))
                     .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                // Selectable once final (see MarkdownView.selectable).
+                Group {
+                    if inProgress { body } else { body.textSelection(.enabled) }
+                }
                     .padding(.leading, 12)
                     .overlay(alignment: .leading) {
                         Rectangle().fill(Theme.gradient).frame(width: 2).opacity(0.6)
@@ -435,22 +458,18 @@ struct TypingIndicator: View {
             }
         }
         .padding(.vertical, 6)
-        .onAppear { withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) { phase = .pi } }
+        .task { while !Task.isCancelled { try? await Task.sleep(nanoseconds: 120_000_000); phase += 0.45 } }   // stepped, see LiveStats
     }
 }
 
+/// A slow blink. (A moving-gradient shimmer was a repeat-forever animation: it rendered every
+/// frame and, on this window, dragged an AppKit layout and hit-test pass with each one.)
 struct Shimmer: ViewModifier {
-    @State private var x: CGFloat = -1
+    @State private var on = true
     func body(content: Content) -> some View {
         content
-            .overlay(
-                LinearGradient(colors: [.clear, .white.opacity(0.7), .clear], startPoint: .leading, endPoint: .trailing)
-                    .scaleEffect(x: 0.5)
-                    .offset(x: x * 80)
-                    .blendMode(.plusLighter)
-                    .mask(content)
-            )
-            .onAppear { withAnimation(.linear(duration: 1.4).repeatForever(autoreverses: false)) { x = 1 } }
+            .opacity(on ? 1 : 0.55)
+            .task { while !Task.isCancelled { try? await Task.sleep(nanoseconds: 600_000_000); on.toggle() } }
     }
 }
 
@@ -627,17 +646,17 @@ struct LiveStats: View {
     let tokens: Int
     @State private var pulse = false
     var body: some View {
+        // Stepped, not animated: a repeat-forever animation renders every frame, and on this
+        // window each frame costs an AppKit layout and hit-test pass (the chat froze for it).
         HStack(spacing: 8) {
             Circle().fill(Theme.gradient).frame(width: 7, height: 7)
-                .scaleEffect(pulse ? 1.25 : 0.8)
-                .opacity(pulse ? 1 : 0.6)
-                .animation(.easeInOut(duration: 0.7).repeatForever(), value: pulse)
+                .opacity(pulse ? 1 : 0.5)
             Text(String(format: "%.0f tok/s", tps))
                 .font(.system(size: 11, weight: .semibold).monospacedDigit())
                 .foregroundStyle(Theme.gradient)
                 .contentTransition(.numericText())
             Text("\(tokens) tokens").font(.system(size: 11).monospacedDigit()).foregroundStyle(.tertiary)
         }
-        .onAppear { pulse = true }
+        .task { while !Task.isCancelled { try? await Task.sleep(nanoseconds: 700_000_000); pulse.toggle() } }
     }
 }

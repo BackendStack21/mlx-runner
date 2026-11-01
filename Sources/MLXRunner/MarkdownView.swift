@@ -7,16 +7,25 @@ import SwiftUI
 struct MarkdownView: View {
     let text: String
     var baseSize: CGFloat = 14
+    /// Text selection makes every paragraph an AppKit-backed view that SwiftUI re-creates and
+    /// hit-tests on each update; a reply that is still streaming (re-rendered 20 times a
+    /// second) stays plain SwiftUI text and becomes selectable once it is final. With
+    /// selection on while streaming, a long reply froze the main thread for seconds.
+    var selectable = true
 
     var body: some View {
         let blocks = MarkdownParser.parse(text)
-        VStack(alignment: .leading, spacing: 10) {
+        let stack = VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, b in
                 view(for: b)
             }
         }
-        .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
+        if selectable {
+            stack.textSelection(.enabled)
+        } else {
+            stack
+        }
     }
 
     @ViewBuilder
@@ -200,6 +209,30 @@ enum MDBlock {
 }
 
 enum MarkdownParser {
+    /// Splits streaming text into the blocks that are complete (up to the last blank line
+    /// outside a code fence) and the block still being written. The head changes only when a
+    /// new block starts, so a view keyed on it is not re-evaluated on every token; the tail is
+    /// the only part re-rendered per update.
+    static func splitStreaming(_ text: String) -> (head: String, tail: String) {
+        var fences = 0
+        var cut: String.Index?
+        var i = text.startIndex
+        var lineStart = true
+        while i < text.endIndex {
+            if lineStart, text[i...].hasPrefix("```") { fences += 1 }
+            if text[i] == "\n" {
+                let next = text.index(after: i)
+                if next < text.endIndex, text[next] == "\n", fences % 2 == 0 { cut = text.index(after: next) }
+                lineStart = true
+            } else {
+                lineStart = false
+            }
+            i = text.index(after: i)
+        }
+        guard let c = cut else { return ("", text) }
+        return (String(text[..<c]), String(text[c...]))
+    }
+
     static func parse(_ text: String) -> [MDBlock] {
         var blocks: [MDBlock] = []
         let lines = text.components(separatedBy: "\n")

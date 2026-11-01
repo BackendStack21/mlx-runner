@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.2
+
+- Fixes the chat window freezing during a long reply (any model) and then showing the rest at once, and the transcript going blank when a reply finished. Sampled on an M2 Pro, the main thread was 100% busy in SwiftUI/AppKit layout while the engine (which streams at 6–7 ms per token) had already finished the reply into the stream buffer. Five causes, all in the chat view:
+  - Every paragraph of the streaming reply was a selectable, AppKit-backed text view that SwiftUI re-created and hit-tested (hover tracking) on each update. A streaming reply is plain text and becomes selectable once it is final; rows have no hover tracking while a reply streams.
+  - The live-stats dot, the "Thinking…" shimmer and the typing dots were repeat-forever animations, rendering 60 frames a second, each frame with a full AppKit layout and hit-test pass. They are stepped now.
+  - Every token mutated the conversation store, so the sidebar, the inspector (with its AppKit sliders) and the whole chat re-rendered per update. The reply streams into live state that only the in-progress row reads; the conversation is written once at the end.
+  - Finished paragraphs keep their view; only the paragraph being written re-renders.
+  - Updates are paced by their measured cost on the main thread (at most 20 a second, never more often than twice what the previous one took), so the UI keeps most of its time whatever the transcript size.
+  - The message list is a plain stack: a lazy one could be left scrolled past its stale content when the reply's layout changed at the end, which showed an empty transcript.
 ## 1.2.1
 
 - Fixes the GPU out-of-memory error when running a large model such as Gemma 4 12B on a 16 GB Mac. MLX writes `safetensors` without the 16-byte alignment the kernels need, so every tensor was copied into its own Metal buffer while the mapped file stayed referenced: the GPU held two copies of the weights (18 GB for a 9 GB model). Shards are now copied once, in file order, into a page-aligned buffer and the mapping is released. Loading is faster too: Gemma 4 12B 156 s → 25 s from disk, 11 s from the page cache; Mistral 7B 3.3 → 2.9 s.
