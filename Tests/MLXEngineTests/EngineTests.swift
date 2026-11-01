@@ -177,3 +177,13 @@ struct ConfigValidationTests {
         #expect(throws: EngineError.self) { _ = try ModelConfig(directory: dir) }
     }
 }
+
+@Suite("Half conversion")
+struct HalfConversionTests {
+    @Test func matchesFloat16() {
+        for bits in [UInt16(0), 0x8000, 0x3C00, 0xBC00, 0x3555, 0x0001, 0x03FF, 0x0400, 0x7BFF, 0xFBFF, 0x7C00, 0xFC00, 0x1234, 0xABCD] {
+            #expect(Tensor.halfToFloat(bits) == Float(Float16(bitPattern: bits)), "bits \(String(bits, radix: 16))")
+        }
+        #expect(Tensor.halfToFloat(0x7E00).isNaN)
+    }
+}

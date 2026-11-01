@@ -146,10 +146,27 @@ public struct Tensor {
         let p = buffer.contents() + offset
         switch dtype {
         case .f32: return (0..<count).map { p.loadUnaligned(fromByteOffset: $0 * 4, as: Float.self) }
-        case .f16: return (0..<count).map { Float(p.loadUnaligned(fromByteOffset: $0 * 2, as: Float16.self)) }
+        case .f16: return (0..<count).map { Self.halfToFloat(p.loadUnaligned(fromByteOffset: $0 * 2, as: UInt16.self)) }
         case .bf16: return (0..<count).map { Float(bitPattern: UInt32(p.loadUnaligned(fromByteOffset: $0 * 2, as: UInt16.self)) << 16) }
         default: throw EngineError.unsupported("\(dtype) weights where floats are expected")
         }
+    }
+
+    /// IEEE half → float from the raw bits (`Float16` itself is unavailable on x86_64 macOS,
+    /// which CodeQL's build targets).
+    static func halfToFloat(_ h: UInt16) -> Float {
+        let sign = UInt32(h & 0x8000) << 16
+        let exp = Int((h >> 10) & 0x1F)
+        let frac = UInt32(h & 0x3FF)
+        if exp == 0 {
+            if frac == 0 { return Float(bitPattern: sign) }
+            // Subnormal: normalise.
+            var e = 127 - 15 + 1, f = frac
+            while f & 0x400 == 0 { f <<= 1; e -= 1 }
+            return Float(bitPattern: sign | (UInt32(e) << 23) | ((f & 0x3FF) << 13))
+        }
+        if exp == 31 { return Float(bitPattern: sign | 0x7F80_0000 | (frac << 13)) }
+        return Float(bitPattern: sign | (UInt32(exp + 127 - 15) << 23) | (frac << 13))
     }
 }
 
