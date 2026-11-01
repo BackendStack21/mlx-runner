@@ -90,13 +90,13 @@ gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx
 | `llama` | Llama-3.2-1B-Instruct-4bit | Llama-3 RoPE scaling |
 | `mistral` | Mistral-7B-Instruct-v0.3-4bit | SentencePiece BPE + byte fallback |
 | `phi3` | Phi-3.5-mini-instruct-4bit | fused qkv / gate_up, LongRoPE |
-| `gemma` | gemma-1.1-2b-it-4bit | (1 + w) RMSNorm, GeGLU (exact GELU), scaled embeddings |
+| `gemma` | gemma-1.1-2b-it-4bit | (1 + w) RMSNorm, GeGLU, scaled embeddings |
 | `gemma2` | gemma-2-2b-it-4bit | sandwich norms, attention and final-logit soft-capping, sliding window |
 | `gemma3_text`, `gemma3` | gemma-3-1b-it-qat-4bit, gemma-3-270m-it-4bit | q/k norms, 5:1 sliding/global layers with their own RoPE bases; `gemma3` multimodal exports run their language model |
 | `gemma4`, `gemma4_text` | gemma-4-e2b-it-OptiQ-4bit | head dims 256/512, proportional RoPE, KV sharing across layers, per-layer input embeddings, mixed 4/8-bit layers |
 | `gemma4_unified` | gemma-4-12B-it-OptiQ-4bit | as above, K = V in the global layers; the vision part of the export is ignored |
 
-Each checkpoint above passes end-to-end generation and the prefill-versus-decode consistency test; the Gemma checkpoints also match mlx-lm's logits position by position (teacher-forced, within about 0.1). Other models of the same type, such as larger Qwen3, Qwen2.5-Coder or other Llama 3 fine-tunes, should work too, unless they need a feature that isn't implemented.
+Each checkpoint above passes end-to-end generation and the prefill-versus-decode consistency test; the Gemma checkpoints also match mlx-lm's logits position by position (teacher-forced: the same argmax at every position, within 0.05 of a float32 mlx-lm run). Other models of the same type, such as larger Qwen3, Qwen2.5-Coder or other Llama 3 fine-tunes, should work too, unless they need a feature that isn't implemented.
 
 ## Limitations
 

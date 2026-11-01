@@ -9,7 +9,20 @@ Gemma support (`gemma`, `gemma2`, `gemma3` / `gemma3_text`, `gemma4` / `gemma4_t
 - Chat formats: `<start_of_turn>` (Gemma 1–3) and `<|turn>` (Gemma 4), checked against transformers' `apply_chat_template`. No tool calling for Gemma.
 - Tokenizer: Gemma's SentencePiece tokenizer adds no dummy prefix, and runs of spaces (added tokens) decode correctly.
 - Verified against mlx-lm, teacher-forced over 40 positions after a 664-token prompt: Gemma 1.1 2B, Gemma 2 2B, Gemma 3 270M/1B/4B, Gemma 4 E2B and 12B produce the same argmax at every position (one near-tie aside), logits within 0.035 of a float32 mlx-lm run.
-- Attention kernels take a sliding window and soft-cap; new kernel tests compare decode, split decode, prefill and flash prefill against a CPU reference. Existing models: greedy output is token-identical and decode/prefill throughput is unchanged (3 alternating pairs on Qwen3 0.6B, Llama 3.2 1B, Mistral 7B, all within ±3%).
+- Attention kernels take a sliding window and soft-cap; new kernel tests compare decode, split decode, prefill and flash prefill against a CPU reference.
+
+Gemma performance (M2 Pro, 3 alternating pairs against the first Gemma build; mlx-lm 0.32.2 on the same files, 200 greedy tokens):
+
+- The 4-bit decode matvec gets a kernel per remainder of `hidden_size` mod 1024 (Gemma's 1152 / 2304 / 2560 / 1536 left a pass with 4–16 of 32 lanes busy): decode +12% on Gemma 3 1B, +5% on Gemma 2 2B, +4% on Gemma 3 4B. The tail lives in its own instantiations: inside the one kernel it cost every model 2–11%.
+- Flash prefill for head_dim 256 (8-key blocks fit threadgroup memory): prefill +7% on Gemma 3 1B, +6% on Gemma 4 E2B (attention 66 → 43 ms and 177 → 121 ms per 512 tokens).
+- Split decode attention for head sizes 256 and 512 (query heads in sub-groups of 2, each K/V row read once per pair): decode at 1K context +3.5% on Gemma 3 1B, +3.7% on Gemma 3 4B, +6.1% on Gemma 4 E2B.
+- Gemma 4's per-layer input gate folds its GELU into the gate matvec's epilogue (one dispatch fewer per layer).
+- Against mlx-lm (mlx-lm → MLX Runner), decode after a short prompt: Gemma 3 270M 396 → 481 tok/s, Gemma 3 1B 187 → 193, Gemma 2 2B 97 → 94, Gemma 3 4B 71 → 67, Gemma 4 E2B 78 → 73; after a 664-token prompt: 1B 177 → 179, 2B 93 → 87, 4B 67 → 64, E2B 75 → 70. Prefill (raw forward pass of 664 tokens vs `mlxr bench` at 512): 1B 1949 vs 1453, 2B 768 vs 538, 4B 378 vs 345, E2B 627 vs 545 tok/s; the remaining prefill gap is the engine's fp32 GEMM, not Gemma-specific.
+- Rejected after measuring (kept out): a gate/up matvec with the activation in its epilogue (−4% to −11% on every model), split-K for few-row matrices (−3% to −11% on Gemma), 8-byte lane loads for a 512 remainder.
+- Existing models: greedy output is token-identical and decode/prefill throughput is unchanged (3 alternating pairs on Qwen3 0.6B, Llama 3.2 1B, Mistral 7B, all within noise).
+- `mlxr bench` adds a per-kernel-class prefill breakdown; the profile sweep no longer crashes on 8-bit layers.
+
+Review fixes (from an adversarial review of the Gemma branch): Gemma replies keep their leading spaces and indentation (the dummy-prefix rule now applies only to tokenizers that have one); raw completions add `<bos>` when the tokenizer's post-processor does (Gemma 2, Llama 3); Gemma 3 encoding of long HTML/code chats is 100× faster (added tokens are matched with a trie instead of a 6,000-way regex); non-special added tokens such as Gemma's HTML tags are kept inside message content, as the reference tokenizer does; Gemma 4's per-layer-input norm uses the reference's exact eps; Gemma 4 mixture-of-experts repos are marked not runnable in Discover and My Models; Gemma 4 OptiQ exports no longer map or budget their 1 GB vision sidecar; flat `gemma3` / transformers 5 `rope_parameters` configs, the outer config's stop tokens, Gemma 2's default soft-caps and an out-of-range `sliding_window` are handled; later system messages render as `<|turn>system`; `layer_scalar` is read only for Gemma 4; model tests cover every installed Gemma checkpoint (Gemma 1.1 2B, 3 4B and 4 12B included) instead of passing silently when one is missing.
 
 ## 1.1.1
 

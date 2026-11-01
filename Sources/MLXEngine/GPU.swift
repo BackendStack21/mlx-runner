@@ -32,7 +32,7 @@ public enum EngineError: LocalizedError {
 // Parameter blocks mirrored in Kernels.swift.
 struct MMParams {
     var K: Int32; var O: Int32; var T: Int32; var gs: Int32; var xStride: Int32; var yStride: Int32
-    var o1: Int32 = 0; var o2: Int32 = 0; var hasBias: Int32 = 0; var pad: Int32 = 0
+    var o1: Int32 = 0; var o2: Int32 = 0; var hasBias: Int32 = 0; var act: Int32 = 0
 }
 struct QKVPostParams { var D: Int32; var nH: Int32; var nKV: Int32; var rowStride: Int32; var offset: Int32; var maxSeq: Int32; var traditional: Int32; var rotDim: Int32; var eps: Float; var hasNorm: Int32; var vNorm: Int32 = 0; var kEqV: Int32 = 0 }
 struct NormParams { var dim: Int32; var headsPerRow: Int32; var rowStride: Int32; var eps: Float }
@@ -255,11 +255,24 @@ final class WeightStore {
     /// (`language_model.model.*`, `model.language_model.*`).
     private var alias: [String: String] = [:]
 
-    init(directory: URL, device: MTLDevice) throws {
+    /// The shards holding the model: those `model.safetensors.index.json` maps weights to, or
+    /// every .safetensors file when there is no index. Keeps unrelated sidecars (Gemma 4 OptiQ
+    /// exports ship a 1 GB `optiq_vision.safetensors`) out of memory and the load budget.
+    static func shardFiles(in directory: URL) throws -> [String] {
         let fm = FileManager.default
-        let names = try fm.contentsOfDirectory(atPath: directory.path)
-            .filter { $0.hasSuffix(".safetensors") }
-            .sorted()
+        let all = try fm.contentsOfDirectory(atPath: directory.path).filter { $0.hasSuffix(".safetensors") }.sorted()
+        if let data = try? Data(contentsOf: directory.appendingPathComponent("model.safetensors.index.json")),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let map = obj["weight_map"] as? [String: String] {
+            let referenced = Set(map.values)
+            let listed = all.filter { referenced.contains($0) }
+            if !listed.isEmpty { return listed }
+        }
+        return all
+    }
+
+    init(directory: URL, device: MTLDevice) throws {
+        let names = try Self.shardFiles(in: directory)
         guard !names.isEmpty else { throw EngineError.invalidFile("no .safetensors files in \(directory.lastPathComponent)") }
         for (i, n) in names.enumerated() {
             let f = try SafeTensorFile(url: directory.appendingPathComponent(n), device: device)

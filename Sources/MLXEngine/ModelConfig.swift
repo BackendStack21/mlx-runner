@@ -12,6 +12,19 @@ public enum SupportedArchitectures {
         guard let t = modelType?.lowercased() else { return false }
         return modelTypes.contains(t)
     }
+
+    /// Like `isSupported`, also ruling out variants the type alone does not reveal: Gemma 4
+    /// mixture-of-experts exports (`enable_moe_block` in the text config).
+    public static func isSupported(_ modelType: String?, config: [String: Any]?) -> Bool {
+        guard isSupported(modelType) else { return false }
+        return !isMoE(config)
+    }
+
+    public static func isMoE(_ config: [String: Any]?) -> Bool {
+        guard let c = config else { return false }
+        let text = c["text_config"] as? [String: Any]
+        return (c["enable_moe_block"] as? Bool) == true || (text?["enable_moe_block"] as? Bool) == true
+    }
 }
 
 public struct ModelConfig {
@@ -93,29 +106,47 @@ public struct ModelConfig {
               var obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw EngineError.invalidFile("config.json not found or unreadable")
         }
+        // The outer config's stop tokens (a multimodal export's text_config may list fewer).
+        var eos: [Int] = []
+        if let e = obj["eos_token_id"] as? NSNumber { eos.append(e.intValue) }
+        if let e = obj["eos_token_id"] as? [NSNumber] { eos += e.map(\.intValue) }
         // Some multimodal exports nest the language model config.
         if obj["hidden_size"] == nil, let text = obj["text_config"] as? [String: Any] {
             obj.merge(text) { _, new in new }
-            // Gemma 3 multimodal exports leave the text model's defaults out (transformers'
-            // Gemma3TextConfig, with the head counts mlx-lm assumes).
-            let inner = (obj["model_type"] as? String)?.lowercased() ?? ""
-            if inner == "gemma4_text" || inner == "gemma4_unified_text" {
-                obj.merge(["num_attention_heads": 8, "num_key_value_heads": 1]) { old, _ in old }   // as mlx-lm
+        }
+        var type = (obj["model_type"] as? String ?? "").lowercased()
+        if type == "gemma4_text" || type == "gemma4_unified_text" {
+            obj.merge(["num_attention_heads": 8, "num_key_value_heads": 1]) { old, _ in old }   // as mlx-lm
+        }
+        if type == "gemma3" { type = "gemma3_text" }   // a flat multimodal config: the text model's own type
+        if type == "gemma3_text" {
+            // Gemma 3 configs (multimodal exports, newer transformers) leave the text model's
+            // defaults out (transformers' Gemma3TextConfig, with the head counts mlx-lm assumes).
+            let defaults: [String: Any] = [
+                "num_attention_heads": 8, "num_key_value_heads": 4, "head_dim": 256, "rms_norm_eps": 1e-6,
+                "rope_local_base_freq": 10_000.0, "query_pre_attn_scalar": 256,
+                "sliding_window": 4096, "sliding_window_pattern": 6, "max_position_embeddings": 131_072,
+                "hidden_activation": "gelu_pytorch_tanh",
+            ]
+            obj.merge(defaults) { old, _ in old }
+        }
+        // transformers >= 5 stores RoPE under rope_parameters[.full_attention] instead of
+        // rope_theta / rope_scaling / rope_local_base_freq.
+        if obj["rope_theta"] == nil, let rp = obj["rope_parameters"] as? [String: Any], !type.hasPrefix("gemma4") {
+            let full = (rp["full_attention"] as? [String: Any]) ?? rp
+            if let t = full["rope_theta"] { obj["rope_theta"] = t }
+            if let kind = full["rope_type"] as? String, kind != "default", obj["rope_scaling"] == nil {
+                obj["rope_scaling"] = full
             }
-            if inner == "gemma3_text" {
-                let defaults: [String: Any] = [
-                    "num_attention_heads": 8, "num_key_value_heads": 4, "head_dim": 256, "rms_norm_eps": 1e-6,
-                    "rope_theta": 1_000_000.0, "rope_local_base_freq": 10_000.0, "query_pre_attn_scalar": 256,
-                    "sliding_window": 4096, "sliding_window_pattern": 6, "max_position_embeddings": 131_072,
-                    "hidden_activation": "gelu_pytorch_tanh",
-                ]
-                obj.merge(defaults) { old, _ in old }
+            if let local = (rp["sliding_attention"] as? [String: Any])?["rope_theta"], obj["rope_local_base_freq"] == nil {
+                obj["rope_local_base_freq"] = local
             }
         }
+        if type == "gemma3_text" { obj.merge(["rope_theta": 1_000_000.0]) { old, _ in old } }
         func int(_ k: String) -> Int? { (obj[k] as? NSNumber)?.intValue }
         func float(_ k: String) -> Float? { (obj[k] as? NSNumber)?.floatValue }
 
-        modelType = (obj["model_type"] as? String ?? "").lowercased()
+        modelType = type
         guard SupportedArchitectures.isSupported(modelType) else {
             throw EngineError.unsupported("architecture '\(modelType)' is not supported yet (supported: \(SupportedArchitectures.modelTypes.sorted().joined(separator: ", ")))")
         }
@@ -169,16 +200,18 @@ public struct ModelConfig {
                 guard s.isFinite, s > 0 else { throw EngineError.invalidFile("config.json: invalid query_pre_attn_scalar") }
                 queryScale = 1 / s.squareRoot()
             }
-            func softcap(_ key: String) throws -> Float {
-                guard let v = float(key) else { return 0 }   // null or absent: off
+            // null: off. Absent: transformers' Gemma2Config defaults (50 / 30); off for Gemma 1 and 3.
+            func softcap(_ key: String, default d: Float) throws -> Float {
+                guard let raw = obj[key] else { return type == "gemma2" ? d : 0 }
+                guard let v = (raw as? NSNumber)?.floatValue else { return 0 }
                 guard v.isFinite, v > 0 else { throw EngineError.invalidFile("config.json: invalid \(key)") }
                 return v
             }
-            attnLogitSoftcap = try softcap("attn_logit_softcapping")
-            finalLogitSoftcap = try softcap("final_logit_softcapping")
+            attnLogitSoftcap = try softcap("attn_logit_softcapping", default: 50)
+            finalLogitSoftcap = try softcap("final_logit_softcapping", default: 30)
             if modelType == "gemma2" || modelType == "gemma3_text" {
                 let window = int("sliding_window") ?? 0
-                guard window >= 0 else { throw EngineError.invalidFile("config.json: invalid sliding_window") }
+                guard (0...(1 << 24)).contains(window) else { throw EngineError.invalidFile("config.json: sliding_window = \(window) is out of range") }
                 if let types = obj["layer_types"] as? [String] {
                     guard types.count == numLayers else { throw EngineError.invalidFile("config.json: layer_types has \(types.count) entries for \(numLayers) layers") }
                     slidingLayers = types.map { $0 == "sliding_attention" }
@@ -197,7 +230,6 @@ public struct ModelConfig {
             }
         }
 
-        var eos: [Int] = []
         if let e = obj["eos_token_id"] as? NSNumber { eos.append(e.intValue) }
         if let e = obj["eos_token_id"] as? [NSNumber] { eos += e.map(\.intValue) }
         if let gdata = try? Data(contentsOf: directory.appendingPathComponent("generation_config.json")),
@@ -240,7 +272,7 @@ public struct ModelConfig {
             finalLogitSoftcap = v
         }
         let window = int("sliding_window") ?? 512
-        guard window > 0 else { throw bad("invalid sliding_window") }
+        guard (1...(1 << 24)).contains(window) else { throw bad("sliding_window = \(window) is out of range") }
         slidingWindow = window
         let types: [String]
         if let t = obj["layer_types"] as? [String] {

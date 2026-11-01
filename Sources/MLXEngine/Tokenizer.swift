@@ -12,7 +12,9 @@ public final class Tokenizer: @unchecked Sendable {
     private var mergeRanks: [String: Int] = [:]
     private var specialIds: Set<Int> = []
     private var addedTokens: [String: Int] = [:]
-    private var addedRegex: NSRegularExpression?
+    /// Leftmost-longest matcher over every added token (a 6,000-way regex alternation made
+    /// Gemma 3 encoding 100× slower).
+    private var addedMatcher: AddedTokenMatcher?
     private var preRegex: NSRegularExpression?
     private var ignoreMerges = false
     private var byteFallback = false
@@ -25,6 +27,9 @@ public final class Tokenizer: @unchecked Sendable {
     private var addedStrip: [String: (left: Bool, right: Bool)] = [:]
     /// The model expects a BOS token at the start of raw prompts.
     public private(set) var addBosToken = false
+    /// Decoding drops the dummy-prefix space a SentencePiece model puts in front of the first
+    /// word (Llama 2, Mistral, Phi). Gemma's tokenizer has no dummy prefix: its leading spaces are real.
+    public var stripsLeadingSpace: Bool { mode == .sentencePiece && spPrepend }
     /// The normaliser applies Unicode NFC.
     public var usesNFC: Bool { nfc }
     private var nfc = false
@@ -108,11 +113,20 @@ public final class Tokenizer: @unchecked Sendable {
         }
         idToToken = Array(repeating: "", count: maxId + 1)
         for (k, i) in vocab { idToToken[i] = k }
-        if !added.isEmpty {
-            let pattern = added.map(\.0).sorted { $0.count > $1.count }
-                .map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
-            addedRegex = try? NSRegularExpression(pattern: pattern)
+        if !added.isEmpty { addedMatcher = AddedTokenMatcher(added.map(\.0)) }
+        // A TemplateProcessing post-processor that opens with a special token (Llama 3, Gemma 2)
+        // adds BOS to raw prompts even when tokenizer_config.json says add_bos_token: false.
+        var postBos: String?
+        func visitPost(_ p: [String: Any]) {
+            switch p["type"] as? String {
+            case "Sequence": for sub in (p["processors"] as? [[String: Any]]) ?? [] { visitPost(sub) }
+            case "TemplateProcessing":
+                if let first = (p["single"] as? [[String: Any]])?.first, let st = first["SpecialToken"] as? [String: Any],
+                   let id = st["id"] as? String { postBos = id }
+            default: break
+            }
         }
+        if let post = json["post_processor"] as? [String: Any] { visitPost(post) }
 
         // Pre-tokenizer & mode detection.
         var isByteLevel = false
@@ -158,7 +172,6 @@ public final class Tokenizer: @unchecked Sendable {
             hasSPNormalizer = String(describing: norm).contains("▁")
         }
         mode = isByteLevel ? .byteLevel : .sentencePiece
-        if mode == .sentencePiece && !hasSPNormalizer && json["pre_tokenizer"] == nil { spPrepend = true }
         // A ▁ normalizer without a prefix rule (Gemma: Replace " " → ▁, Split on spaces) adds no
         // dummy prefix.
         if mode == .sentencePiece && hasSPNormalizer && !hasPrefixRule { spPrepend = false }
@@ -180,6 +193,10 @@ public final class Tokenizer: @unchecked Sendable {
                     ?? arr.first?["template"] as? String
                 toolUseTemplate = arr.first(where: { $0["name"] as? String == "tool_use" })?["template"] as? String
             }
+        }
+        if let b = postBos, vocab[b] != nil {
+            addBosToken = true
+            if bosToken == nil { bosToken = b }
         }
         if chatTemplate == nil,
            let t = try? String(contentsOf: directory.appendingPathComponent("chat_template.jinja"), encoding: .utf8) {
@@ -208,9 +225,14 @@ public final class Tokenizer: @unchecked Sendable {
         let ns = text as NSString
         var cursor = 0
         var firstSegment = true
-        var matches = addedRegex?.matches(in: text, range: NSRange(location: 0, length: ns.length)) ?? []
+        var matches = addedMatcher?.matches(in: ns) ?? []
         if !plainRanges.isEmpty {
-            matches.removeAll { m in plainRanges.contains { NSIntersectionRange($0, m.range).length > 0 } }
+            // Message content must not forge control tokens; non-special added tokens (Gemma's
+            // HTML tags, Qwen's <tool_call>) are matched there as the reference tokenizer does.
+            matches.removeAll { m in
+                specialIds.contains(addedTokens[ns.substring(with: m.range)] ?? -1)
+                    && plainRanges.contains { NSIntersectionRange($0, m.range).length > 0 }
+            }
         }
         for m in matches {
             let strip = addedStrip[ns.substring(with: m.range)]
@@ -395,6 +417,43 @@ public struct StreamingDecoder {
     public mutating func flush() -> String {
         let out = String(decoding: pending, as: UTF8.self)
         pending.removeAll()
+        return out
+    }
+}
+
+/// Leftmost-longest literal matching of a token set over UTF-16 text (a trie), equivalent to
+/// a regex alternation of the tokens sorted longest first.
+struct AddedTokenMatcher {
+    struct Match { let range: NSRange }
+    private var next: [[UInt16: Int32]] = [[:]]
+    private var terminal: [Bool] = [false]
+
+    init(_ tokens: [String]) {
+        for t in tokens {
+            var node = 0
+            for u in t.utf16 {
+                if let n = next[node][u] { node = Int(n) } else {
+                    next.append([:]); terminal.append(false)
+                    next[node][u] = Int32(next.count - 1)
+                    node = next.count - 1
+                }
+            }
+            terminal[node] = true
+        }
+    }
+
+    func matches(in s: NSString) -> [Match] {
+        var out: [Match] = []
+        let n = s.length
+        var i = 0
+        while i < n {
+            var node = 0, j = i, end = -1
+            while j < n, let nx = next[node][s.character(at: j)] {
+                node = Int(nx); j += 1
+                if terminal[node] { end = j }
+            }
+            if end > i { out.append(Match(range: NSRange(location: i, length: end - i))); i = end } else { i += 1 }
+        }
         return out
     }
 }

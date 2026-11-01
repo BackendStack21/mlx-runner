@@ -264,7 +264,8 @@ public struct ChatTemplate: Sendable {
             let list = Array(rest)
             for (i, m) in list.enumerated() {
                 let model = m.role == .assistant
-                if !(model && i > 0 && list[i - 1].role == .assistant) { lit("<|turn>\(model ? "model" : "user")\n") }
+                let role = model ? "model" : m.role == .system ? "system" : "user"
+                if !(model && i > 0 && list[i - 1].role == .assistant) { lit("<|turn>\(role)\n") }
                 content(m.content.trimmingCharacters(in: .whitespacesAndNewlines))
                 if !(model && i + 1 < list.count && list[i + 1].role == .assistant) { lit("<turn|>\n") }
             }

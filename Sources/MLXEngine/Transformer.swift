@@ -25,6 +25,7 @@ final class Linear {
     private var gemm8PSO: MTLComputePipelineState?     // 5...8 tokens: qgemm on an 8-token tile
     private var gemm16PSO: MTLComputePipelineState?    // 9...16 tokens: qgemm on a 16-token tile
     private(set) var qmvPSO: MTLComputePipelineState?  // fused decode kernel (bias folded in)
+    private(set) var qmvGatePSO: MTLComputePipelineState?  // decode with y = act(y) · e
     private(set) var qmvbPSO: MTLComputePipelineState?  // 4-bit, 2...4 tokens (speculative verification)
     private var biasPSO: MTLComputePipelineState?
     let description: String
@@ -67,7 +68,11 @@ final class Linear {
             pso1 = try gpu.pipeline("qmm_\(bits)_\(sfx)_1")
             let qmvAlign = bits == 4 ? 32 : 16  // the 4-bit fast path consumes 32 values per lane
             if inDim % qmvAlign == 0 && groupSize % qmvAlign == 0 && (bias == nil || bias?.dtype == s.dtype) {
-                qmvPSO = try gpu.pipeline("qmv_\(bits)_\(sfx)")
+                // 4-bit: a remainder of 128/256/512 after the 1024-wide passes gets its own kernel.
+                var tail = ""
+                if bits == 4, [128, 256, 512].contains(inDim % 1024) { tail = "t\(inDim % 1024 / 32)_" }
+                qmvPSO = try gpu.pipeline("qmv_\(tail)\(bits)_\(sfx)")
+                qmvGatePSO = try gpu.pipeline("qmv_gate_\(tail)\(bits)_\(sfx)")
                 if bits == 4 { qmvbPSO = try gpu.pipeline("qmvb4_\(sfx)_4") }
             }
             if inDim % 32 == 0 { gemmPSO = try gpu.pipeline("qgemm_\(bits)_\(sfx)") }
@@ -122,12 +127,30 @@ final class Linear {
         }
         enc.set(x, xOffset, 3)
         enc.set(y, yOffset, 4)
+        enc.set(x, xOffset, 15)
         let total = parts.reduce(0) { $0 + $1.outDim }
         let rowsPerTG = T == 1 ? qmvRowsPerThreadgroup : qmvbRowsPerSimdgroup * qmvSimdgroups
         enc.params(MMParams(K: Int32(f.inDim), O: Int32(total), T: Int32(T), gs: Int32(f.groupSize), xStride: Int32(xStride), yStride: Int32(yStride),
                             o1: Int32(parts[0].outDim), o2: Int32(parts.count > 1 ? parts[1].outDim : 0),
                             hasBias: f.bias != nil ? 1 : 0), 5)
         enc.dispatchThreadgroups(MTLSize(width: (total + rowsPerTG - 1) / rowsPerTG, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: qmvThreads, height: 1, depth: 1))
+    }
+
+    /// Decode-only gated output: y[:outDim] = act(x · Wᵀ + bias) · e[:outDim] in one dispatch.
+    func encodeGated(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, xOffset: Int = 0, y: MTLBuffer, yOffset: Int = 0,
+                     e: MTLBuffer, eOffset: Int, act: Int32) {
+        enc.setComputePipelineState(qmvGatePSO!)
+        for slot in [0, 6, 9] {
+            enc.set(weight, slot); enc.set(scales!, slot + 1); enc.set(biases!, slot + 2)
+            enc.set(bias ?? scales!, 12 + slot / 3)
+        }
+        enc.set(x, xOffset, 3)
+        enc.set(y, yOffset, 4)
+        enc.set(e, eOffset, 15)
+        enc.params(MMParams(K: Int32(inDim), O: Int32(outDim), T: 1, gs: Int32(groupSize), xStride: 0, yStride: 0,
+                            o1: Int32(outDim), o2: 0, hasBias: bias != nil ? 1 : 0, act: act), 5)
+        enc.dispatchThreadgroups(MTLSize(width: (outDim + qmvRowsPerThreadgroup - 1) / qmvRowsPerThreadgroup, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: qmvThreads, height: 1, depth: 1))
     }
 
@@ -334,7 +357,8 @@ final class TransformerLayer {
         } else {
             pleGate = nil; pleProj = nil; pleNorm = nil
         }
-        if let t = s.get("\(p).layer_scalar") {
+        // Only Gemma 4 has (and can apply) a layer scalar: it rides on the sandwich-norm kernel.
+        if c.isGemma4, let t = s.get("\(p).layer_scalar") {
             guard t.count == 1, let v = try t.floats().first, v.isFinite else { throw EngineError.invalidFile("\(p).layer_scalar") }
             layerScalar = v
         } else {
@@ -399,6 +423,8 @@ public final class Transformer {
         /// share each K/V read) + `attention_combine`. Bit-identical to `decode`; nil when the
         /// shape has no instantiation.
         var split: (split: MTLComputePipelineState, combine: MTLComputePipelineState)?
+        /// Query-head sub-groups per KV head of the split kernel (grid depth).
+        var splitGroups = 1
     }
     /// By head size (Gemma 4 mixes 256 and 512).
     private let attnKernels: [Int: AttnKernels]
@@ -521,21 +547,25 @@ public final class Transformer {
             let e = D / 32
             let decodeSG = e >= 16 ? 8 : e >= 8 ? 16 : 32
             var k: AttnKernels
-            if [32, 64, 96, 128].contains(D) {
+            if [32, 64, 96, 128, 256].contains(D) {
                 k = AttnKernels(decode: (try pipeline("attention_\(e)_\(decodeSG)\(cap)"), decodeSG * 32),
                                 prefill: (try pipeline("flash_prefill_\(D / 8)\(cap)"), 128), prefillQB: 32)
             } else {
                 k = AttnKernels(decode: (try pipeline("attention_\(e)_\(decodeSG)\(cap)"), decodeSG * 32),
                                 prefill: (try pipeline("attention_prefill_\(e)\(cap)"), 256), prefillQB: e >= 16 ? 2 : e > 4 ? 4 : 8)
             }
-            // The split kernel reproduces attention_E_32 exactly, so it needs the same virtual
-            // simdgroup count; G = query heads per KV head must have an instantiation (every
-            // layer of this head size must have the same G).
+            // The split kernel reproduces attention_E_32 exactly, so for head sizes up to 128 it
+            // needs the same virtual simdgroup count; G = query heads per KV head must have an
+            // instantiation (every layer of this head size must have the same G). Head sizes
+            // 256 / 512 take the query heads in sub-groups of up to 2 (grid depth; 4 heads of 256
+            // per simdgroup measured 5% slower at 1K context on Gemma 3 1B); their decode kernel
+            // has 16 / 8 simdgroups, so the split result is not bit-identical there.
             let Gs = Set(c.layers.filter { $0.headDim == D }.map { c.numHeads / $0.numKVHeads })
             let V = Self.attnSplitVirtualSG
-            let maxG = e == 2 ? 8 : 4
-            if decodeSG == V, (2...4).contains(e), Gs.count == 1, let G = Gs.first, (1...maxG).contains(G),
-               let split = try? gpu.pipeline("attention_split_\(e)_\(G)\(cap)"),
+            let maxG = e == 2 ? 8 : e <= 4 ? 4 : 2
+            let gSub = Gs.first.map { e <= 4 ? $0 : min($0, maxG) } ?? 0
+            if (decodeSG == V && (2...4).contains(e)) || e >= 8, Gs.count == 1, let G = Gs.first, (1...maxG).contains(gSub), G % gSub == 0,
+               let split = try? gpu.pipeline("attention_split_\(e)_\(gSub)\(cap)"),
                let combine = try? gpu.pipeline("attention_combine_\(e)"),
                split.maxTotalThreadsPerThreadgroup >= Self.attnSplitSG * 32,
                // floats: m + l + acc[D] per (head, virtual simdgroup)
@@ -545,12 +575,12 @@ public final class Transformer {
                case let (bytes, o4) = floats.multipliedReportingOverflow(by: 4), !o4,
                rows <= Int(Int32.max) / max(1, perRow) {
                 k.split = (split, combine)
+                k.splitGroups = G / gSub
                 partialBytes = max(partialBytes, bytes)
             }
             kernels[D] = k
         }
         attnPartials = partialBytes > 0 ? try gpu.buffer(partialBytes) : nil
-        if attnPartials == nil { for d in kernels.keys { kernels[d]?.split = nil } }
         attnKernels = kernels
 
         if c.perLayerInputSize > 0 {
@@ -562,7 +592,8 @@ public final class Transformer {
             }
             ple = PerLayerInputs(size: P, embed: table, embedPSO: try table.lookupPipeline(),
                                  modelProj: try Linear(store, "model.per_layer_model_projection", inDim: H, outDim: LP),
-                                 norm: try RMSNorm(store, "model.per_layer_projection_norm.weight", eps: c.rmsNormEps, dim: P),
+                                 // The reference normalises proj(h) / sqrt(H): RMSNorm(x / sqrt(H), eps) == RMSNorm(x, eps · H).
+                                 norm: try RMSNorm(store, "model.per_layer_projection_norm.weight", eps: c.rmsNormEps * Float(H), dim: P),
                                  raw: try gpu.buffer(B * LP * 4), inputs: try gpu.buffer(B * LP * 4), gateBuf: try gpu.buffer(B * P * 4),
                                  addPSO: try gpu.pipeline("add_scaled"), gatePSO: try gpu.pipeline("gelu_tanh_gate"))
         } else {
@@ -780,7 +811,7 @@ public final class Transformer {
                 enc.set(kv.vCache!, 0, 2)
                 enc.set(partials, 0, 3)
                 enc.params(attnParams, 4)
-                enc.dispatchThreadgroups(MTLSize(width: nKV, height: Self.attnSplitVirtualSG / Self.attnSplitSG, depth: 1),
+                enc.dispatchThreadgroups(MTLSize(width: nKV, height: Self.attnSplitVirtualSG / Self.attnSplitSG, depth: kernels.splitGroups),
                                          threadsPerThreadgroup: MTLSize(width: Self.attnSplitSG * 32, height: 1, depth: 1))
                 enc.setComputePipelineState(combine)
                 enc.set(partials, 0, 0)
@@ -832,13 +863,17 @@ public final class Transformer {
             if let ple, let gate = layer.pleGate, let proj = layer.pleProj, let pn = layer.pleNorm, let mon = layer.mlpOutNorm {
                 // Gemma 4 per-layer input: h += norm(mlp); h += norm(proj(gelu(gate(h)) · ple[layer]))
                 mon.encodeAdd(enc, h: h, residual: tmp, normedBy: mon, y: xn, dim: H, rows: T)   // xn is scratch here
-                gate.encode(enc, x: h, xStride: H, y: ple.gateBuf, yStride: ple.size, T: T)
-                enc.setComputePipelineState(ple.gatePSO)
-                enc.set(ple.inputs, li * ple.size * 4, 1)
-                enc.set(ple.gateBuf, 0, 0)
-                enc.params(EWParams(n: 0, stride: Int32(ple.size * layers.count), cols: Int32(ple.size)), 2)
-                enc.dispatchThreads(MTLSize(width: ple.size, height: T, depth: 1),
-                                    threadsPerThreadgroup: MTLSize(width: min(256, ple.size), height: 1, depth: 1))
+                if decode, gate.qmvGatePSO != nil {
+                    gate.encodeGated(enc, x: h, y: ple.gateBuf, e: ple.inputs, eOffset: li * ple.size * 4, act: 1)
+                } else {
+                    gate.encode(enc, x: h, xStride: H, y: ple.gateBuf, yStride: ple.size, T: T)
+                    enc.setComputePipelineState(ple.gatePSO)
+                    enc.set(ple.inputs, li * ple.size * 4, 1)
+                    enc.set(ple.gateBuf, 0, 0)
+                    enc.params(EWParams(n: 0, stride: Int32(ple.size * layers.count), cols: Int32(ple.size)), 2)
+                    enc.dispatchThreads(MTLSize(width: ple.size, height: T, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: min(256, ple.size), height: 1, depth: 1))
+                }
                 proj.encode(enc, x: ple.gateBuf, xStride: ple.size, y: tmp, yStride: H, T: T)
                 residualNorm = pn
             }
@@ -872,7 +907,7 @@ public final class Transformer {
 
     /// Gemma 4: per-layer inputs for T tokens into `ple.inputs` ([T][layers][P]):
     /// (norm(per_layer_model_projection(h) / sqrt(H)) + embed_tokens_per_layer[id] · sqrt(P)) / sqrt(2).
-    /// (The 1/sqrt(H) projection scale is dropped: the RMSNorm that follows cancels it.)
+    /// (The 1/sqrt(H) projection scale is folded into the norm's eps, see `PerLayerInputs.norm`.)
     private func encodePerLayerInputs(_ enc: MTLComputeCommandEncoder, _ ple: PerLayerInputs, T: Int, offset: Int) {
         let LP = ple.size * layers.count
         ple.embed.encodeLookup(enc, pso: ple.embedPSO, ids: hist, idsOffset: offset * 4, out: ple.raw, T: T)
@@ -924,7 +959,7 @@ extension Transformer {
             let t = time(3) { enc in
                 for l in self.layers {
                     let ps = parts(l)
-                    if ps.count > 1, Linear.fusable(ps) { Linear.encodeFusedDecode(enc, ps, x: x, xStride: ps[0].inDim, y: self.guBuf, yStride: ps.reduce(0) { $0 + $1.outDim }, T: T) }
+                    if ps.count > 1, Linear.fusable(ps), Linear.canFuse(ps, T: T) { Linear.encodeFusedDecode(enc, ps, x: x, xStride: ps[0].inDim, y: self.guBuf, yStride: ps.reduce(0) { $0 + $1.outDim }, T: T) }
                     else { for p in ps { p.encode(enc, x: x, xStride: p.inDim, y: self.guBuf, yStride: p.outDim, T: T) } }
                 }
             }
@@ -939,12 +974,12 @@ extension Transformer {
         let tLM = time(20) { lmHead.encode($0, x: xn, xStride: H, y: logits, yStride: lmHead.outDim, T: 1) }
         out += String(format: "lm_head matvec: %.3f ms  (%.0f GB/s, cache-warm)\n", tLM * 1000, bytes(lmHead) / tLM / 1e9)
         // Decode step breakdown: the step without each kernel class (its cost includes dispatch gaps).
-        func stepTime(_ skip: Set<String>) -> Double {
+        func stepTime(_ skip: Set<String>, T: Int = 1) -> Double {
             profileSkip = skip
             defer { profileSkip = [] }
             var best = Double.infinity
-            for _ in 0..<5 {
-                let cb = try! encode(T: 1, offset: 16, computeLogits: true, allLogits: false)
+            for _ in 0..<(T == 1 ? 5 : 3) {
+                let cb = try! encode(T: T, offset: T == 1 ? 16 : 0, computeLogits: true, allLogits: false)
                 cb.commit(); cb.waitUntilCompleted()
                 best = min(best, cb.gpuEndTime - cb.gpuStartTime)
             }
@@ -956,6 +991,13 @@ extension Transformer {
             out += String(format: " %@ -%.3f", cls as NSString, (full - stepTime([cls])) * 1000)
         }
         out += String(format: "; matvecs only %.3f ms\n", stepTime(["post", "attn", "norm", "silu"]) * 1000)
+        // Prefill step breakdown at 512 tokens (GEMMs, attention and the elementwise kernels).
+        let fullP = stepTime([], T: 512)
+        out += String(format: "prefill step @512: %.1f ms; without", fullP * 1000)
+        for cls in ["qkv", "o", "gateup", "down", "lmhead", "post", "attn", "norm", "silu"] {
+            out += String(format: " %@ -%.1f", cls as NSString, (fullP - stepTime([cls], T: 512)) * 1000)
+        }
+        out += "\n"
         let l0 = layers[0]
         let tAdd = time(500) { enc in self.add(enc, tmp, xn, H) }
         out += String(format: "tiny dependent dispatch: %.1f us\n", tAdd * 1e6)

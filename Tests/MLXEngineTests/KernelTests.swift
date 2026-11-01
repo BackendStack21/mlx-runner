@@ -145,6 +145,34 @@ struct MatmulKernelTests {
         }
     }
 
+    /// K values that are not a multiple of the 4-bit decode kernel's 1024-wide pass: the 128/256/512
+    /// remainders are spread over all lanes, others fall back to a partial pass (Gemma, Qwen2.5).
+    @Test(arguments: [1152, 1536, 2304, 2560, 896, 1664, 6912])
+    func fourBitDecodeWithPartialPass(K: Int) throws {
+        let O = 24
+        for gs in [32, 64, 128] where K % gs == 0 {
+            let fx = try QuantFixture(O: O, K: K, bits: 4, gs: gs, seed: UInt64(K))
+            var rng = RNG(s: UInt64(K))
+            let x = (0..<K).map { _ in rng.float() }
+            let yb = try GPU.shared.buffer(O * 4)
+            runGPU { fx.linear.encode($0, x: makeBuffer(x), xStride: K, y: yb, yStride: O, T: 1) }
+            assertClose(readFloats(yb, O), fx.reference(x, T: 1, K: K), "K \(K) gs \(gs)")
+        }
+    }
+
+    /// y = act(x · Wᵀ) · e (the per-layer input gate of Gemma 4).
+    @Test func gatedOutputMatchesReference() throws {
+        let O = 40, K = 1536
+        let fx = try QuantFixture(O: O, K: K, bits: 4, gs: 64, seed: 21)
+        var rng = RNG(s: 6)
+        let x = (0..<K).map { _ in rng.float() * 4 }
+        let e = (0..<(2 * O)).map { _ in rng.float() }
+        let yb = try GPU.shared.buffer(O * 4)
+        runGPU { fx.linear.encodeGated($0, x: makeBuffer(x), y: yb, e: makeBuffer(e), eOffset: O * 4, act: 1) }
+        let ref = zip(fx.reference(x, T: 1, K: K), e[O...]).map { g, e in 0.5 * g * (1 + tanh(0.7978845608 * (g + 0.044715 * g * g * g))) * e }
+        assertClose(readFloats(yb, O), ref, tol: 5e-3, "gated output")
+    }
+
     @Test func fusedDecodeWithBiasMatchesSeparate() throws {
         let K = 256
         let parts = try [(64, 1), (16, 2), (16, 3)].map {
@@ -331,11 +359,13 @@ struct SampleKernelTests {
 /// including Gemma's sliding window and attention-score soft-capping.
 @Suite("Attention kernels")
 struct AttentionKernelTests {
-    struct Case { let D: Int; let window: Int; let softcap: Float }
+    struct Case { let D: Int; let window: Int; let softcap: Float; var nH = 4; var nKV = 2 }
     static let cases: [Case] = [
         Case(D: 128, window: 0, softcap: 0), Case(D: 128, window: 20, softcap: 0), Case(D: 128, window: 20, softcap: 5),
         Case(D: 256, window: 0, softcap: 0), Case(D: 256, window: 9, softcap: 5),
+        Case(D: 256, window: 0, softcap: 0, nH: 8, nKV: 1),   // split attention in two sub-groups of 4 heads
         Case(D: 512, window: 0, softcap: 0), Case(D: 512, window: 9, softcap: 0),
+        Case(D: 512, window: 0, softcap: 0, nH: 8, nKV: 2),   // sub-groups of 2
     ]
 
     /// CPU attention for queries at positions offset..<offset+T over cache rows 0...pos.
@@ -368,7 +398,7 @@ struct AttentionKernelTests {
 
     @Test(arguments: cases)
     func kernelsMatchReference(c: Case) throws {
-        let D = c.D, nH = 4, nKV = 2, maxSeq = 128, e = D / 32
+        let D = c.D, nH = c.nH, nKV = c.nKV, maxSeq = 128, e = D / 32
         let cap = c.softcap > 0 ? "_cap" : ""
         var rng = RNG(s: UInt64(D * 31 + c.window))
         let kh = (0..<(nKV * maxSeq * D)).map { _ in Float16(rng.float()) }
@@ -396,18 +426,19 @@ struct AttentionKernelTests {
         let ref1 = reference(q: q1, k: k, v: v, D: D, nH: nH, nKV: nKV, maxSeq: maxSeq, offset: offset, T: 1, scale: scale, window: c.window, softcap: c.softcap)
         let sg = e >= 16 ? 8 : e >= 8 ? 16 : 32
         assertClose(try run("attention_\(e)_\(sg)\(cap)", threads: sg * 32, grid: (nH, 1), T: 1, offset: offset, q: q1), ref1, "decode D=\(D)")
-        if (2...4).contains(e) {
-            // Split decode: attention_split + attention_combine.
+        do {
+            // Split decode: attention_split + attention_combine (query-head sub-groups for D >= 256).
+            let G = nH / nKV, gSub = e <= 4 ? G : min(G, 2)
             let V = Transformer.attnSplitVirtualSG, NSG = Transformer.attnSplitSG
             let part = try GPU.shared.buffer(nH * V * (D + 2) * 4)
             let out = try GPU.shared.buffer(nH * D * 4)
             let p = AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(nH * D), maxSeq: Int32(maxSeq),
                                offset: Int32(offset), scale: scale, outStride: Int32(nH * D), T: 1, window: Int32(c.window), softcap: c.softcap)
-            let split = try GPU.shared.pipeline("attention_split_\(e)_\(nH / nKV)\(cap)"), combine = try GPU.shared.pipeline("attention_combine_\(e)")
+            let split = try GPU.shared.pipeline("attention_split_\(e)_\(gSub)\(cap)"), combine = try GPU.shared.pipeline("attention_combine_\(e)")
             runGPU { enc in
                 enc.setComputePipelineState(split)
                 enc.set(makeBuffer(q1), 0, 0); enc.set(kBuf, 0, 1); enc.set(vBuf, 0, 2); enc.set(part, 0, 3); enc.params(p, 4)
-                enc.dispatchThreadgroups(MTLSize(width: nKV, height: V / NSG, depth: 1), threadsPerThreadgroup: MTLSize(width: NSG * 32, height: 1, depth: 1))
+                enc.dispatchThreadgroups(MTLSize(width: nKV, height: V / NSG, depth: G / gSub), threadsPerThreadgroup: MTLSize(width: NSG * 32, height: 1, depth: 1))
                 enc.setComputePipelineState(combine)
                 enc.set(part, 0, 0); enc.set(out, 0, 1); enc.params(p, 2)
                 enc.dispatchThreadgroups(MTLSize(width: nH, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
@@ -421,7 +452,7 @@ struct AttentionKernelTests {
         let qb = e >= 16 ? 2 : e > 4 ? 4 : 8
         // (Head size 128 prefills with flash_prefill: there is no soft-capped attention_prefill_4.)
         if cap.isEmpty || D > 128 { assertClose(try run("attention_prefill_\(e)\(cap)", threads: 256, grid: (nH, (T + qb - 1) / qb), T: T, offset: off, q: qT), refT, "prefill D=\(D)") }
-        if D <= 128 {
+        if D <= 256 {
             assertClose(try run("flash_prefill_\(D / 8)\(cap)", threads: 128, grid: (nH, (T + 31) / 32), T: T, offset: off, q: qT), refT, "flash prefill D=\(D)")
         }
     }

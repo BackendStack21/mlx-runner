@@ -26,6 +26,13 @@ struct GemmaTemplateTests {
         #expect(t.stopTokens.contains("<end_of_turn>"))
     }
 
+    @Test func gemma4KeepsLaterSystemTurns() {
+        let t = ChatTemplate(template: "<|turn>", modelType: "gemma4", bosToken: "<bos>")
+        let msgs = [ChatMessage(role: .user, content: "Hi"), ChatMessage(role: .assistant, content: "Hello"),
+                    ChatMessage(role: .system, content: "Be brief."), ChatMessage(role: .user, content: "Why?")]
+        #expect(t.render(msgs) == "<bos><|turn>user\nHi<turn|>\n<|turn>model\nHello<turn|>\n<|turn>system\nBe brief.<turn|>\n<|turn>user\nWhy?<turn|>\n<|turn>model\n")
+    }
+
     @Test func gemma4HasASystemTurnAndNoThinkingToggle() {
         let t = ChatTemplate(template: "{{ bos_token }}<|turn>{% if enable_thinking %}<|think|>{% endif %}", modelType: "gemma4", bosToken: "<bos>")
         #expect(t.format == .gemma4 && !t.supportsTools && !t.supportsThinkingToggle)
@@ -61,6 +68,29 @@ struct GemmaConfigTests {
         #expect(c.embedScale == 50.5)   // sqrt(2560) = 50.596 rounded to bf16
     }
 
+    /// transformers >= 5 writes a flat gemma3_text config with rope_parameters only.
+    @Test func gemma3FlatTransformers5Config() throws {
+        let dir = try configDir(#"{"model_type":"gemma3_text","hidden_size":1152,"intermediate_size":6912,"num_hidden_layers":12,"num_attention_heads":4,"num_key_value_heads":1,"head_dim":256,"sliding_window":512,"layer_types":["sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention"],"rope_parameters":{"full_attention":{"rope_theta":1000000.0,"rope_type":"default"},"sliding_attention":{"rope_theta":10000.0,"rope_type":"default"}},"eos_token_id":[1,106],"text_config":{"eos_token_id":1}}"#)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let c = try ModelConfig(directory: dir)
+        #expect(c.ropeTheta == 1_000_000 && c.ropeLocalTheta == 10_000 && c.slidingWindow == 512)
+        #expect(c.layers[2].invFreq[1] < c.layers[0].invFreq[1])
+        #expect(c.attnLogitSoftcap == 0 && c.finalLogitSoftcap == 0)
+    }
+
+    /// A flat `gemma3` config (no text_config) is the text model; Gemma 2 without the
+    /// soft-capping keys gets transformers' defaults, with null meaning off.
+    @Test func gemmaVariantsOfTheSameConfig() throws {
+        let flat = try configDir(#"{"model_type":"gemma3","hidden_size":2560,"num_hidden_layers":12,"num_attention_heads":8,"num_key_value_heads":4,"head_dim":256,"sliding_window":1024,"sliding_window_pattern":6,"rope_theta":1e6,"rope_local_base_freq":1e4}"#)
+        defer { try? FileManager.default.removeItem(at: flat) }
+        let c = try ModelConfig(directory: flat)
+        #expect(c.modelType == "gemma3_text" && c.slidingWindow == 1024 && c.ropeLocalTheta == 1e4 && c.layers.filter(\.sliding).count == 10)
+        let g2 = try configDir(#"{"model_type":"gemma2","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,"final_logit_softcapping":null}"#)
+        defer { try? FileManager.default.removeItem(at: g2) }
+        let c2 = try ModelConfig(directory: g2)
+        #expect(c2.attnLogitSoftcap == 50 && c2.finalLogitSoftcap == 0)
+    }
+
     @Test func gemma4LayerGeometry() throws {
         let dir = try configDir(#"{"model_type":"gemma4","text_config":{"model_type":"gemma4_text","hidden_size":256,"intermediate_size":512,"num_hidden_layers":6,"num_attention_heads":4,"num_key_value_heads":1,"head_dim":64,"global_head_dim":128,"num_kv_shared_layers":2,"hidden_size_per_layer_input":32,"final_logit_softcapping":30.0,"sliding_window":16,"layer_types":["sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention"],"rope_parameters":{"full_attention":{"partial_rotary_factor":0.25,"rope_theta":1000000.0,"rope_type":"proportional"},"sliding_attention":{"rope_theta":10000.0,"rope_type":"default"}}}}"#)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -86,6 +116,8 @@ struct GemmaConfigTests {
         #"{"model_type":"gemma4_text","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,"num_kv_shared_layers":1,"layer_types":["sliding_attention","full_attention"]}"#,
         #"{"model_type":"gemma4_text","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,"enable_moe_block":true}"#,
         #"{"model_type":"gemma4_text","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,"global_head_dim":4096}"#,
+        #"{"model_type":"gemma3_text","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,"sliding_window":4294967316}"#,
+        #"{"model_type":"gemma4_text","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,"sliding_window":2147483653}"#,
     ])
     func rejectsInvalidGemmaConfigs(json: String) throws {
         let dir = try configDir(json)
@@ -96,12 +128,18 @@ struct GemmaConfigTests {
 
 @Suite("Gemma models", .serialized)
 struct GemmaModelTests {
+    static let gemma1 = "mlx-community/gemma-1.1-2b-it-4bit"
     static let gemma2 = "mlx-community/gemma-2-2b-it-4bit"
     static let gemma3 = "mlx-community/gemma-3-1b-it-qat-4bit"
+    static let gemma3Multimodal = "mlx-community/gemma-3-text-4b-it-4bit"   // `gemma3` export: text model only
     static let gemma4 = "mlx-community/gemma-4-e2b-it-OptiQ-4bit"
+    static let gemma4Unified = "mlx-community/gemma-4-12B-it-OptiQ-4bit"   // K = V global attention
+    /// Only installed checkpoints become test cases (a missing one must not pass silently).
+    static let installed = [gemma1, gemma2, gemma3, gemma3Multimodal, gemma4, gemma4Unified].filter { installedModel($0) != nil }
+    static let installedTokenizers = [gemma2, gemma3, gemma4].filter { installedModel($0) != nil }
 
     /// Ids from transformers' tokenizer for the same files.
-    @Test(.enabled(if: installedModel(gemma3) != nil || installedModel(gemma4) != nil), arguments: [gemma2, gemma3, gemma4])
+    @Test(arguments: installedTokenizers)
     func tokenizerKnownIdsAndRoundTrip(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let tok = try Tokenizer(directory: dir)
@@ -117,11 +155,12 @@ struct GemmaModelTests {
 
     /// Prefill and token-by-token decode agree past the sliding window (512 tokens for Gemma 3
     /// 1B and Gemma 4), so the windowed prefill and decode kernels are both exercised.
-    @Test(.enabled(if: installedModel(gemma3) != nil || installedModel(gemma4) != nil), arguments: [gemma2, gemma3, gemma4])
+    @Test(arguments: installed)
     func prefillMatchesIncrementalDecodePastTheWindow(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let model = try Transformer(directory: dir, contextLength: 1024)
         let tok = try Tokenizer(directory: dir)
+        #expect(!tok.stripsLeadingSpace)   // Gemma's leading spaces are real: the engine must not drop them
         let text = (0..<60).map { "Sentence number \($0) talks about the quick brown fox and the lazy dog." }.joined(separator: " ")
         let ids = Array(tok.encode(text).map { Int32($0) }.prefix(600))
         #expect(ids.count == 600)
