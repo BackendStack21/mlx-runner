@@ -25,6 +25,7 @@ final class Linear {
     private var gemm8PSO: MTLComputePipelineState?     // 5...8 tokens: qgemm on an 8-token tile
     private var gemm16PSO: MTLComputePipelineState?    // 9...16 tokens: qgemm on a 16-token tile
     private(set) var qmvPSO: MTLComputePipelineState?  // fused decode kernel (bias folded in)
+    private(set) var qmvGatePSO: MTLComputePipelineState?  // decode with y = act(y) · e
     private(set) var qmvbPSO: MTLComputePipelineState?  // 4-bit, 2...4 tokens (speculative verification)
     private var biasPSO: MTLComputePipelineState?
     let description: String
@@ -67,7 +68,11 @@ final class Linear {
             pso1 = try gpu.pipeline("qmm_\(bits)_\(sfx)_1")
             let qmvAlign = bits == 4 ? 32 : 16  // the 4-bit fast path consumes 32 values per lane
             if inDim % qmvAlign == 0 && groupSize % qmvAlign == 0 && (bias == nil || bias?.dtype == s.dtype) {
-                qmvPSO = try gpu.pipeline("qmv_\(bits)_\(sfx)")
+                // 4-bit: a remainder of 128/256/512 after the 1024-wide passes gets its own kernel.
+                var tail = ""
+                if bits == 4, [128, 256, 512].contains(inDim % 1024) { tail = "t\(inDim % 1024 / 32)_" }
+                qmvPSO = try gpu.pipeline("qmv_\(tail)\(bits)_\(sfx)")
+                qmvGatePSO = try gpu.pipeline("qmv_gate_\(tail)\(bits)_\(sfx)")
                 if bits == 4 { qmvbPSO = try gpu.pipeline("qmvb4_\(sfx)_4") }
             }
             if inDim % 32 == 0 { gemmPSO = try gpu.pipeline("qgemm_\(bits)_\(sfx)") }
@@ -122,12 +127,30 @@ final class Linear {
         }
         enc.set(x, xOffset, 3)
         enc.set(y, yOffset, 4)
+        enc.set(x, xOffset, 15)
         let total = parts.reduce(0) { $0 + $1.outDim }
         let rowsPerTG = T == 1 ? qmvRowsPerThreadgroup : qmvbRowsPerSimdgroup * qmvSimdgroups
         enc.params(MMParams(K: Int32(f.inDim), O: Int32(total), T: Int32(T), gs: Int32(f.groupSize), xStride: Int32(xStride), yStride: Int32(yStride),
                             o1: Int32(parts[0].outDim), o2: Int32(parts.count > 1 ? parts[1].outDim : 0),
                             hasBias: f.bias != nil ? 1 : 0), 5)
         enc.dispatchThreadgroups(MTLSize(width: (total + rowsPerTG - 1) / rowsPerTG, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: qmvThreads, height: 1, depth: 1))
+    }
+
+    /// Decode-only gated output: y[:outDim] = act(x · Wᵀ + bias) · e[:outDim] in one dispatch.
+    func encodeGated(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, xOffset: Int = 0, y: MTLBuffer, yOffset: Int = 0,
+                     e: MTLBuffer, eOffset: Int, act: Int32) {
+        enc.setComputePipelineState(qmvGatePSO!)
+        for slot in [0, 6, 9] {
+            enc.set(weight, slot); enc.set(scales!, slot + 1); enc.set(biases!, slot + 2)
+            enc.set(bias ?? scales!, 12 + slot / 3)
+        }
+        enc.set(x, xOffset, 3)
+        enc.set(y, yOffset, 4)
+        enc.set(e, eOffset, 15)
+        enc.params(MMParams(K: Int32(inDim), O: Int32(outDim), T: 1, gs: Int32(groupSize), xStride: 0, yStride: 0,
+                            o1: Int32(outDim), o2: 0, hasBias: bias != nil ? 1 : 0, act: act), 5)
+        enc.dispatchThreadgroups(MTLSize(width: (outDim + qmvRowsPerThreadgroup - 1) / qmvRowsPerThreadgroup, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: qmvThreads, height: 1, depth: 1))
     }
 
@@ -209,19 +232,32 @@ final class RMSNorm {
     let weight: Tensor
     let pso: MTLComputePipelineState
     let addPSO: MTLComputePipelineState
+    /// `norm_add_rms_norm` (Gemma's normalized residual).
+    let normAddPSO: MTLComputePipelineState
     let eps: Float
 
     /// Threads per row: one float4 each, up to 1024 (dim 4096) and the pipelines' maximum.
     let threads: Int
 
-    init(_ store: WeightStore, _ name: String, eps: Float, dim: Int) throws {
-        weight = try store.require(name)
-        guard weight.shape == [dim] else { throw EngineError.invalidFile("\(name): expected shape [\(dim)], found \(weight.shape)") }
+    /// `offset`: the stored weights are offsets from 1 (Gemma); 1 + w is computed once, in f32
+    /// as transformers does, into a buffer of its own.
+    init(_ store: WeightStore, _ name: String, eps: Float, dim: Int, offset: Bool = false) throws {
+        var w = try store.require(name)
+        guard w.shape == [dim] else { throw EngineError.invalidFile("\(name): expected shape [\(dim)], found \(w.shape)") }
         guard dim % 4 == 0 else { throw EngineError.unsupported("\(name): dimension \(dim) is not a multiple of 4") }
+        if offset {
+            let values = try w.floats().map { 1 + $0 }
+            let buf = try GPU.shared.buffer(dim * 4)
+            values.withUnsafeBytes { buf.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+            w = Tensor(buffer: buf, offset: 0, dtype: .f32, shape: [dim])
+        }
+        weight = w
         guard let sfx = weight.dtype.suffix else { throw EngineError.unsupported("\(name) dtype") }
         pso = try GPU.shared.pipeline("rms_norm_\(sfx)")
         addPSO = try GPU.shared.pipeline("add_rms_norm_\(sfx)")
-        let maxThreads = min(pso.maxTotalThreadsPerThreadgroup, addPSO.maxTotalThreadsPerThreadgroup)
+        normAddPSO = try GPU.shared.pipeline("norm_add_rms_norm_\(sfx)")
+        let maxThreads = min(pso.maxTotalThreadsPerThreadgroup, addPSO.maxTotalThreadsPerThreadgroup,
+                             normAddPSO.maxTotalThreadsPerThreadgroup)
         threads = max(32, min(1024, maxThreads, dim / 4) / 32 * 32)
         self.eps = eps
     }
@@ -240,47 +276,104 @@ final class RMSNorm {
 }
 
 final class TransformerLayer {
+    let spec: ModelConfig.LayerSpec
     let qkvFusable: Bool
     let gateUpFusable: Bool
     let qkvPostPSO: MTLComputePipelineState
     let inputNorm: RMSNorm
-    let postNorm: RMSNorm
+    /// The norm in front of the MLP (`post_attention_layernorm`, or Gemma 2/3/4's `pre_feedforward_layernorm`).
+    let mlpNorm: RMSNorm
+    /// Gemma 2/3/4: norms of the attention and MLP outputs, applied before their residual adds.
+    let attnOutNorm: RMSNorm?
+    let mlpOutNorm: RMSNorm?
     let qNorm: RMSNorm?
     let kNorm: RMSNorm?
-    let qkv: [Linear]      // either [qkv_proj] or [q, k, v]
+    /// [qkv_proj], [q, k, v], [q, k] (K = V) or [q] (KV-shared layer).
+    let qkv: [Linear]
     let o: Linear
     let gateUp: [Linear]   // either [gate_up_proj] or [gate, up]
     let down: Linear
-    let kCache: MTLBuffer
-    let vCache: MTLBuffer
+    /// MLP width (Gemma 4 doubles it in the KV-shared layers).
+    let intermediate: Int
+    /// Row stride of the [q | k | v] projection buffer.
+    let qkvCols: Int
+    /// nil for a KV-shared layer (it attends over `spec.kvSource`'s cache).
+    let kCache: MTLBuffer?
+    let vCache: MTLBuffer?
+    /// Gemma 4 per-layer input: gate (H → P), projection (P → H) and its norm.
+    let pleGate: Linear?
+    let pleProj: Linear?
+    let pleNorm: RMSNorm?
+    /// Gemma 4: the layer output is multiplied by this.
+    let layerScalar: Float
 
     init(_ s: WeightStore, _ i: Int, _ c: ModelConfig, maxSeq: Int) throws {
         let p = "model.layers.\(i)"
-        let H = c.hiddenSize, D = c.headDim, I = c.intermediateSize
-        inputNorm = try RMSNorm(s, "\(p).input_layernorm.weight", eps: c.rmsNormEps, dim: H)
-        postNorm = try RMSNorm(s, "\(p).post_attention_layernorm.weight", eps: c.rmsNormEps, dim: H)
-        qNorm = s.has("\(p).self_attn.q_norm.weight") ? try RMSNorm(s, "\(p).self_attn.q_norm.weight", eps: c.rmsNormEps, dim: D) : nil
-        kNorm = s.has("\(p).self_attn.k_norm.weight") ? try RMSNorm(s, "\(p).self_attn.k_norm.weight", eps: c.rmsNormEps, dim: D) : nil
-        if s.has("\(p).self_attn.qkv_proj.weight") {
-            qkv = [try Linear(s, "\(p).self_attn.qkv_proj", inDim: H, outDim: (c.numHeads + 2 * c.numKVHeads) * D)]
+        spec = c.layers[i]
+        let H = c.hiddenSize, D = spec.headDim, nKV = spec.numKVHeads
+        let off = c.normWeightOffset
+        let eps = c.rmsNormEps
+        inputNorm = try RMSNorm(s, "\(p).input_layernorm.weight", eps: eps, dim: H, offset: off)
+        if c.sandwichNorms {
+            attnOutNorm = try RMSNorm(s, "\(p).post_attention_layernorm.weight", eps: eps, dim: H, offset: off)
+            mlpNorm = try RMSNorm(s, "\(p).pre_feedforward_layernorm.weight", eps: eps, dim: H, offset: off)
+            mlpOutNorm = try RMSNorm(s, "\(p).post_feedforward_layernorm.weight", eps: eps, dim: H, offset: off)
         } else {
-            qkv = try [("q_proj", c.numHeads), ("k_proj", c.numKVHeads), ("v_proj", c.numKVHeads)].map {
-                try Linear(s, "\(p).self_attn.\($0.0)", inDim: H, outDim: $0.1 * D)
-            }
+            mlpNorm = try RMSNorm(s, "\(p).post_attention_layernorm.weight", eps: eps, dim: H, offset: off)
+            attnOutNorm = nil
+            mlpOutNorm = nil
+        }
+        qNorm = s.has("\(p).self_attn.q_norm.weight") ? try RMSNorm(s, "\(p).self_attn.q_norm.weight", eps: eps, dim: D, offset: off) : nil
+        kNorm = spec.hasOwnKV && s.has("\(p).self_attn.k_norm.weight") ? try RMSNorm(s, "\(p).self_attn.k_norm.weight", eps: eps, dim: D, offset: off) : nil
+        if spec.hasOwnKV, (qNorm == nil) != (kNorm == nil) { throw EngineError.invalidFile("\(p): q_norm and k_norm must come together") }
+        qkvCols = (c.numHeads + 2 * nKV) * D
+        if !spec.hasOwnKV {
+            qkv = [try Linear(s, "\(p).self_attn.q_proj", inDim: H, outDim: c.numHeads * D)]
+        } else if s.has("\(p).self_attn.qkv_proj.weight") {
+            qkv = [try Linear(s, "\(p).self_attn.qkv_proj", inDim: H, outDim: qkvCols)]
+        } else {
+            let parts = spec.kEqV ? [("q_proj", c.numHeads), ("k_proj", nKV)] : [("q_proj", c.numHeads), ("k_proj", nKV), ("v_proj", nKV)]
+            qkv = try parts.map { try Linear(s, "\(p).self_attn.\($0.0)", inDim: H, outDim: $0.1 * D) }
         }
         o = try Linear(s, "\(p).self_attn.o_proj", inDim: c.numHeads * D, outDim: H)
+        // Gemma 4's MLP width varies per layer: take it from the weights.
+        let I0: Int? = c.isGemma4 ? nil : c.intermediateSize
         if s.has("\(p).mlp.gate_up_proj.weight") {
-            gateUp = [try Linear(s, "\(p).mlp.gate_up_proj", inDim: H, outDim: 2 * I)]
+            gateUp = [try Linear(s, "\(p).mlp.gate_up_proj", inDim: H, outDim: I0.map { 2 * $0 })]
+            guard gateUp[0].outDim % 2 == 0 else { throw EngineError.invalidFile("\(p).mlp.gate_up_proj: odd output size") }
+            intermediate = gateUp[0].outDim / 2
         } else {
-            gateUp = try ["gate_proj", "up_proj"].map { try Linear(s, "\(p).mlp.\($0)", inDim: H, outDim: I) }
+            let gate = try Linear(s, "\(p).mlp.gate_proj", inDim: H, outDim: I0)
+            gateUp = [gate, try Linear(s, "\(p).mlp.up_proj", inDim: H, outDim: gate.outDim)]
+            intermediate = gate.outDim
         }
-        down = try Linear(s, "\(p).mlp.down_proj", inDim: I, outDim: H)
+        guard (1...262_144).contains(intermediate) else { throw EngineError.invalidFile("\(p): MLP width \(intermediate) is out of range") }
+        down = try Linear(s, "\(p).mlp.down_proj", inDim: intermediate, outDim: H)
+        if c.perLayerInputSize > 0 {
+            let P = c.perLayerInputSize
+            pleGate = try Linear(s, "\(p).per_layer_input_gate", inDim: H, outDim: P)
+            pleProj = try Linear(s, "\(p).per_layer_projection", inDim: P, outDim: H)
+            pleNorm = try RMSNorm(s, "\(p).post_per_layer_input_norm.weight", eps: eps, dim: H)
+        } else {
+            pleGate = nil; pleProj = nil; pleNorm = nil
+        }
+        // Only Gemma 4 has (and can apply) a layer scalar: it rides on the sandwich-norm kernel.
+        if c.isGemma4, let t = s.get("\(p).layer_scalar") {
+            guard t.count == 1, let v = try t.floats().first, v.isFinite else { throw EngineError.invalidFile("\(p).layer_scalar") }
+            layerScalar = v
+        } else {
+            layerScalar = 1
+        }
         qkvFusable = qkv.count > 1 && Linear.fusable(qkv)
         gateUpFusable = gateUp.count > 1 && Linear.fusable(gateUp)
         qkvPostPSO = try GPU.shared.pipeline("qkv_post_\(qNorm?.weight.dtype.suffix ?? "f32")")
-        let cacheBytes = c.numKVHeads * maxSeq * c.headDim * 2
-        kCache = try GPU.shared.buffer(cacheBytes)
-        vCache = try GPU.shared.buffer(cacheBytes)
+        if spec.hasOwnKV {
+            let cacheBytes = nKV * maxSeq * D * 2
+            kCache = try GPU.shared.buffer(cacheBytes)
+            vCache = try GPU.shared.buffer(cacheBytes)
+        } else {
+            kCache = nil; vCache = nil
+        }
     }
 }
 
@@ -318,14 +411,23 @@ public final class Transformer {
     /// Logits for every row of a small batch (speculative verification).
     let logitsAll: MTLBuffer
     public static let maxVerifyTokens = 4
-    private let invFreq: MTLBuffer
+    /// Inverse RoPE frequencies per layer (layers with the same RoPE share a buffer).
+    private let ropeFreqs: [MTLBuffer]
 
-    private let attnDecodePSO: (MTLComputePipelineState, Int)
-    private let attnPrefillPSO: (MTLComputePipelineState, Int)
-    /// Long-context decode attention: `attention_split` (KV head × 8 key slices, GQA heads share
-    /// each K/V read) + `attention_combine`. Bit-identical to `attnDecodePSO`; nil when the shape
-    /// has no instantiation.
-    private let attnSplitPSO: (split: MTLComputePipelineState, combine: MTLComputePipelineState)?
+    /// Attention pipelines for one head size.
+    struct AttnKernels {
+        var decode: (MTLComputePipelineState, Int)
+        var prefill: (MTLComputePipelineState, Int)
+        var prefillQB: Int
+        /// Long-context decode attention: `attention_split` (KV head × 8 key slices, GQA heads
+        /// share each K/V read) + `attention_combine`. Bit-identical to `decode`; nil when the
+        /// shape has no instantiation.
+        var split: (split: MTLComputePipelineState, combine: MTLComputePipelineState)?
+        /// Query-head sub-groups per KV head of the split kernel (grid depth).
+        var splitGroups = 1
+    }
+    /// By head size (Gemma 4 mixes 256 and 512).
+    private let attnKernels: [Int: AttnKernels]
     private let attnPartials: MTLBuffer?
     static let attnSplitVirtualSG = 32, attnSplitSG = 4
     /// Decode uses the split attention once the context (offset + 1) reaches this length.
@@ -335,9 +437,27 @@ public final class Transformer {
         if let s = ProcessInfo.processInfo.environment["MLXR_ATTN_SPLIT_MIN"], let v = Int(s), v > 0 { return v }
         return 256
     }()
-    private let prefillQB: Int
+
+    /// Gemma 4 per-layer input embeddings.
+    struct PerLayerInputs {
+        let size: Int                 // P (hidden_size_per_layer_input)
+        let embed: Linear             // embed_tokens_per_layer: [vocab][layers · P]
+        let embedPSO: MTLComputePipelineState
+        let modelProj: Linear         // per_layer_model_projection: H → layers · P
+        let norm: RMSNorm             // per_layer_projection_norm (P)
+        let raw: MTLBuffer            // [T][layers · P] looked-up embeddings
+        let inputs: MTLBuffer         // [T][layers · P] per-layer inputs
+        let gateBuf: MTLBuffer        // [T][P]
+        let addPSO: MTLComputePipelineState
+        let gatePSO: MTLComputePipelineState
+    }
+    private let ple: PerLayerInputs?
+    /// The MLP's gated activation: SiLU, or GELU (tanh / exact) for Gemma.
     private let siluPSO: MTLComputePipelineState
     private let addPSO: MTLComputePipelineState
+    /// Gemma: embedding scale and final-logit soft-capping (nil when unused).
+    private let scalePSO: MTLComputePipelineState?
+    private let softcapPSO: MTLComputePipelineState?
     private let embedPSO: MTLComputePipelineState
     /// The next decode step (T = 1, at `offset`), encoded while the previous one ran on the GPU.
     /// Encoding does not depend on the token id (read from `hist` at execution time), only on
@@ -346,7 +466,6 @@ public final class Transformer {
     /// Developer profiling only (`profile`): kernel classes left out of `encode`.
     var profileSkip: Set<String> = []
 
-    private let qkvCols: Int
     public private(set) var lastGPUTime: Double = 0
     public var vocabSize: Int { lmHead.outDim }
     public var weightBytes: Int { store.totalBytes }
@@ -365,21 +484,33 @@ public final class Transformer {
         maxSeq = seq
         let store = try WeightStore(directory: directory, device: gpu.device)
         self.store = store
-        guard c.headDim % 32 == 0, c.headDim / 32 <= 8, c.numHeads % c.numKVHeads == 0 else {
-            throw EngineError.unsupported("head_dim \(c.headDim)")
+        let headDims = Set(c.layers.map(\.headDim))
+        for d in headDims {
+            guard d % 32 == 0, d / 32 <= 8 || d == 512 else { throw EngineError.unsupported("head_dim \(d)") }
+        }
+        guard c.layers.count == c.numLayers, c.layers.allSatisfy({ c.numHeads % $0.numKVHeads == 0 }) else {
+            throw EngineError.unsupported("attention head layout")
         }
         embed = try Linear(store, "model.embed_tokens", inDim: c.hiddenSize)
         layers = try (0..<c.numLayers).map { try TransformerLayer(store, $0, c, maxSeq: seq) }
-        norm = try RMSNorm(store, "model.norm.weight", eps: c.rmsNormEps, dim: c.hiddenSize)
+        norm = try RMSNorm(store, "model.norm.weight", eps: c.rmsNormEps, dim: c.hiddenSize, offset: c.normWeightOffset)
         if store.has("lm_head.weight") {
             lmHead = try Linear(store, "lm_head", inDim: c.hiddenSize)
         } else {
             lmHead = embed
         }
         quantDescription = layers.first?.down.description ?? ""
+        // The fused residual-norm kernels read two norm weights with one dtype.
+        let normType = norm.weight.dtype
+        for l in layers {
+            let norms = [l.inputNorm, l.mlpNorm, l.attnOutNorm, l.mlpOutNorm, l.pleNorm].compactMap { $0 }
+            guard norms.allSatisfy({ $0.weight.dtype == normType }) else { throw EngineError.unsupported("mixed norm weight dtypes") }
+        }
 
-        qkvCols = (c.numHeads + 2 * c.numKVHeads) * c.headDim
-        let H = c.hiddenSize, I = c.intermediateSize, B = maxBatch
+        // Scratch buffers fit the largest layer.
+        let qkvMax = layers.map(\.qkvCols).max()!, attnMax = layers.map { c.numHeads * $0.spec.headDim }.max()!
+        let I = layers.map(\.intermediate).max()!
+        let H = c.hiddenSize, B = maxBatch
         hist = try gpu.buffer((seq + 1) * 4)
         rngState = try gpu.buffer(16)
         sampleStatus = try gpu.buffer((seq + 1) * 4)
@@ -388,50 +519,94 @@ public final class Transformer {
         sampleThreads = min(1024, samplePSO.maxTotalThreadsPerThreadgroup) / 32 * 32
         h = try gpu.buffer(B * H * 4)
         xn = try gpu.buffer(B * H * 4)
-        qkvBuf = try gpu.buffer(B * qkvCols * 4)
-        attnBuf = try gpu.buffer(B * c.numHeads * c.headDim * 4)
+        qkvBuf = try gpu.buffer(B * qkvMax * 4)
+        attnBuf = try gpu.buffer(B * attnMax * 4)
         guBuf = try gpu.buffer(B * 2 * I * 4)
         mlpBuf = try gpu.buffer(B * I * 4)
         tmp = try gpu.buffer(B * H * 4)
         logits = try gpu.buffer(lmHead.outDim * 4)
         logitsAll = try gpu.buffer(Self.maxVerifyTokens * lmHead.outDim * 4)
-        let f = c.inverseFrequencies()
-        invFreq = gpu.device.makeBuffer(bytes: f, length: max(16, f.count * 4), options: .storageModeShared)!
+        var freqBuffers: [[Float]: MTLBuffer] = [:]
+        ropeFreqs = c.layers.map { l in
+            if let b = freqBuffers[l.invFreq] { return b }
+            let b = gpu.device.makeBuffer(bytes: l.invFreq, length: max(16, l.invFreq.count * 4), options: .storageModeShared)!
+            freqBuffers[l.invFreq] = b
+            return b
+        }
 
-        let e = c.headDim / 32
-        let decodeSG = e >= 8 ? 16 : 32
-        attnDecodePSO = (try gpu.pipeline("attention_\(e)_\(decodeSG)"), decodeSG * 32)
-        // The split kernel reproduces attention_E_32 exactly, so it needs the same virtual
-        // simdgroup count; G = query heads per KV head must have an instantiation.
-        let G = c.numHeads / c.numKVHeads
-        let V = Self.attnSplitVirtualSG
-        let maxG = e == 2 ? 8 : 4
-        if decodeSG == V, (2...4).contains(e), (1...maxG).contains(G),
-           let split = try? gpu.pipeline("attention_split_\(e)_\(G)"),
-           let combine = try? gpu.pipeline("attention_combine_\(e)"),
-           split.maxTotalThreadsPerThreadgroup >= Self.attnSplitSG * 32,
-           // floats: m + l + acc[D] per (head, virtual simdgroup)
-           case let (rows, o1) = c.numHeads.multipliedReportingOverflow(by: V), !o1,
-           case let (perRow, o2) = c.headDim.addingReportingOverflow(2), !o2,
-           case let (floats, o3) = rows.multipliedReportingOverflow(by: perRow), !o3,
-           case let (bytes, o4) = floats.multipliedReportingOverflow(by: 4), !o4,
-           rows <= Int(Int32.max) / max(1, perRow),
-           let buf = try? gpu.buffer(bytes) {
-            attnSplitPSO = (split, combine)
-            attnPartials = buf
-        } else {
-            attnSplitPSO = nil
-            attnPartials = nil
+        var kernels: [Int: AttnKernels] = [:]
+        var partialBytes = 0
+        // Soft-capped attention (Gemma 2) has its own instantiations (head sizes 128 and 256).
+        let cap = c.attnLogitSoftcap > 0 ? "_cap" : ""
+        func pipeline(_ name: String) throws -> MTLComputePipelineState {
+            do { return try gpu.pipeline(name) } catch {
+                throw cap.isEmpty ? error : EngineError.unsupported("attention soft-capping with head_dim \(name)")
+            }
         }
-        if [32, 64, 96, 128].contains(c.headDim) {
-            attnPrefillPSO = (try gpu.pipeline("flash_prefill_\(c.headDim / 8)"), 128)
-            prefillQB = 32
-        } else {
-            attnPrefillPSO = (try gpu.pipeline("attention_prefill_\(e)"), 256)
-            prefillQB = e > 4 ? 4 : 8
+        for D in headDims {
+            let e = D / 32
+            let decodeSG = e >= 16 ? 8 : e >= 8 ? 16 : 32
+            var k: AttnKernels
+            if [32, 64, 96, 128, 256].contains(D) {
+                k = AttnKernels(decode: (try pipeline("attention_\(e)_\(decodeSG)\(cap)"), decodeSG * 32),
+                                prefill: (try pipeline("flash_prefill_\(D / 8)\(cap)"), 128), prefillQB: 32)
+            } else {
+                k = AttnKernels(decode: (try pipeline("attention_\(e)_\(decodeSG)\(cap)"), decodeSG * 32),
+                                prefill: (try pipeline("attention_prefill_\(e)\(cap)"), 256), prefillQB: e >= 16 ? 2 : e > 4 ? 4 : 8)
+            }
+            // The split kernel reproduces attention_E_32 exactly, so for head sizes up to 128 it
+            // needs the same virtual simdgroup count; G = query heads per KV head must have an
+            // instantiation (every layer of this head size must have the same G). Head sizes
+            // 256 / 512 take the query heads in sub-groups of up to 2 (grid depth; 4 heads of 256
+            // per simdgroup measured 5% slower at 1K context on Gemma 3 1B); their decode kernel
+            // has 16 / 8 simdgroups, so the split result is not bit-identical there.
+            let Gs = Set(c.layers.filter { $0.headDim == D }.map { c.numHeads / $0.numKVHeads })
+            let V = Self.attnSplitVirtualSG
+            let maxG = e == 2 ? 8 : e <= 4 ? 4 : 2
+            let gSub = Gs.first.map { e <= 4 ? $0 : min($0, maxG) } ?? 0
+            if (decodeSG == V && (2...4).contains(e)) || e >= 8, Gs.count == 1, let G = Gs.first, (1...maxG).contains(gSub), G % gSub == 0,
+               let split = try? gpu.pipeline("attention_split_\(e)_\(gSub)\(cap)"),
+               let combine = try? gpu.pipeline("attention_combine_\(e)"),
+               split.maxTotalThreadsPerThreadgroup >= Self.attnSplitSG * 32,
+               // floats: m + l + acc[D] per (head, virtual simdgroup)
+               case let (rows, o1) = c.numHeads.multipliedReportingOverflow(by: V), !o1,
+               case let (perRow, o2) = D.addingReportingOverflow(2), !o2,
+               case let (floats, o3) = rows.multipliedReportingOverflow(by: perRow), !o3,
+               case let (bytes, o4) = floats.multipliedReportingOverflow(by: 4), !o4,
+               rows <= Int(Int32.max) / max(1, perRow) {
+                k.split = (split, combine)
+                k.splitGroups = G / gSub
+                partialBytes = max(partialBytes, bytes)
+            }
+            kernels[D] = k
         }
-        siluPSO = try gpu.pipeline("silu_mul")
+        attnPartials = partialBytes > 0 ? try gpu.buffer(partialBytes) : nil
+        attnKernels = kernels
+
+        if c.perLayerInputSize > 0 {
+            let P = c.perLayerInputSize, LP = P * c.numLayers
+            let table = try Linear(store, "model.embed_tokens_per_layer", inDim: LP)
+            // The sampler can produce any lm_head row, and every id indexes this table too.
+            guard table.outDim >= embed.outDim else {
+                throw EngineError.invalidFile("embed_tokens_per_layer has \(table.outDim) rows for a \(embed.outDim)-token vocabulary")
+            }
+            ple = PerLayerInputs(size: P, embed: table, embedPSO: try table.lookupPipeline(),
+                                 modelProj: try Linear(store, "model.per_layer_model_projection", inDim: H, outDim: LP),
+                                 // The reference normalises proj(h) / sqrt(H): RMSNorm(x / sqrt(H), eps) == RMSNorm(x, eps · H).
+                                 norm: try RMSNorm(store, "model.per_layer_projection_norm.weight", eps: c.rmsNormEps * Float(H), dim: P),
+                                 raw: try gpu.buffer(B * LP * 4), inputs: try gpu.buffer(B * LP * 4), gateBuf: try gpu.buffer(B * P * 4),
+                                 addPSO: try gpu.pipeline("add_scaled"), gatePSO: try gpu.pipeline("gelu_tanh_gate"))
+        } else {
+            ple = nil
+        }
+        switch c.activation {
+        case .silu: siluPSO = try gpu.pipeline("silu_mul")
+        case .geluTanh: siluPSO = try gpu.pipeline("gelu_tanh_mul")
+        case .gelu: siluPSO = try gpu.pipeline("gelu_mul")
+        }
         addPSO = try gpu.pipeline("add_inplace")
+        scalePSO = c.embedScale != nil ? try gpu.pipeline("scale_inplace") : nil
+        softcapPSO = c.finalLogitSoftcap > 0 ? try gpu.pipeline("softcap_inplace") : nil
         embedPSO = try embed.lookupPipeline()
     }
 
@@ -567,8 +742,7 @@ public final class Transformer {
     /// With `sample`, the last row's logits are turned into a token on the GPU (see `sample_token`).
     private func encode(T: Int, offset: Int, computeLogits: Bool, allLogits: Bool, sample: SampleParams? = nil) throws -> MTLCommandBuffer {
         let c = config
-        let H = c.hiddenSize, D = c.headDim, I = c.intermediateSize
-        let nH = c.numHeads, nKV = c.numKVHeads
+        let H = c.hiddenSize, nH = c.numHeads
         guard T > 0, T <= maxBatch, offset >= 0, offset + T <= maxSeq else { throw EngineError.contextFull }
         if sample != nil { guard computeLogits, !allLogits, offset + T < maxSeq else { throw EngineError.contextFull } }
 
@@ -577,6 +751,8 @@ public final class Transformer {
             throw EngineError.noMetalDevice
         }
         embed.encodeLookup(enc, pso: embedPSO, ids: hist, idsOffset: offset * 4, out: h, T: T)
+        if let scalePSO, let s = c.embedScale { scale(enc, scalePSO, h, T * H, s) }
+        if let ple { encodePerLayerInputs(enc, ple, T: T, offset: offset) }
         // Profiling only: every flag is false in normal use.
         let skip = profileSkip
         let skipNorm = skip.contains("norm"), skipPost = skip.contains("post"), skipAttn = skip.contains("attn")
@@ -584,54 +760,58 @@ public final class Transformer {
         let skipGateUp = skip.contains("gateup"), skipDown = skip.contains("down"), skipLMHead = skip.contains("lmhead")
         if !skipNorm { layers[0].inputNorm.encode(enc, x: h, y: xn, dim: H, rows: T, rowStride: H) }
 
-        let kCol = nH * D, vCol = (nH + nKV) * D
         let decode = T == 1
-        let (attn, attnThreads) = decode ? attnDecodePSO : attnPrefillPSO
-        let useSplit = decode && attnSplitPSO != nil && offset + 1 >= attnSplitMinContext
         for (li, layer) in layers.enumerated() {
+            let spec = layer.spec
+            let D = spec.headDim, nKV = spec.numKVHeads, qkvCols = layer.qkvCols, I = layer.intermediate
+            let kv = spec.hasOwnKV ? layer : layers[spec.kvSource]
+            let kernels = attnKernels[D]!
             // Attention block: [q|k|v] projection → norm/rope/cache → attention → o_proj
             if skipQKV {
             } else if layer.qkvFusable && Linear.canFuse(layer.qkv, T: T) {
                 Linear.encodeFusedDecode(enc, layer.qkv, x: xn, xStride: H, y: qkvBuf, yStride: qkvCols, T: T)
-            } else if layer.qkv.count == 1 {
-                layer.qkv[0].encode(enc, x: xn, xStride: H, y: qkvBuf, yStride: qkvCols, T: T)
             } else {
-                layer.qkv[0].encode(enc, x: xn, xStride: H, y: qkvBuf, yOffset: 0, yStride: qkvCols, T: T)
-                layer.qkv[1].encode(enc, x: xn, xStride: H, y: qkvBuf, yOffset: kCol * 4, yStride: qkvCols, T: T)
-                layer.qkv[2].encode(enc, x: xn, xStride: H, y: qkvBuf, yOffset: vCol * 4, yStride: qkvCols, T: T)
+                var col = 0   // q, k, v sections (or one fused qkv_proj)
+                for part in layer.qkv {
+                    part.encode(enc, x: xn, xStride: H, y: qkvBuf, yOffset: col * 4, yStride: qkvCols, T: T)
+                    col += part.outDim
+                }
             }
 
             if !skipPost {
             enc.setComputePipelineState(layer.qkvPostPSO)
             enc.set(qkvBuf, 0, 0)
-            enc.set(invFreq, 0, 1)
-            enc.set(layer.kCache, 0, 2)
-            enc.set(layer.vCache, 0, 3)
-            if let qn = layer.qNorm, let kn = layer.kNorm {
-                enc.set(qn.weight, 4); enc.set(kn.weight, 5)
+            enc.set(ropeFreqs[li], 0, 1)
+            enc.set(kv.kCache!, 0, 2)
+            enc.set(kv.vCache!, 0, 3)
+            if let qn = layer.qNorm {
+                enc.set(qn.weight, 4); enc.set((layer.kNorm ?? qn).weight, 5)
             } else {
-                enc.set(invFreq, 0, 4); enc.set(invFreq, 0, 5)
+                enc.set(ropeFreqs[li], 0, 4); enc.set(ropeFreqs[li], 0, 5)
             }
             enc.params(QKVPostParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), rowStride: Int32(qkvCols),
                                      offset: Int32(offset), maxSeq: Int32(maxSeq), traditional: c.ropeTraditional ? 1 : 0,
-                                     rotDim: Int32(c.rotaryDim), eps: c.rmsNormEps, hasNorm: layer.qNorm != nil ? 1 : 0), 6)
-            enc.dispatchThreadgroups(MTLSize(width: nH + 2 * nKV, height: T, depth: 1),
+                                     rotDim: Int32(spec.rotDim), eps: c.rmsNormEps, hasNorm: layer.qNorm != nil ? 1 : 0,
+                                     vNorm: c.valueNorm ? 1 : 0, kEqV: spec.kEqV ? 1 : 0), 6)
+            // A KV-shared layer only prepares its queries.
+            enc.dispatchThreadgroups(MTLSize(width: spec.hasOwnKV ? nH + 2 * nKV : nH, height: T, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: D, height: 1, depth: 1))
             }
 
             let attnParams = AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(qkvCols),
-                                        maxSeq: Int32(maxSeq), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor / Float(D).squareRoot(),
-                                        outStride: Int32(nH * D), T: Int32(T))
+                                        maxSeq: Int32(maxSeq), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor * c.queryScale,
+                                        outStride: Int32(nH * D), T: Int32(T), window: Int32(spec.sliding ? c.slidingWindow : 0),
+                                        softcap: c.attnLogitSoftcap)
             if skipAttn {
-            } else if useSplit, let (split, combine) = attnSplitPSO, let partials = attnPartials {
+            } else if decode, offset + 1 >= attnSplitMinContext, let (split, combine) = kernels.split, let partials = attnPartials {
                 // Partials are reused by every layer: the serial encoder orders the dispatches.
                 enc.setComputePipelineState(split)
                 enc.set(qkvBuf, 0, 0)
-                enc.set(layer.kCache, 0, 1)
-                enc.set(layer.vCache, 0, 2)
+                enc.set(kv.kCache!, 0, 1)
+                enc.set(kv.vCache!, 0, 2)
                 enc.set(partials, 0, 3)
                 enc.params(attnParams, 4)
-                enc.dispatchThreadgroups(MTLSize(width: nKV, height: Self.attnSplitVirtualSG / Self.attnSplitSG, depth: 1),
+                enc.dispatchThreadgroups(MTLSize(width: nKV, height: Self.attnSplitVirtualSG / Self.attnSplitSG, depth: kernels.splitGroups),
                                          threadsPerThreadgroup: MTLSize(width: Self.attnSplitSG * 32, height: 1, depth: 1))
                 enc.setComputePipelineState(combine)
                 enc.set(partials, 0, 0)
@@ -640,20 +820,21 @@ public final class Transformer {
                 enc.dispatchThreadgroups(MTLSize(width: nH, height: 1, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             } else {
+                let (attn, attnThreads) = decode ? kernels.decode : kernels.prefill
                 enc.setComputePipelineState(attn)
                 enc.set(qkvBuf, 0, 0)
-                enc.set(layer.kCache, 0, 1)
-                enc.set(layer.vCache, 0, 2)
+                enc.set(kv.kCache!, 0, 1)
+                enc.set(kv.vCache!, 0, 2)
                 enc.set(attnBuf, 0, 3)
                 enc.params(attnParams, 4)
-                enc.dispatchThreadgroups(MTLSize(width: nH, height: decode ? 1 : (T + prefillQB - 1) / prefillQB, depth: 1),
+                enc.dispatchThreadgroups(MTLSize(width: nH, height: decode ? 1 : (T + kernels.prefillQB - 1) / kernels.prefillQB, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: attnThreads, height: 1, depth: 1))
             }
 
             if !skipO { layer.o.encode(enc, x: attnBuf, xStride: nH * D, y: tmp, yStride: H, T: T) }
-            if !skipNorm { layer.postNorm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T) }
+            if !skipNorm { layer.mlpNorm.encodeAdd(enc, h: h, residual: tmp, normedBy: layer.attnOutNorm, y: xn, dim: H, rows: T) }
 
-            // MLP block: [gate|up] → SiLU(gate)·up → down_proj
+            // MLP block: [gate|up] → act(gate)·up → down_proj
             if skipGateUp {
             } else if layer.gateUpFusable && Linear.canFuse(layer.gateUp, T: T) {
                 Linear.encodeFusedDecode(enc, layer.gateUp, x: xn, xStride: H, y: guBuf, yStride: 2 * I, T: T)
@@ -674,19 +855,38 @@ public final class Transformer {
             if !skipDown { layer.down.encode(enc, x: mlpBuf, xStride: I, y: tmp, yStride: H, T: T) }
 
             // Residual add fused with the next norm (next layer's input norm, or the final norm).
-            if skipNorm {
-            } else if li + 1 < layers.count {
-                layers[li + 1].inputNorm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T)
-            } else if computeLogits {
-                norm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T)
+            // The last layer's output only matters for the logits.
+            let isLast = li + 1 == layers.count
+            if skipNorm || (isLast && !computeLogits) { continue }
+            let next = isLast ? norm : layers[li + 1].inputNorm
+            var residualNorm = layer.mlpOutNorm
+            if let ple, let gate = layer.pleGate, let proj = layer.pleProj, let pn = layer.pleNorm, let mon = layer.mlpOutNorm {
+                // Gemma 4 per-layer input: h += norm(mlp); h += norm(proj(gelu(gate(h)) · ple[layer]))
+                mon.encodeAdd(enc, h: h, residual: tmp, normedBy: mon, y: xn, dim: H, rows: T)   // xn is scratch here
+                if decode, gate.qmvGatePSO != nil {
+                    gate.encodeGated(enc, x: h, y: ple.gateBuf, e: ple.inputs, eOffset: li * ple.size * 4, act: 1)
+                } else {
+                    gate.encode(enc, x: h, xStride: H, y: ple.gateBuf, yStride: ple.size, T: T)
+                    enc.setComputePipelineState(ple.gatePSO)
+                    enc.set(ple.inputs, li * ple.size * 4, 1)
+                    enc.set(ple.gateBuf, 0, 0)
+                    enc.params(EWParams(n: 0, stride: Int32(ple.size * layers.count), cols: Int32(ple.size)), 2)
+                    enc.dispatchThreads(MTLSize(width: ple.size, height: T, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: min(256, ple.size), height: 1, depth: 1))
+                }
+                proj.encode(enc, x: ple.gateBuf, xStride: ple.size, y: tmp, yStride: H, T: T)
+                residualNorm = pn
             }
+            next.encodeAdd(enc, h: h, residual: tmp, normedBy: residualNorm, hScale: layer.layerScalar, y: xn, dim: H, rows: T)
         }
 
         if skipLMHead {
         } else if computeLogits && allLogits {
             lmHead.encode(enc, x: xn, xStride: H, y: logitsAll, yStride: lmHead.outDim, T: T)
+            if let softcapPSO { scale(enc, softcapPSO, logitsAll, T * lmHead.outDim, c.finalLogitSoftcap) }
         } else if computeLogits {
             lmHead.encode(enc, x: xn, xOffset: (T - 1) * H * 4, xStride: H, y: logits, yStride: lmHead.outDim, T: 1)
+            if let softcapPSO { scale(enc, softcapPSO, logits, lmHead.outDim, c.finalLogitSoftcap) }
         }
         if var sp = sample {
             sp.V = Int32(min(Int(sp.V), lmHead.outDim))
@@ -703,6 +903,31 @@ public final class Transformer {
         }
         enc.endEncoding()
         return cb
+    }
+
+    /// Gemma 4: per-layer inputs for T tokens into `ple.inputs` ([T][layers][P]):
+    /// (norm(per_layer_model_projection(h) / sqrt(H)) + embed_tokens_per_layer[id] · sqrt(P)) / sqrt(2).
+    /// (The 1/sqrt(H) projection scale is folded into the norm's eps, see `PerLayerInputs.norm`.)
+    private func encodePerLayerInputs(_ enc: MTLComputeCommandEncoder, _ ple: PerLayerInputs, T: Int, offset: Int) {
+        let LP = ple.size * layers.count
+        ple.embed.encodeLookup(enc, pso: ple.embedPSO, ids: hist, idsOffset: offset * 4, out: ple.raw, T: T)
+        ple.modelProj.encode(enc, x: h, xStride: config.hiddenSize, y: ple.inputs, yStride: LP, T: T)
+        ple.norm.encode(enc, x: ple.inputs, y: ple.inputs, dim: ple.size, rows: T * layers.count, headsPerRow: layers.count, rowStride: LP)
+        enc.setComputePipelineState(ple.addPSO)
+        enc.set(ple.inputs, 0, 0)
+        enc.set(ple.raw, 0, 1)
+        enc.params(EWParams(n: Int32(T * LP), stride: 0, cols: 0), 2)
+        enc.params(SIMD2<Float>(Float(ple.size).squareRoot(), Float(0.5).squareRoot()), 3)
+        enc.dispatchThreads(MTLSize(width: T * LP, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    /// `scale_inplace` / `softcap_inplace` over the first n floats of a.
+    private func scale(_ enc: MTLComputeCommandEncoder, _ pso: MTLComputePipelineState, _ a: MTLBuffer, _ n: Int, _ v: Float) {
+        enc.setComputePipelineState(pso)
+        enc.set(a, 0, 0)
+        enc.params(EWParams(n: Int32(n), stride: 0, cols: 0), 1)
+        enc.params(v, 2)
+        enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
     func add(_ enc: MTLComputeCommandEncoder, _ a: MTLBuffer, _ b: MTLBuffer, _ n: Int) {
@@ -734,7 +959,7 @@ extension Transformer {
             let t = time(3) { enc in
                 for l in self.layers {
                     let ps = parts(l)
-                    if ps.count > 1, Linear.fusable(ps) { Linear.encodeFusedDecode(enc, ps, x: x, xStride: ps[0].inDim, y: self.guBuf, yStride: ps.reduce(0) { $0 + $1.outDim }, T: T) }
+                    if ps.count > 1, Linear.fusable(ps), Linear.canFuse(ps, T: T) { Linear.encodeFusedDecode(enc, ps, x: x, xStride: ps[0].inDim, y: self.guBuf, yStride: ps.reduce(0) { $0 + $1.outDim }, T: T) }
                     else { for p in ps { p.encode(enc, x: x, xStride: p.inDim, y: self.guBuf, yStride: p.outDim, T: T) } }
                 }
             }
@@ -749,12 +974,12 @@ extension Transformer {
         let tLM = time(20) { lmHead.encode($0, x: xn, xStride: H, y: logits, yStride: lmHead.outDim, T: 1) }
         out += String(format: "lm_head matvec: %.3f ms  (%.0f GB/s, cache-warm)\n", tLM * 1000, bytes(lmHead) / tLM / 1e9)
         // Decode step breakdown: the step without each kernel class (its cost includes dispatch gaps).
-        func stepTime(_ skip: Set<String>) -> Double {
+        func stepTime(_ skip: Set<String>, T: Int = 1) -> Double {
             profileSkip = skip
             defer { profileSkip = [] }
             var best = Double.infinity
-            for _ in 0..<5 {
-                let cb = try! encode(T: 1, offset: 16, computeLogits: true, allLogits: false)
+            for _ in 0..<(T == 1 ? 5 : 3) {
+                let cb = try! encode(T: T, offset: T == 1 ? 16 : 0, computeLogits: true, allLogits: false)
                 cb.commit(); cb.waitUntilCompleted()
                 best = min(best, cb.gpuEndTime - cb.gpuStartTime)
             }
@@ -766,6 +991,13 @@ extension Transformer {
             out += String(format: " %@ -%.3f", cls as NSString, (full - stepTime([cls])) * 1000)
         }
         out += String(format: "; matvecs only %.3f ms\n", stepTime(["post", "attn", "norm", "silu"]) * 1000)
+        // Prefill step breakdown at 512 tokens (GEMMs, attention and the elementwise kernels).
+        let fullP = stepTime([], T: 512)
+        out += String(format: "prefill step @512: %.1f ms; without", fullP * 1000)
+        for cls in ["qkv", "o", "gateup", "down", "lmhead", "post", "attn", "norm", "silu"] {
+            out += String(format: " %@ -%.1f", cls as NSString, (fullP - stepTime([cls], T: 512)) * 1000)
+        }
+        out += "\n"
         let l0 = layers[0]
         let tAdd = time(500) { enc in self.add(enc, tmp, xn, H) }
         out += String(format: "tiny dependent dispatch: %.1f us\n", tAdd * 1e6)
@@ -823,9 +1055,20 @@ extension Transformer {
 }
 
 extension RMSNorm {
-    /// h += residual; y = norm(h)  — one dispatch.
-    func encodeAdd(_ enc: MTLComputeCommandEncoder, h: MTLBuffer, residual: MTLBuffer, y: MTLBuffer, dim: Int, rows: Int) {
-        enc.setComputePipelineState(addPSO)
+    /// h += residual; y = norm(h)  — one dispatch. With `normedBy` (Gemma 2/3):
+    /// h += normedBy(residual); y = norm(h), also one dispatch.
+    func encodeAdd(_ enc: MTLComputeCommandEncoder, h: MTLBuffer, residual: MTLBuffer, normedBy rn: RMSNorm? = nil,
+                   hScale: Float = 1, y: MTLBuffer, dim: Int, rows: Int) {
+        if let rn {
+            // Same weight dtype for both norms (the kernel is instantiated per dtype).
+            precondition(rn.weight.dtype == weight.dtype, "residual norm dtype")
+            enc.setComputePipelineState(normAddPSO)
+            enc.set(rn.weight, 5)
+            enc.params(hScale, 6)
+        } else {
+            precondition(hScale == 1, "layer scale needs a residual norm")
+            enc.setComputePipelineState(addPSO)
+        }
         enc.set(h, 0, 0)
         enc.set(residual, 0, 1)
         enc.set(y, 0, 2)

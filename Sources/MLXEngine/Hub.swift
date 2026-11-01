@@ -21,13 +21,18 @@ public struct HubModel: Codable, Identifiable, Hashable, Sendable {
     public struct HubConfig: Codable, Hashable, Sendable {
         public let model_type: String?
         public let quantization_config: Quant?
+        public let enable_moe_block: Bool?
+        public let text_config: TextConfig?
+        public struct TextConfig: Codable, Hashable, Sendable { public let enable_moe_block: Bool? }
+        /// Gemma 4 mixture-of-experts exports share the dense models' `model_type`.
+        public var isMoE: Bool { enable_moe_block == true || text_config?.enable_moe_block == true }
         public struct Quant: Codable, Hashable, Sendable { public let bits: Int? }
     }
     public struct HubSafetensors: Codable, Hashable, Sendable { public let total: Int? }
 
     /// Exact architecture from config.json when the listing includes it.
     public var modelType: String? { config?.model_type?.lowercased() ?? modelTypeTag }
-    public var isRunnable: Bool { SupportedArchitectures.isSupported(modelType) }
+    public var isRunnable: Bool { SupportedArchitectures.isSupported(modelType) && config?.isMoE != true }
 
     /// Parameter count, e.g. "7.6B" (for quantized repos this counts packed elements).
     public var parameterLabel: String? {
@@ -77,8 +82,9 @@ public struct HubModelDetails: Sendable {
     public let tags: [String]
     public let license: String?
 
+    public var isMoE: Bool = false
     public var isSupported: Bool {
-        SupportedArchitectures.isSupported(modelType) && files.contains { $0.rfilename == "tokenizer.json" }
+        SupportedArchitectures.isSupported(modelType) && !isMoE && files.contains { $0.rfilename == "tokenizer.json" }
             && files.contains { $0.rfilename.hasSuffix(".safetensors") }
     }
 
@@ -364,7 +370,7 @@ public enum HubClient {
         let config = obj["config"] as? [String: Any]
         let q = config?["quantization_config"] as? [String: Any]
         let card = obj["cardData"] as? [String: Any]
-        return HubModelDetails(
+        var details = HubModelDetails(
             id: id, files: siblings,
             modelType: config?["model_type"] as? String,
             bits: (q?["bits"] as? NSNumber)?.intValue,
@@ -373,6 +379,8 @@ public enum HubClient {
             likes: (obj["likes"] as? NSNumber)?.intValue,
             tags: obj["tags"] as? [String] ?? [],
             license: card?["license"] as? String)
+        details.isMoE = SupportedArchitectures.isMoE(config)
+        return details
     }
 
     public static func readme(_ id: String) async -> String? {

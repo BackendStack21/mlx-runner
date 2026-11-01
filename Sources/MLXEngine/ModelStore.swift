@@ -14,7 +14,9 @@ public struct LocalModel: Identifiable, Hashable, Sendable {
 
     public var name: String { repo.split(separator: "/").last.map(String.init) ?? repo }
     public var author: String { repo.contains("/") ? String(repo.split(separator: "/").first!) : "local" }
-    public var isSupported: Bool { SupportedArchitectures.isSupported(modelType) }
+    public var isSupported: Bool { SupportedArchitectures.isSupported(modelType) && !isMoE }
+    /// A mixture-of-experts variant of a supported type (Gemma 4 26B-A4B).
+    public var isMoE: Bool = false
 }
 
 public enum ModelStore {
@@ -99,9 +101,11 @@ public enum ModelStore {
             let p = dir.appendingPathComponent(f).resolvingSymlinksInPath().path
             size += (try? fm.attributesOfItem(atPath: p)[.size] as? Int) ?? 0
         }
-        return LocalModel(repo: repo, directory: dir, sizeBytes: size,
-                          modelType: (cfg["model_type"] as? String)?.lowercased(),
-                          bits: (q?["bits"] as? NSNumber)?.intValue, source: source)
+        var m = LocalModel(repo: repo, directory: dir, sizeBytes: size,
+                           modelType: (cfg["model_type"] as? String)?.lowercased(),
+                           bits: (q?["bits"] as? NSNumber)?.intValue, source: source)
+        m.isMoE = SupportedArchitectures.isMoE(cfg)
+        return m
     }
 }
 

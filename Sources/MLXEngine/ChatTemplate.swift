@@ -19,7 +19,7 @@ public struct ChatMessage: Codable, Hashable, Sendable {
 /// Prompt formats for the supported model families. The format is detected
 /// from the model's Jinja `chat_template` instead of executing it.
 public enum ChatFormat: String, Sendable {
-    case chatML, llama3, mistral, phi3, plain
+    case chatML, llama3, mistral, phi3, gemma, gemma4, plain
 
     public static func detect(template: String?, modelType: String) -> ChatFormat {
         let t = template ?? ""
@@ -27,10 +27,14 @@ public enum ChatFormat: String, Sendable {
         if t.contains("<|start_header_id|>") { return .llama3 }
         if t.contains("[INST]") { return .mistral }
         if t.contains("<|user|>") && t.contains("<|end|>") { return .phi3 }
+        if t.contains("<start_of_turn>") { return .gemma }
+        if t.contains("<|turn>") { return .gemma4 }
         switch modelType {
         case "qwen2", "qwen3": return .chatML
         case "mistral": return .mistral
         case "phi3": return .phi3
+        case "gemma", "gemma2", "gemma3", "gemma3_text": return .gemma
+        case "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text": return .gemma4
         case "llama": return t.isEmpty ? .plain : .llama3
         default: return .chatML
         }
@@ -52,22 +56,28 @@ public struct ChatTemplate: Sendable {
     /// Qwen2.5's template prints its tool-call example with doubled braces (`{{"name": …}}`, a
     /// Jinja quirk the model was trained with); Qwen3's prints single braces.
     let hermesDoubleBraces: Bool
+    /// Gemma 4 templates that close an empty thought channel after the model turn opener when
+    /// thinking is off (the 12B), so the model answers directly.
+    let emptyThoughtPrefill: Bool
 
     /// `toolTemplate`: a separate tool-use template, when the model ships one (checked for tool support).
     public init(template: String?, modelType: String, bosToken: String?, toolTemplate: String? = nil) {
         format = ChatFormat.detect(template: template, modelType: modelType)
-        supportsThinkingToggle = template?.contains("enable_thinking") ?? false
+        // Gemma 4's thinking (`<|think|>`, `<|channel>thought…<channel|>`) is not wired up: it runs
+        // with thinking off, its template's default.
+        supportsThinkingToggle = format != .gemma4 && (template?.contains("enable_thinking") ?? false)
         bos = bosToken ?? ""
         let qwen = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
         defaultSystem = format == .chatML && (template?.contains(qwen) ?? false) ? qwen : nil
         llamaDatePreamble = format == .llama3 && (template?.contains("Cutting Knowledge Date") ?? false)
         let t = (template ?? "") + (toolTemplate ?? "")
         hermesDoubleBraces = t.contains("{{\\\"name\\\": <function-name>")
+        emptyThoughtPrefill = format == .gemma4 && (template ?? "").contains("'<|channel>thought\\n<channel|>'")
         switch format {
         case .chatML: supportsTools = t.contains("<tool_call>")
         case .llama3: supportsTools = llamaDatePreamble && t.contains("ipython")
         case .mistral: supportsTools = t.contains("[AVAILABLE_TOOLS]")
-        case .phi3, .plain: supportsTools = false
+        case .phi3, .gemma, .gemma4, .plain: supportsTools = false
         }
     }
 
@@ -228,6 +238,39 @@ public struct ChatTemplate: Sendable {
                 lit("<|\(m.role.rawValue)|>\n"); content(m.content); lit("<|end|>\n")
             }
             lit("<|assistant|>\n")
+        case .gemma:
+            // Gemma's templates fold a system prompt into the first turn, call the assistant
+            // "model" and trim message content. There is no tool role: results go in as user turns.
+            lit(bos.isEmpty ? "<bos>" : bos)
+            var rest = messages[...]
+            var prefix: String?
+            if rest.first?.role == .system { prefix = rest.removeFirst().content + "\n\n" }
+            for m in rest {
+                let role = m.role == .assistant ? "model" : "user"
+                lit("<start_of_turn>\(role)\n")
+                if let p = prefix { content(p); prefix = nil }
+                content(m.content.trimmingCharacters(in: .whitespacesAndNewlines)); lit("<end_of_turn>\n")
+            }
+            if let p = prefix { lit("<start_of_turn>user\n"); content(p); lit("<end_of_turn>\n") }
+            lit("<start_of_turn>model\n")
+        case .gemma4:
+            // `<|turn>role … <turn|>`; a system prompt gets its own (trimmed) turn; consecutive
+            // assistant messages share one model turn. No tools: results go in as user turns.
+            lit(bos.isEmpty ? "<bos>" : bos)
+            var rest = messages[...]
+            if rest.first?.role == .system {
+                lit("<|turn>system\n"); content(rest.removeFirst().content.trimmingCharacters(in: .whitespacesAndNewlines)); lit("<turn|>\n")
+            }
+            let list = Array(rest)
+            for (i, m) in list.enumerated() {
+                let model = m.role == .assistant
+                let role = model ? "model" : m.role == .system ? "system" : "user"
+                if !(model && i > 0 && list[i - 1].role == .assistant) { lit("<|turn>\(role)\n") }
+                content(m.content.trimmingCharacters(in: .whitespacesAndNewlines))
+                if !(model && i + 1 < list.count && list[i + 1].role == .assistant) { lit("<turn|>\n") }
+            }
+            lit("<|turn>model\n")
+            if emptyThoughtPrefill { lit("<|channel>thought\n<channel|>") }
         case .plain:
             lit(bos)
             for m in messages {
@@ -252,6 +295,8 @@ public struct ChatTemplate: Sendable {
         case .llama3: return ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"]
         case .mistral: return ["</s>"]
         case .phi3: return ["<|end|>", "<|endoftext|>"]
+        case .gemma: return ["<end_of_turn>", "<eos>"]
+        case .gemma4: return ["<turn|>", "<eos>"]
         case .plain: return []
         }
     }

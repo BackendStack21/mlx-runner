@@ -400,7 +400,7 @@ public enum ToolCallParser {
         switch format {
         case .llama3: return ["<|python_tag|>"]
         case .mistral: return ["[TOOL_CALLS]"]
-        case .chatML, .phi3, .plain: return []
+        case .chatML, .phi3, .gemma, .gemma4, .plain: return []
         }
     }
 
@@ -410,7 +410,7 @@ public enum ToolCallParser {
         case .chatML: return "<tool_call>"
         case .mistral: return "[TOOL_CALLS]"
         case .llama3: return "<|python_tag|>"
-        case .phi3, .plain: return nil
+        case .phi3, .gemma, .gemma4, .plain: return nil
         }
     }
 
@@ -469,7 +469,7 @@ public enum ToolCallParser {
             for item in items { guard add(item, argsKeys: ["arguments", "parameters"]) else { return nil } }
             guard !calls.isEmpty else { return nil }
             return Result(content: rest.trimmingCharacters(in: .whitespacesAndNewlines), calls: calls)
-        case .phi3, .plain:
+        case .phi3, .gemma, .gemma4, .plain:
             return nil
         }
     }

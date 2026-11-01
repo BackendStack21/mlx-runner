@@ -32,11 +32,11 @@ public enum EngineError: LocalizedError {
 // Parameter blocks mirrored in Kernels.swift.
 struct MMParams {
     var K: Int32; var O: Int32; var T: Int32; var gs: Int32; var xStride: Int32; var yStride: Int32
-    var o1: Int32 = 0; var o2: Int32 = 0; var hasBias: Int32 = 0; var pad: Int32 = 0
+    var o1: Int32 = 0; var o2: Int32 = 0; var hasBias: Int32 = 0; var act: Int32 = 0
 }
-struct QKVPostParams { var D: Int32; var nH: Int32; var nKV: Int32; var rowStride: Int32; var offset: Int32; var maxSeq: Int32; var traditional: Int32; var rotDim: Int32; var eps: Float; var hasNorm: Int32 }
+struct QKVPostParams { var D: Int32; var nH: Int32; var nKV: Int32; var rowStride: Int32; var offset: Int32; var maxSeq: Int32; var traditional: Int32; var rotDim: Int32; var eps: Float; var hasNorm: Int32; var vNorm: Int32 = 0; var kEqV: Int32 = 0 }
 struct NormParams { var dim: Int32; var headsPerRow: Int32; var rowStride: Int32; var eps: Float }
-struct AttnParams { var D: Int32; var nH: Int32; var nKV: Int32; var qStride: Int32; var maxSeq: Int32; var offset: Int32; var scale: Float; var outStride: Int32; var T: Int32 = 1 }
+struct AttnParams { var D: Int32; var nH: Int32; var nKV: Int32; var qStride: Int32; var maxSeq: Int32; var offset: Int32; var scale: Float; var outStride: Int32; var T: Int32 = 1; var window: Int32 = 0; var softcap: Float = 0 }
 struct EWParams { var n: Int32; var stride: Int32; var cols: Int32; var pad: Int32 = 0 }
 /// GPU token selection (`sample_token`); `V` is the number of logits considered, `pos` the
 /// position of the token whose logits these are (the result goes to hist[pos + 1]).
@@ -139,6 +139,35 @@ public struct Tensor {
     let shape: [Int]
     var count: Int { shape.reduce(1, *) }
     var nbytes: Int { count * dtype.size }
+
+    /// The elements as Float (small tensors such as norm weights; floating dtypes only).
+    func floats() throws -> [Float] {
+        guard offset >= 0, nbytes <= buffer.length - offset else { throw EngineError.invalidFile("tensor outside its file") }
+        let p = buffer.contents() + offset
+        switch dtype {
+        case .f32: return (0..<count).map { p.loadUnaligned(fromByteOffset: $0 * 4, as: Float.self) }
+        case .f16: return (0..<count).map { Self.halfToFloat(p.loadUnaligned(fromByteOffset: $0 * 2, as: UInt16.self)) }
+        case .bf16: return (0..<count).map { Float(bitPattern: UInt32(p.loadUnaligned(fromByteOffset: $0 * 2, as: UInt16.self)) << 16) }
+        default: throw EngineError.unsupported("\(dtype) weights where floats are expected")
+        }
+    }
+
+    /// IEEE half → float from the raw bits (`Float16` itself is unavailable on x86_64 macOS,
+    /// which CodeQL's build targets).
+    static func halfToFloat(_ h: UInt16) -> Float {
+        let sign = UInt32(h & 0x8000) << 16
+        let exp = Int((h >> 10) & 0x1F)
+        let frac = UInt32(h & 0x3FF)
+        if exp == 0 {
+            if frac == 0 { return Float(bitPattern: sign) }
+            // Subnormal: normalise.
+            var e = 127 - 15 + 1, f = frac
+            while f & 0x400 == 0 { f <<= 1; e -= 1 }
+            return Float(bitPattern: sign | (UInt32(e) << 23) | ((f & 0x3FF) << 13))
+        }
+        if exp == 31 { return Float(bitPattern: sign | 0x7F80_0000 | (frac << 13)) }
+        return Float(bitPattern: sign | (UInt32(exp + 127 - 15) << 23) | (frac << 13))
+    }
 }
 
 extension MTLComputeCommandEncoder {
@@ -239,27 +268,52 @@ final class SafeTensorFile {
 final class WeightStore {
     private var files: [SafeTensorFile] = []
     private var index: [String: Int] = [:]
+    /// Engine name → name in the file, for multimodal exports that nest the language model
+    /// (`language_model.model.*`, `model.language_model.*`).
+    private var alias: [String: String] = [:]
+
+    /// The shards holding the model: those `model.safetensors.index.json` maps weights to, or
+    /// every .safetensors file when there is no index. Keeps unrelated sidecars (Gemma 4 OptiQ
+    /// exports ship a 1 GB `optiq_vision.safetensors`) out of memory and the load budget.
+    static func shardFiles(in directory: URL) throws -> [String] {
+        let fm = FileManager.default
+        let all = try fm.contentsOfDirectory(atPath: directory.path).filter { $0.hasSuffix(".safetensors") }.sorted()
+        if let data = try? Data(contentsOf: directory.appendingPathComponent("model.safetensors.index.json")),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let map = obj["weight_map"] as? [String: String] {
+            let referenced = Set(map.values)
+            let listed = all.filter { referenced.contains($0) }
+            if !listed.isEmpty { return listed }
+        }
+        return all
+    }
 
     init(directory: URL, device: MTLDevice) throws {
-        let fm = FileManager.default
-        let names = try fm.contentsOfDirectory(atPath: directory.path)
-            .filter { $0.hasSuffix(".safetensors") }
-            .sorted()
+        let names = try Self.shardFiles(in: directory)
         guard !names.isEmpty else { throw EngineError.invalidFile("no .safetensors files in \(directory.lastPathComponent)") }
         for (i, n) in names.enumerated() {
             let f = try SafeTensorFile(url: directory.appendingPathComponent(n), device: device)
             files.append(f)
             for k in f.infos.keys { index[k] = i }
         }
+        if index["model.embed_tokens.weight"] == nil {
+            for (from, to) in [("language_model.model.", "model."), ("language_model.lm_head.", "lm_head."), ("model.language_model.", "model.")] {
+                for k in index.keys where k.hasPrefix(from) {
+                    let name = to + k.dropFirst(from.count)
+                    if index[name] == nil, alias[name] == nil { alias[name] = k }
+                }
+            }
+        }
     }
 
     var names: Dictionary<String, Int>.Keys { index.keys }
 
-    func has(_ name: String) -> Bool { index[name] != nil }
+    func has(_ name: String) -> Bool { index[alias[name] ?? name] != nil }
 
     func get(_ name: String) -> Tensor? {
-        guard let i = index[name] else { return nil }
-        return files[i].tensor(name)
+        let n = alias[name] ?? name
+        guard let i = index[n] else { return nil }
+        return files[i].tensor(n)
     }
 
     func require(_ name: String) throws -> Tensor {

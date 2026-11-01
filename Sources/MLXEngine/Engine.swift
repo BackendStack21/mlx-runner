@@ -454,7 +454,7 @@ public final class InferenceEngine: @unchecked Sendable {
             stats.generatedTokens += 1
             var text = decoder.append(tok.bytes(for: t, includeSpecial: reveal.contains(t)))
             // SentencePiece models start the reply with a word-boundary space.
-            if atStart, tok.mode == .sentencePiece { text = String(text.drop(while: { $0 == " " })) }
+            if atStart, tok.stripsLeadingSpace { text = String(text.drop(while: { $0 == " " })) }
             if !text.isEmpty { atStart = false; emit(.text(text)) }
             history.append(t)
             if nameOpen, let texts {
@@ -585,13 +585,13 @@ extension InferenceEngine {
     static func checkMemory(directory: URL, contextLength: Int) throws {
         let fm = FileManager.default
         var weights = 0
-        for f in (try? fm.contentsOfDirectory(atPath: directory.path)) ?? [] where f.hasSuffix(".safetensors") {
+        for f in (try? WeightStore.shardFiles(in: directory)) ?? [] {
             let p = directory.appendingPathComponent(f).resolvingSymlinksInPath().path
             weights += (try? fm.attributesOfItem(atPath: p)[.size] as? Int) ?? 0
         }
         let cfg = try ModelConfig(directory: directory)
         let ctx = min(contextLength, max(cfg.maxPositionEmbeddings, 256))
-        let kv = cfg.numLayers * 2 * cfg.numKVHeads * cfg.headDim * 2 * ctx
+        let kv = cfg.kvBytesPerToken * ctx
         let need = UInt64(weights + kv)
         let budget = GPU.shared.device.recommendedMaxWorkingSetSize
         guard need < budget else {
