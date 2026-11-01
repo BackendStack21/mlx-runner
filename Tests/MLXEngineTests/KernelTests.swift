@@ -326,3 +326,103 @@ struct SampleKernelTests {
         #expect(r2.tokens.filter { $0 == 1 }.count > 100)
     }
 }
+
+/// Attention kernels (decode, split decode, prefill and flash prefill) against a CPU reference,
+/// including Gemma's sliding window and attention-score soft-capping.
+@Suite("Attention kernels")
+struct AttentionKernelTests {
+    struct Case { let D: Int; let window: Int; let softcap: Float }
+    static let cases: [Case] = [
+        Case(D: 128, window: 0, softcap: 0), Case(D: 128, window: 20, softcap: 0), Case(D: 128, window: 20, softcap: 5),
+        Case(D: 256, window: 0, softcap: 0), Case(D: 256, window: 9, softcap: 5),
+        Case(D: 512, window: 0, softcap: 0), Case(D: 512, window: 9, softcap: 0),
+    ]
+
+    /// CPU attention for queries at positions offset..<offset+T over cache rows 0...pos.
+    func reference(q: [Float], k: [Float], v: [Float], D: Int, nH: Int, nKV: Int, maxSeq: Int,
+                   offset: Int, T: Int, scale: Float, window: Int, softcap: Float) -> [Float] {
+        var out = [Float](repeating: 0, count: T * nH * D)
+        for t in 0..<T {
+            let pos = offset + t
+            let first = window > 0 ? max(0, pos - window + 1) : 0
+            for h in 0..<nH {
+                let kvh = h / (nH / nKV)
+                var s = [Float]()
+                for j in first...pos {
+                    var d: Float = 0
+                    for e in 0..<D { d += q[t * nH * D + h * D + e] * scale * k[(kvh * maxSeq + j) * D + e] }
+                    s.append(softcap > 0 ? tanh(d / softcap) * softcap : d)
+                }
+                let m = s.max()!
+                let p = s.map { exp($0 - m) }
+                let z = p.reduce(0, +)
+                for e in 0..<D {
+                    var acc: Float = 0
+                    for (i, j) in (first...pos).enumerated() { acc += p[i] * v[(kvh * maxSeq + j) * D + e] }
+                    out[t * nH * D + h * D + e] = acc / z
+                }
+            }
+        }
+        return out
+    }
+
+    @Test(arguments: cases)
+    func kernelsMatchReference(c: Case) throws {
+        let D = c.D, nH = 4, nKV = 2, maxSeq = 128, e = D / 32
+        let cap = c.softcap > 0 ? "_cap" : ""
+        var rng = RNG(s: UInt64(D * 31 + c.window))
+        let kh = (0..<(nKV * maxSeq * D)).map { _ in Float16(rng.float()) }
+        let vh = (0..<(nKV * maxSeq * D)).map { _ in Float16(rng.float()) }
+        let kBuf = makeBuffer(kh), vBuf = makeBuffer(vh)
+        let k = kh.map { Float($0) }, v = vh.map { Float($0) }
+        let scale = 1 / Float(D).squareRoot() * 3   // sharpen so the window and cap matter
+        func run(_ name: String, threads: Int, grid: (Int, Int), T: Int, offset: Int, q: [Float]) throws -> [Float] {
+            let pso = try GPU.shared.pipeline(name)
+            let out = try GPU.shared.buffer(T * nH * D * 4)
+            let p = AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(nH * D), maxSeq: Int32(maxSeq),
+                               offset: Int32(offset), scale: scale, outStride: Int32(nH * D), T: Int32(T),
+                               window: Int32(c.window), softcap: c.softcap)
+            runGPU { enc in
+                enc.setComputePipelineState(pso)
+                enc.set(makeBuffer(q), 0, 0); enc.set(kBuf, 0, 1); enc.set(vBuf, 0, 2); enc.set(out, 0, 3)
+                enc.params(p, 4)
+                enc.dispatchThreadgroups(MTLSize(width: grid.0, height: grid.1, depth: 1), threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
+            }
+            return readFloats(out, T * nH * D)
+        }
+        // Decode at a long position (window active).
+        let offset = 100
+        let q1 = (0..<(nH * D)).map { _ in rng.float() }
+        let ref1 = reference(q: q1, k: k, v: v, D: D, nH: nH, nKV: nKV, maxSeq: maxSeq, offset: offset, T: 1, scale: scale, window: c.window, softcap: c.softcap)
+        let sg = e >= 16 ? 8 : e >= 8 ? 16 : 32
+        assertClose(try run("attention_\(e)_\(sg)\(cap)", threads: sg * 32, grid: (nH, 1), T: 1, offset: offset, q: q1), ref1, "decode D=\(D)")
+        if (2...4).contains(e) {
+            // Split decode: attention_split + attention_combine.
+            let V = Transformer.attnSplitVirtualSG, NSG = Transformer.attnSplitSG
+            let part = try GPU.shared.buffer(nH * V * (D + 2) * 4)
+            let out = try GPU.shared.buffer(nH * D * 4)
+            let p = AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(nH * D), maxSeq: Int32(maxSeq),
+                               offset: Int32(offset), scale: scale, outStride: Int32(nH * D), T: 1, window: Int32(c.window), softcap: c.softcap)
+            let split = try GPU.shared.pipeline("attention_split_\(e)_\(nH / nKV)\(cap)"), combine = try GPU.shared.pipeline("attention_combine_\(e)")
+            runGPU { enc in
+                enc.setComputePipelineState(split)
+                enc.set(makeBuffer(q1), 0, 0); enc.set(kBuf, 0, 1); enc.set(vBuf, 0, 2); enc.set(part, 0, 3); enc.params(p, 4)
+                enc.dispatchThreadgroups(MTLSize(width: nKV, height: V / NSG, depth: 1), threadsPerThreadgroup: MTLSize(width: NSG * 32, height: 1, depth: 1))
+                enc.setComputePipelineState(combine)
+                enc.set(part, 0, 0); enc.set(out, 0, 1); enc.params(p, 2)
+                enc.dispatchThreadgroups(MTLSize(width: nH, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+            assertClose(readFloats(out, nH * D), ref1, "split decode D=\(D)")
+        }
+        // Prefill: 45 queries after 10 cached positions.
+        let T = 45, off = 10
+        let qT = (0..<(64 * nH * D)).map { _ in rng.float() }   // whole 32-row tiles (flash_prefill loads them)
+        let refT = reference(q: qT, k: k, v: v, D: D, nH: nH, nKV: nKV, maxSeq: maxSeq, offset: off, T: T, scale: scale, window: c.window, softcap: c.softcap)
+        let qb = e >= 16 ? 2 : e > 4 ? 4 : 8
+        // (Head size 128 prefills with flash_prefill: there is no soft-capped attention_prefill_4.)
+        if cap.isEmpty || D > 128 { assertClose(try run("attention_prefill_\(e)\(cap)", threads: 256, grid: (nH, (T + qb - 1) / qb), T: T, offset: off, q: qT), refT, "prefill D=\(D)") }
+        if D <= 128 {
+            assertClose(try run("flash_prefill_\(D / 8)\(cap)", threads: 128, grid: (nH, (T + 31) / 32), T: T, offset: off, q: qT), refT, "flash prefill D=\(D)")
+        }
+    }
+}

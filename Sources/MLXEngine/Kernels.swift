@@ -11,7 +11,13 @@ using namespace metal;
 // ---------------------------------------------------------------------------
 struct MMParams   { int K; int O; int T; int gs; int xStride; int yStride; int o1; int o2; int hasBias; int pad; };
 struct NormParams { int dim; int headsPerRow; int rowStride; float eps; };
-struct AttnParams { int D; int nH; int nKV; int qStride; int maxSeq; int offset; float scale; int outStride; int T; };
+struct AttnParams { int D; int nH; int nKV; int qStride; int maxSeq; int offset; float scale; int outStride; int T; int window; float softcap; };
+// Sliding window (window > 0): the query at position i sees keys i - window < j <= i.
+inline int attn_first_key(constant AttnParams& p, int pos) { return p.window > 0 ? max(0, pos - p.window + 1) : 0; }
+// Gemma 2 attention-score soft-capping: s = tanh(s / cap) * cap. A template parameter of the
+// attention kernels (`_cap` instantiations) so the other models' inner loops do not carry it.
+template <bool CAP>
+inline float attn_cap(float s, float cap) { return CAP ? precise::tanh(s / cap) * cap : s; }
 struct EWParams   { int n; int stride; int cols; int pad; };
 
 #define QROWS 4
@@ -610,8 +616,11 @@ kernel void rms_norm(device const float* x [[buffer(0)]],
 // Fused post-projection step, one threadgroup (D threads) per (head, token):
 //   q heads: optional per-head RMSNorm, RoPE, written back in place
 //   k heads: optional per-head RMSNorm, RoPE, appended to the K cache
-//   v heads: appended to the V cache
-struct QKVPostParams { int D; int nH; int nKV; int rowStride; int offset; int maxSeq; int traditional; int rotDim; float eps; int hasNorm; };
+//   v heads: optional weightless RMSNorm (Gemma 4), appended to the V cache; with kEqV they
+//            read the raw k head (Gemma 4 global layers without v_proj)
+// D <= 1024 (checked on the host). Dispatch only the nH q heads for a layer that reuses
+// another layer's KV cache.
+struct QKVPostParams { int D; int nH; int nKV; int rowStride; int offset; int maxSeq; int traditional; int rotDim; float eps; int hasNorm; int vNorm; int kEqV; };
 
 template <typename T>
 kernel void qkv_post(device float*       qkv     [[buffer(0)]],
@@ -629,14 +638,23 @@ kernel void qkv_post(device float*       qkv     [[buffer(0)]],
     const int h = int(tg.x), t = int(tg.y), i = int(tid);
     device float* base = qkv + t * p.rowStride + h * p.D;
     const int pos = p.offset + t;
-    float v = base[i];
-    if (h >= p.nH + p.nKV) {
+    const bool isV = h >= p.nH + p.nKV;
+    float v = (isV && p.kEqV) ? base[i - p.nKV * p.D] : base[i];
+    threadgroup float buf[1024];
+    threadgroup float red[32];
+    if (isV) {
+        if (p.vNorm) {   // uniform per threadgroup
+            float ss = simd_sum(v * v);
+            if (lane == 0) red[sgid] = ss;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float tot = 0;
+            for (uint s = 0; s < nsg; s++) tot += red[s];
+            v *= rsqrt(tot / float(p.D) + p.eps);
+        }
         vc[(ulong(h - p.nH - p.nKV) * ulong(p.maxSeq) + ulong(pos)) * ulong(p.D) + i] = half(v);
         return;
     }
     const bool isQ = h < p.nH;
-    threadgroup float buf[256];
-    threadgroup float red[8];
     if (p.hasNorm) {
         float ss = simd_sum(v * v);
         if (lane == 0) red[sgid] = ss;
@@ -698,6 +716,55 @@ kernel void add_rms_norm(device float*       hbuf [[buffer(0)]],
     }
 }
 
+// h = (h + RMSNorm(r) * wr) * hScale; y = RMSNorm(h) * w   (Gemma 2/3/4: the block output is
+// normalized before the residual add, fused with the next norm; hScale is Gemma 4's layer_scalar)
+template <typename T>
+kernel void norm_add_rms_norm(device float*       hbuf [[buffer(0)]],
+                              device const float* r    [[buffer(1)]],
+                              device float*       y    [[buffer(2)]],
+                              device const T*     w    [[buffer(3)]],
+                              constant NormParams& p   [[buffer(4)]],
+                              device const T*     wr   [[buffer(5)]],
+                              constant float&     hScale [[buffer(6)]],
+                              uint row  [[threadgroup_position_in_grid]],
+                              uint tid  [[thread_index_in_threadgroup]],
+                              uint tsz  [[threads_per_threadgroup]],
+                              uint sgid [[simdgroup_index_in_threadgroup]],
+                              uint nsg  [[simdgroups_per_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    device float* hr = hbuf + row * p.rowStride;
+    device const float* rr = r + row * p.rowStride;
+    device float* yr = y + row * p.rowStride;
+    const int n4 = p.dim / 4;   // dim is a multiple of 4 and the rows are 16-byte aligned (checked on the host)
+    threadgroup float buf[2][32];
+    float ss = 0.0f;
+    for (int i = int(tid); i < n4; i += int(tsz)) { const float4 v = ((device const float4*)rr)[i]; ss += dot(v, v); }
+    ss = simd_sum(ss);
+    if (lane == 0) buf[0][sgid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0;
+    for (uint s = 0; s < nsg; s++) tot += buf[0][s];
+    const float invR = rsqrt(tot / float(p.dim) + p.eps);
+    ss = 0.0f;
+    for (int i = int(tid); i < n4; i += int(tsz)) {
+        const float4 ww = float4(float(wr[4 * i]), float(wr[4 * i + 1]), float(wr[4 * i + 2]), float(wr[4 * i + 3]));
+        const float4 v = (((device const float4*)hr)[i] + ((device const float4*)rr)[i] * invR * ww) * hScale;
+        ((device float4*)hr)[i] = v;
+        ss += dot(v, v);
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) buf[1][sgid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    tot = 0;
+    for (uint s = 0; s < nsg; s++) tot += buf[1][s];
+    const float inv = rsqrt(tot / float(p.dim) + p.eps);
+    for (int i = int(tid); i < n4; i += int(tsz)) {
+        const float4 v = ((device const float4*)hr)[i];
+        const float4 ww = float4(float(w[4 * i]), float(w[4 * i + 1]), float(w[4 * i + 2]), float(w[4 * i + 3]));
+        ((device float4*)yr)[i] = v * inv * ww;
+    }
+}
+
 // Causal attention over the KV cache with grouped-query heads.
 // One threadgroup per (head, query token); ANSG simdgroups split the keys
 // (simdgroup s takes keys s, s+ANSG, ...) and keep an online softmax, then
@@ -707,12 +774,12 @@ kernel void add_rms_norm(device float*       hbuf [[buffer(0)]],
 #define AU 1
 
 // One online-softmax step for one key: k/v are this lane's E elements.
-template <int E>
+template <int E, bool CAP>
 inline void attn_update(thread const float* qr, thread float* acc, thread float& m, thread float& l,
-                        thread const half* k, thread const half* v) {
+                        thread const half* k, thread const half* v, float cap) {
     float s = 0.0f;
     for (int e = 0; e < E; e++) s += qr[e] * float(k[e]);
-    s = simd_sum(s);
+    s = attn_cap<CAP>(simd_sum(s), cap);
     const float mn = max(m, s);
     const float cr = exp(m - mn), pe = exp(s - mn);
     l = l * cr + pe;
@@ -737,7 +804,7 @@ inline void attn_merge(P tm, P tl, P ta, uint lane, device float* op) {
     for (int e = 0; e < E; e++) op[e * 32 + lane] = o[e] * inv;
 }
 
-template <int E, int ANSG>
+template <int E, int ANSG, bool CAP>
 kernel void attention(device const float* qkv [[buffer(0)]],
                       device const half*  kc  [[buffer(1)]],
                       device const half*  vc  [[buffer(2)]],
@@ -755,7 +822,7 @@ kernel void attention(device const float* qkv [[buffer(0)]],
     const int L = p.offset + t + 1;
     device const half* kb = kc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
     device const half* vb = vc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
-    for (int j0 = int(sg); j0 < L; j0 += ANSG * AU) {
+    for (int j0 = attn_first_key(p, L - 1) + int(sg); j0 < L; j0 += ANSG * AU) {
         half kh[AU][E], vh[AU][E];
         for (int u = 0; u < AU; u++) {
             const int j = min(j0 + u * ANSG, L - 1);   // clamped: rows past L are loaded but unused
@@ -764,7 +831,7 @@ kernel void attention(device const float* qkv [[buffer(0)]],
             for (int e = 0; e < E; e++) { kh[u][e] = kp[e * 32 + lane]; vh[u][e] = vp[e * 32 + lane]; }
         }
         for (int u = 0; u < AU; u++)
-            if (j0 + u * ANSG < L) attn_update<E>(qr, acc, m, l, kh[u], vh[u]);
+            if (j0 + u * ANSG < L) attn_update<E, CAP>(qr, acc, m, l, kh[u], vh[u], p.softcap);
     }
     threadgroup float tm[ANSG], tl[ANSG];
     threadgroup float ta[ANSG * E * 32];
@@ -784,7 +851,7 @@ kernel void attention(device const float* qkv [[buffer(0)]],
 // Partials layout (floats): pm[nH*V] | pl[nH*V] | pa[nH*V*D], row = h*V + v.
 #define ASPLIT_V 32
 #define ASPLIT_NSG 4
-template <int E, int G>
+template <int E, int G, bool CAP>
 kernel void attention_split(device const float* qkv  [[buffer(0)]],
                             device const half*  kc   [[buffer(1)]],
                             device const half*  vc   [[buffer(2)]],
@@ -805,7 +872,7 @@ kernel void attention_split(device const float* qkv  [[buffer(0)]],
     const int L = p.offset + 1;
     device const half* kb = kc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
     device const half* vb = vc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
-    for (int j0 = v; j0 < L; j0 += ASPLIT_V * AU) {
+    for (int j0 = attn_first_key(p, L - 1) + v; j0 < L; j0 += ASPLIT_V * AU) {
         half kh[AU][E], vh[AU][E];
         for (int u = 0; u < AU; u++) {
             const int j = min(j0 + u * ASPLIT_V, L - 1);
@@ -815,7 +882,7 @@ kernel void attention_split(device const float* qkv  [[buffer(0)]],
         }
         for (int u = 0; u < AU; u++)
             if (j0 + u * ASPLIT_V < L)
-                for (int g = 0; g < G; g++) attn_update<E>(qr[g], acc[g], m[g], l[g], kh[u], vh[u]);
+                for (int g = 0; g < G; g++) attn_update<E, CAP>(qr[g], acc[g], m[g], l[g], kh[u], vh[u], p.softcap);
     }
     // Virtual simdgroups with no keys still write (-1e30, 0, 0), exactly like the fused kernel.
     const int rows = p.nH * ASPLIT_V;
@@ -843,7 +910,7 @@ kernel void attention_combine(device const float* part [[buffer(0)]],
 // Prefill attention: one threadgroup per (head, block of QB queries). Each K/V
 // row is loaded once and scored against all QB queries; 8 simdgroups split the
 // keys with per-query online softmax, merged through threadgroup memory.
-template <int E, int QB>
+template <int E, int QB, bool CAP>
 kernel void attention_prefill(device const float* qkv [[buffer(0)]],
                               device const half*  kc  [[buffer(1)]],
                               device const half*  vc  [[buffer(2)]],
@@ -866,16 +933,18 @@ kernel void attention_prefill(device const float* qkv [[buffer(0)]],
     const int L = p.offset + t0 + nq;
     device const half* kb = kc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
     device const half* vb = vc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
-    for (int j = int(sg); j < L; j += NSG) {
+    const int jlo = attn_first_key(p, p.offset + t0);   // the first query's first key
+    for (int j = jlo + int(sg); j < L; j += NSG) {
         float kv[E], vv[E];
         device const half* kp = kb + ulong(j) * ulong(p.D);
         device const half* vp = vb + ulong(j) * ulong(p.D);
         for (int e = 0; e < E; e++) { kv[e] = float(kp[e * 32 + lane]); vv[e] = float(vp[e * 32 + lane]); }
         for (int qi = 0; qi < QB; qi++) {
             if (qi >= nq || j > p.offset + t0 + qi) continue;   // causal mask (uniform per simdgroup)
+            if (j < attn_first_key(p, p.offset + t0 + qi)) continue;   // sliding window
             float s = 0.0f;
             for (int e = 0; e < E; e++) s += qr[qi][e] * kv[e];
-            s = simd_sum(s);
+            s = attn_cap<CAP>(simd_sum(s), p.softcap);
             const float mn = max(m[qi], s);
             const float cr = exp(m[qi] - mn), pe = exp(s - mn);
             l[qi] = l[qi] * cr + pe;
@@ -915,7 +984,7 @@ kernel void attention_prefill(device const float* qkv [[buffer(0)]],
 // Threadgroup = (head, 32 queries); 4 simdgroups × 8 query rows; key blocks of 16.
 // S = Q·Kᵀ and O += P·V use 8×8 MMA; the online-softmax rescale of O is a
 // multiply by a diagonal matrix. DD = head_dim / 8.
-template <int DD>
+template <int DD, bool CAP>
 kernel void flash_prefill(device const float* qkv [[buffer(0)]],
                           device const half*  kc  [[buffer(1)]],
                           device const half*  vc  [[buffer(2)]],
@@ -954,7 +1023,8 @@ kernel void flash_prefill(device const float* qkv [[buffer(0)]],
     device const half* kb = kc + ulong(kvh) * ulong(p.maxSeq) * ulong(D);
     device const half* vb = vc + ulong(kvh) * ulong(p.maxSeq) * ulong(D);
 
-    for (int j0 = 0; j0 < L; j0 += BK) {
+    const int qFirst = attn_first_key(p, p.offset + t0);       // first key of the block's first query
+    for (int j0 = qFirst / BK * BK; j0 < L; j0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int i = int(tid); i < BK * D; i += 128) {
             const int j = j0 + i / D;
@@ -979,9 +1049,10 @@ kernel void flash_prefill(device const float* qkv [[buffer(0)]],
 
         float s[4];
         float bmax = -1e30f;
+        const int jMin = attn_first_key(p, qAbs);
         for (int c = 0; c < 4; c++) {
             const int j = j0 + c0 + c;
-            s[c] = (rowValid && j <= qAbs && j < L) ? Ssh[sg][r * BK + c0 + c] * p.scale : -1e30f;
+            s[c] = (rowValid && j <= qAbs && j >= jMin && j < L) ? attn_cap<CAP>(Ssh[sg][r * BK + c0 + c] * p.scale, p.softcap) : -1e30f;
             bmax = max(bmax, s[c]);
         }
         bmax = max(bmax, simd_shuffle_xor(bmax, 1));
@@ -1036,6 +1107,75 @@ kernel void silu_mul(device const float* gu  [[buffer(0)]],
     const float g = gu[t * p.stride + i];
     const float u = gu[t * p.stride + p.cols + i];
     out[t * p.cols + i] = (g / (1.0f + exp(-g))) * u;
+}
+
+// out[t, i] = gelu(gu[t, i]) * gu[t, cols + i]   (Gemma's GeGLU; tanh approximation)
+kernel void gelu_tanh_mul(device const float* gu  [[buffer(0)]],
+                          device float*       out [[buffer(1)]],
+                          constant EWParams&  p   [[buffer(2)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    const int i = int(gid.x), t = int(gid.y);
+    if (i >= p.cols) return;
+    const float g = gu[t * p.stride + i];
+    const float u = gu[t * p.stride + p.cols + i];
+    out[t * p.cols + i] = 0.5f * g * (1.0f + precise::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g))) * u;
+}
+
+// erf with |error| < 1.2e-7 (Numerical Recipes erfc, Chebyshev fit); Metal has no erf.
+inline float erf_nr(float x) {
+    const float z = fabs(x), t = 1.0f / (1.0f + 0.5f * z);
+    const float r = t * precise::exp(-z * z - 1.26551223f + t * (1.00002368f + t * (0.37409196f + t * (0.09678418f +
+                    t * (-0.18628806f + t * (0.27886807f + t * (-1.13520398f + t * (1.48851587f +
+                    t * (-0.82215223f + t * 0.17087277f)))))))));
+    return x >= 0.0f ? 1.0f - r : r - 1.0f;
+}
+
+// out[t, i] = gelu(gu[t, i]) * gu[t, cols + i]   (exact GELU, Gemma 1)
+kernel void gelu_mul(device const float* gu  [[buffer(0)]],
+                     device float*       out [[buffer(1)]],
+                     constant EWParams&  p   [[buffer(2)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    const int i = int(gid.x), t = int(gid.y);
+    if (i >= p.cols) return;
+    const float g = gu[t * p.stride + i];
+    const float u = gu[t * p.stride + p.cols + i];
+    out[t * p.cols + i] = 0.5f * g * (1.0f + erf_nr(g * 0.7071067811865476f)) * u;
+}
+
+// a[i] = (a[i] + b[i] * s.x) * s.y   (Gemma 4 per-layer inputs)
+kernel void add_scaled(device float*       a [[buffer(0)]],
+                       device const float* b [[buffer(1)]],
+                       constant EWParams&  p [[buffer(2)]],
+                       constant float2&    s [[buffer(3)]],
+                       uint gid [[thread_position_in_grid]]) {
+    if (int(gid) < p.n) a[gid] = (a[gid] + b[gid] * s.x) * s.y;
+}
+
+// g[t, i] = gelu(g[t, i]) * x[t * stride + i], in place over cols columns (Gemma 4 per-layer input gate)
+kernel void gelu_tanh_gate(device float*       g [[buffer(0)]],
+                           device const float* x [[buffer(1)]],
+                           constant EWParams&  p [[buffer(2)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    const int i = int(gid.x), t = int(gid.y);
+    if (i >= p.cols) return;
+    const float a = g[t * p.cols + i];
+    g[t * p.cols + i] = 0.5f * a * (1.0f + precise::tanh(0.7978845608028654f * (a + 0.044715f * a * a * a))) * x[t * p.stride + i];
+}
+
+// a[i] *= s   (Gemma's embedding scale)
+kernel void scale_inplace(device float*       a [[buffer(0)]],
+                          constant EWParams&  p [[buffer(1)]],
+                          constant float&     s [[buffer(2)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (int(gid) < p.n) a[gid] *= s;
+}
+
+// a[i] = tanh(a[i] / cap) * cap   (final-logit soft-capping)
+kernel void softcap_inplace(device float*       a   [[buffer(0)]],
+                            constant EWParams&  p   [[buffer(1)]],
+                            constant float&     cap [[buffer(2)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (int(gid) < p.n) a[gid] = precise::tanh(a[gid] / cap) * cap;
 }
 
 kernel void add_inplace(device float*       a [[buffer(0)]],
@@ -1302,16 +1442,16 @@ INST_QMVB(half, f16, 4) INST_QMVB(bfloat, bf16, 4) INST_QMVB(float, f32, 4)
   template [[host_name("rms_norm_" #TN)]] kernel void rms_norm<T>(device const float*, device float*, device const T*, constant NormParams&, uint, uint, uint, uint, uint, uint); \
   template [[host_name("qkv_post_" #TN)]] kernel void qkv_post<T>(device float*, device const float*, device half*, device half*, device const T*, device const T*, constant QKVPostParams&, uint2, uint, uint, uint, uint); \
   template [[host_name("add_rms_norm_" #TN)]] kernel void add_rms_norm<T>(device float*, device const float*, device float*, device const T*, constant NormParams&, uint, uint, uint, uint, uint, uint); \
+  template [[host_name("norm_add_rms_norm_" #TN)]] kernel void norm_add_rms_norm<T>(device float*, device const float*, device float*, device const T*, constant NormParams&, device const T*, constant float&, uint, uint, uint, uint, uint, uint); \
   template [[host_name("add_bias_" #TN)]] kernel void add_bias<T>(device float*, device const T*, constant EWParams&, uint2);
 
 INST_DENSE(half, f16)
 INST_DENSE(bfloat, bf16)
 INST_DENSE(float, f32)
 
-#define INST_ATTN(E) \
-  template [[host_name("attention_" #E "_8")]] kernel void attention<E, 8>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint); \
-  template [[host_name("attention_" #E "_16")]] kernel void attention<E, 16>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint); \
-  template [[host_name("attention_" #E "_32")]] kernel void attention<E, 32>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint);
+#define INST_ATTN_SG(E, SG, CAP, SFX) \
+  template [[host_name("attention_" #E "_" #SG SFX)]] kernel void attention<E, SG, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint);
+#define INST_ATTN(E) INST_ATTN_SG(E, 8, false, "") INST_ATTN_SG(E, 16, false, "") INST_ATTN_SG(E, 32, false, "")
 INST_ATTN(1)
 INST_ATTN(2)
 INST_ATTN(3)
@@ -1319,17 +1459,25 @@ INST_ATTN(4)
 INST_ATTN(5)
 INST_ATTN(6)
 INST_ATTN(8)
-#define INST_ASPLIT(E, G) \
-  template [[host_name("attention_split_" #E "_" #G)]] kernel void attention_split<E, G>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint);
+// head_dim 512 (Gemma 4 global layers): 8 simdgroups keep the merge buffer within 32 KB.
+INST_ATTN_SG(16, 8, false, "")
+// Soft-capped variants for Gemma 2's head sizes (128 and 256).
+INST_ATTN_SG(4, 32, true, "_cap")
+INST_ATTN_SG(8, 16, true, "_cap")
+#define INST_ASPLIT_C(E, G, CAP, SFX) \
+  template [[host_name("attention_split_" #E "_" #G SFX)]] kernel void attention_split<E, G, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint);
+#define INST_ASPLIT(E, G) INST_ASPLIT_C(E, G, false, "")
 INST_ASPLIT(2, 1) INST_ASPLIT(2, 2) INST_ASPLIT(2, 3) INST_ASPLIT(2, 4)
 INST_ASPLIT(2, 5) INST_ASPLIT(2, 6) INST_ASPLIT(2, 7) INST_ASPLIT(2, 8)
 INST_ASPLIT(3, 1) INST_ASPLIT(3, 2) INST_ASPLIT(3, 3) INST_ASPLIT(3, 4)
 INST_ASPLIT(4, 1) INST_ASPLIT(4, 2) INST_ASPLIT(4, 3) INST_ASPLIT(4, 4)
+INST_ASPLIT_C(4, 1, true, "_cap") INST_ASPLIT_C(4, 2, true, "_cap") INST_ASPLIT_C(4, 3, true, "_cap") INST_ASPLIT_C(4, 4, true, "_cap")
 #define INST_ACOMB(E) \
   template [[host_name("attention_combine_" #E)]] kernel void attention_combine<E>(device const float*, device float*, constant AttnParams&, uint, uint);
 INST_ACOMB(2) INST_ACOMB(3) INST_ACOMB(4)
-#define INST_ATTNP(E, QB) \
-  template [[host_name("attention_prefill_" #E)]] kernel void attention_prefill<E, QB>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint, uint);
+#define INST_ATTNP_C(E, QB, CAP, SFX) \
+  template [[host_name("attention_prefill_" #E SFX)]] kernel void attention_prefill<E, QB, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint, uint);
+#define INST_ATTNP(E, QB) INST_ATTNP_C(E, QB, false, "")
 INST_ATTNP(1, 8)
 INST_ATTNP(2, 8)
 INST_ATTNP(3, 8)
@@ -1337,11 +1485,15 @@ INST_ATTNP(4, 8)
 INST_ATTNP(5, 4)
 INST_ATTNP(6, 4)
 INST_ATTNP(8, 4)
-#define INST_FLASH(DD) \
-  template [[host_name("flash_prefill_" #DD)]] kernel void flash_prefill<DD>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint, uint);
+INST_ATTNP(16, 2)
+INST_ATTNP_C(8, 4, true, "_cap")
+#define INST_FLASH_C(DD, CAP, SFX) \
+  template [[host_name("flash_prefill_" #DD SFX)]] kernel void flash_prefill<DD, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint, uint);
+#define INST_FLASH(DD) INST_FLASH_C(DD, false, "")
 INST_FLASH(4)
 INST_FLASH(8)
 INST_FLASH(12)
 INST_FLASH(16)
+INST_FLASH_C(16, true, "_cap")
 """#
 }

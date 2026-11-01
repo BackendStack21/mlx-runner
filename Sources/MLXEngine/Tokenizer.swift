@@ -116,6 +116,7 @@ public final class Tokenizer: @unchecked Sendable {
 
         // Pre-tokenizer & mode detection.
         var isByteLevel = false
+        var hasPrefixRule = false   // Metaspace or a Prepend normalizer decides the ▁ prefix
         func visitPre(_ p: [String: Any]) {
             switch p["type"] as? String {
             case "Sequence":
@@ -134,6 +135,7 @@ public final class Tokenizer: @unchecked Sendable {
                 let scheme = p["prepend_scheme"] as? String ?? ((p["add_prefix_space"] as? Bool ?? true) ? "always" : "never")
                 spPrepend = scheme != "never"
                 spPrependEverySegment = scheme == "always"
+                hasPrefixRule = true
             default: break
             }
         }
@@ -146,7 +148,7 @@ public final class Tokenizer: @unchecked Sendable {
             switch n["type"] as? String {
             case "Sequence": for sub in (n["normalizers"] as? [[String: Any]]) ?? [] { visitNorm(sub) }
             case "NFC": nfc = true
-            case "Prepend": spPrepend = true; spPrependEverySegment = true; spPrependUnconditional = true
+            case "Prepend": spPrepend = true; spPrependEverySegment = true; spPrependUnconditional = true; hasPrefixRule = true
             default: break
             }
         }
@@ -157,6 +159,9 @@ public final class Tokenizer: @unchecked Sendable {
         }
         mode = isByteLevel ? .byteLevel : .sentencePiece
         if mode == .sentencePiece && !hasSPNormalizer && json["pre_tokenizer"] == nil { spPrepend = true }
+        // A ▁ normalizer without a prefix rule (Gemma: Replace " " → ▁, Split on spaces) adds no
+        // dummy prefix.
+        if mode == .sentencePiece && hasSPNormalizer && !hasPrefixRule { spPrepend = false }
 
         // tokenizer_config.json: special tokens and chat template.
         if let cdata = try? Data(contentsOf: directory.appendingPathComponent("tokenizer_config.json")),
@@ -333,7 +338,9 @@ public final class Tokenizer: @unchecked Sendable {
     public func bytes(for id: Int, includeSpecial: Bool = false) -> [UInt8] {
         guard let tok = token(id) else { return [] }
         if specialIds.contains(id) { return includeSpecial ? Array(tok.utf8) : [] }
-        if addedTokens[tok] != nil { return Array(tok.utf8) }
+        // Non-special added tokens still go through the decoder in SentencePiece mode (Gemma
+        // lists runs of ▁ as added tokens).
+        if addedTokens[tok] != nil, mode == .byteLevel { return Array(tok.utf8) }
         switch mode {
         case .byteLevel:
             var out: [UInt8] = []

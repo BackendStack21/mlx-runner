@@ -591,7 +591,7 @@ extension InferenceEngine {
         }
         let cfg = try ModelConfig(directory: directory)
         let ctx = min(contextLength, max(cfg.maxPositionEmbeddings, 256))
-        let kv = cfg.numLayers * 2 * cfg.numKVHeads * cfg.headDim * 2 * ctx
+        let kv = cfg.kvBytesPerToken * ctx
         let need = UInt64(weights + kv)
         let budget = GPU.shared.device.recommendedMaxWorkingSetSize
         guard need < budget else {

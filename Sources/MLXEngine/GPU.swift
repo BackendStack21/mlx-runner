@@ -34,9 +34,9 @@ struct MMParams {
     var K: Int32; var O: Int32; var T: Int32; var gs: Int32; var xStride: Int32; var yStride: Int32
     var o1: Int32 = 0; var o2: Int32 = 0; var hasBias: Int32 = 0; var pad: Int32 = 0
 }
-struct QKVPostParams { var D: Int32; var nH: Int32; var nKV: Int32; var rowStride: Int32; var offset: Int32; var maxSeq: Int32; var traditional: Int32; var rotDim: Int32; var eps: Float; var hasNorm: Int32 }
+struct QKVPostParams { var D: Int32; var nH: Int32; var nKV: Int32; var rowStride: Int32; var offset: Int32; var maxSeq: Int32; var traditional: Int32; var rotDim: Int32; var eps: Float; var hasNorm: Int32; var vNorm: Int32 = 0; var kEqV: Int32 = 0 }
 struct NormParams { var dim: Int32; var headsPerRow: Int32; var rowStride: Int32; var eps: Float }
-struct AttnParams { var D: Int32; var nH: Int32; var nKV: Int32; var qStride: Int32; var maxSeq: Int32; var offset: Int32; var scale: Float; var outStride: Int32; var T: Int32 = 1 }
+struct AttnParams { var D: Int32; var nH: Int32; var nKV: Int32; var qStride: Int32; var maxSeq: Int32; var offset: Int32; var scale: Float; var outStride: Int32; var T: Int32 = 1; var window: Int32 = 0; var softcap: Float = 0 }
 struct EWParams { var n: Int32; var stride: Int32; var cols: Int32; var pad: Int32 = 0 }
 /// GPU token selection (`sample_token`); `V` is the number of logits considered, `pos` the
 /// position of the token whose logits these are (the result goes to hist[pos + 1]).
@@ -139,6 +139,18 @@ public struct Tensor {
     let shape: [Int]
     var count: Int { shape.reduce(1, *) }
     var nbytes: Int { count * dtype.size }
+
+    /// The elements as Float (small tensors such as norm weights; floating dtypes only).
+    func floats() throws -> [Float] {
+        guard offset >= 0, nbytes <= buffer.length - offset else { throw EngineError.invalidFile("tensor outside its file") }
+        let p = buffer.contents() + offset
+        switch dtype {
+        case .f32: return (0..<count).map { p.loadUnaligned(fromByteOffset: $0 * 4, as: Float.self) }
+        case .f16: return (0..<count).map { Float(p.loadUnaligned(fromByteOffset: $0 * 2, as: Float16.self)) }
+        case .bf16: return (0..<count).map { Float(bitPattern: UInt32(p.loadUnaligned(fromByteOffset: $0 * 2, as: UInt16.self)) << 16) }
+        default: throw EngineError.unsupported("\(dtype) weights where floats are expected")
+        }
+    }
 }
 
 extension MTLComputeCommandEncoder {
@@ -239,6 +251,9 @@ final class SafeTensorFile {
 final class WeightStore {
     private var files: [SafeTensorFile] = []
     private var index: [String: Int] = [:]
+    /// Engine name → name in the file, for multimodal exports that nest the language model
+    /// (`language_model.model.*`, `model.language_model.*`).
+    private var alias: [String: String] = [:]
 
     init(directory: URL, device: MTLDevice) throws {
         let fm = FileManager.default
@@ -251,15 +266,24 @@ final class WeightStore {
             files.append(f)
             for k in f.infos.keys { index[k] = i }
         }
+        if index["model.embed_tokens.weight"] == nil {
+            for (from, to) in [("language_model.model.", "model."), ("language_model.lm_head.", "lm_head."), ("model.language_model.", "model.")] {
+                for k in index.keys where k.hasPrefix(from) {
+                    let name = to + k.dropFirst(from.count)
+                    if index[name] == nil, alias[name] == nil { alias[name] = k }
+                }
+            }
+        }
     }
 
     var names: Dictionary<String, Int>.Keys { index.keys }
 
-    func has(_ name: String) -> Bool { index[name] != nil }
+    func has(_ name: String) -> Bool { index[alias[name] ?? name] != nil }
 
     func get(_ name: String) -> Tensor? {
-        guard let i = index[name] else { return nil }
-        return files[i].tensor(name)
+        let n = alias[name] ?? name
+        guard let i = index[n] else { return nil }
+        return files[i].tensor(n)
     }
 
     func require(_ name: String) throws -> Tensor {

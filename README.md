@@ -90,13 +90,19 @@ gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx
 | `llama` | Llama-3.2-1B-Instruct-4bit | Llama-3 RoPE scaling |
 | `mistral` | Mistral-7B-Instruct-v0.3-4bit | SentencePiece BPE + byte fallback |
 | `phi3` | Phi-3.5-mini-instruct-4bit | fused qkv / gate_up, LongRoPE |
+| `gemma` | gemma-1.1-2b-it-4bit | (1 + w) RMSNorm, GeGLU (exact GELU), scaled embeddings |
+| `gemma2` | gemma-2-2b-it-4bit | sandwich norms, attention and final-logit soft-capping, sliding window |
+| `gemma3_text`, `gemma3` | gemma-3-1b-it-qat-4bit, gemma-3-270m-it-4bit | q/k norms, 5:1 sliding/global layers with their own RoPE bases; `gemma3` multimodal exports run their language model |
+| `gemma4`, `gemma4_text` | gemma-4-e2b-it-OptiQ-4bit | head dims 256/512, proportional RoPE, KV sharing across layers, per-layer input embeddings, mixed 4/8-bit layers |
+| `gemma4_unified` | gemma-4-12B-it-OptiQ-4bit | as above, K = V in the global layers; the vision part of the export is ignored |
 
-Each checkpoint above passes end-to-end generation and the prefill-versus-decode consistency test. Other models of the same type, such as larger Qwen3, Qwen2.5-Coder or other Llama 3 fine-tunes, should work too, unless they need a feature that isn't implemented, such as sliding-window attention.
+Each checkpoint above passes end-to-end generation and the prefill-versus-decode consistency test; the Gemma checkpoints also match mlx-lm's logits position by position (teacher-forced, within about 0.1). Other models of the same type, such as larger Qwen3, Qwen2.5-Coder or other Llama 3 fine-tunes, should work too, unless they need a feature that isn't implemented.
 
 ## Limitations
 
-- **Unsupported model types:** Gemma, mixture-of-experts (Mixtral, Qwen3-MoE) and vision-language models. Discover marks them as not runnable.
-- **Chat templates:** the prompt format is detected (ChatML, Llama 3, Mistral, Phi-3) rather than executed as Jinja, so a model with an unusual template may get a near-match format.
+- **Unsupported model types:** mixture-of-experts (Mixtral, Qwen3-MoE, Gemma 4 26B-A4B), Gemma 3n, and the vision and audio parts of multimodal models (Gemma 3 and Gemma 4 exports run as text-only). Discover marks unsupported types as not runnable.
+- **Gemma:** no tool calling and no Gemma 4 thinking mode (Gemma 4 runs with thinking off, its template's default). Sliding-window layers keep a full-length KV cache, so long contexts cost as much memory as on a model without sliding windows.
+- **Chat templates:** the prompt format is detected (ChatML, Llama 3, Mistral, Phi-3, Gemma, Gemma 4) rather than executed as Jinja, so a model with an unusual template may get a near-match format.
 - **Prefill speed:** about 165 tok/s on a 7B model on an M2 Pro, because the prefill GEMM reaches about 35% of fp32 peak.
 - **Speculative decoding is opt-in.** Prompt-lookup drafting with exact verification is implemented and tested (greedy output is identical), but checking 4 drafted tokens on a 7B model still costs about 3 decode steps. So it only helps when most drafts are accepted (copying or editing text), and it is off by default (`SamplingParameters.speculative`, or `mlxr run --spec`).
 - **Glass effects:** set `MLXRUNNER_NO_GLASS=1` to use plain materials instead of Liquid Glass.
