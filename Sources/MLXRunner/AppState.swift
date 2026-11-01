@@ -380,7 +380,7 @@ final class AppState {
                     case .text(let t):
                         pending += t
                         tokenCount += 1
-                        if Date().timeIntervalSince(lastFlush) > 0.033 { flush() }
+                        if Date().timeIntervalSince(lastFlush) > 0.05 { flush() }   // 20 updates/s
                     case .finished(let s):
                         flush(true)
                         update(id, replyID) { $0.stats = s }

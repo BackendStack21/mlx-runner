@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.2
+
+- Fixes the chat window freezing for seconds during a long reply (any model) and then showing the rest at once. A streaming reply is rendered as plain SwiftUI text and becomes selectable once it is final: with text selection on, every paragraph of the growing reply was an AppKit-backed view that SwiftUI re-created and hit-tested (hover tracking) on each update, which saturated the main thread while the engine kept generating into the stream's buffer. Updates are flushed 20 times a second instead of 30.
+
 ## 1.2.1
 
 - Fixes the GPU out-of-memory error when running a large model such as Gemma 4 12B on a 16 GB Mac. MLX writes `safetensors` without the 16-byte alignment the kernels need, so every tensor was copied into its own Metal buffer while the mapped file stayed referenced: the GPU held two copies of the weights (18 GB for a 9 GB model). Shards are now copied once, in file order, into a page-aligned buffer and the mapping is released. Loading is faster too: Gemma 4 12B 156 s → 25 s from disk, 11 s from the page cache; Mistral 7B 3.3 → 2.9 s.

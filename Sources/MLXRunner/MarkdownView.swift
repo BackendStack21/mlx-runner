@@ -7,16 +7,25 @@ import SwiftUI
 struct MarkdownView: View {
     let text: String
     var baseSize: CGFloat = 14
+    /// Text selection makes every paragraph an AppKit-backed view that SwiftUI re-creates and
+    /// hit-tests on each update; a reply that is still streaming (re-rendered 20 times a
+    /// second) stays plain SwiftUI text and becomes selectable once it is final. With
+    /// selection on while streaming, a long reply froze the main thread for seconds.
+    var selectable = true
 
     var body: some View {
         let blocks = MarkdownParser.parse(text)
-        VStack(alignment: .leading, spacing: 10) {
+        let stack = VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, b in
                 view(for: b)
             }
         }
-        .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
+        if selectable {
+            stack.textSelection(.enabled)
+        } else {
+            stack
+        }
     }
 
     @ViewBuilder

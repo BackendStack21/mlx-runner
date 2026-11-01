@@ -313,7 +313,7 @@ struct MessageRow: View {
                     if message.content.isEmpty && message.reasoning == nil && generating {
                         TypingIndicator()
                     } else if !message.content.isEmpty {
-                        MarkdownView(text: message.content)
+                        MarkdownView(text: message.content, selectable: !generating)
                     }
                     if !generating {
                         footer
@@ -412,10 +412,13 @@ struct ReasoningView: View {
             }
             .buttonStyle(.plain)
             if expanded || inProgress {
-                Text(inProgress ? String(text.suffix(1200)) : text)
+                let body = Text(inProgress ? String(text.suffix(1200)) : text)
                     .font(.system(size: 12.5))
                     .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                // Selectable once final (see MarkdownView.selectable).
+                Group {
+                    if inProgress { body } else { body.textSelection(.enabled) }
+                }
                     .padding(.leading, 12)
                     .overlay(alignment: .leading) {
                         Rectangle().fill(Theme.gradient).frame(width: 2).opacity(0.6)
