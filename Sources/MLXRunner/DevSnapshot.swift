@@ -86,13 +86,44 @@ enum DevSnapshot {
             while state.isGenerating { try? await Task.sleep(nanoseconds: 300_000_000) }
             await shot("chat", window: window, dir: dir, settle: 1.0)
 
+            // Thinking: Qwen3 reasoning streaming into its block, captured while it is still open.
+            let thinkingChat = state.newChat()
+            state.enableThinking = true
+            state.send("Is 1,001 a prime number? Think it through.", in: thinkingChat)
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            await shot("thinking", window: window, dir: dir, settle: 0)
+            while state.isGenerating { try? await Task.sleep(nanoseconds: 300_000_000) }
+            state.enableThinking = false
+
             state.selection = .discover
             await shot("discover", window: window, dir: dir, settle: 5.0)  // Hub search + model card
             state.selection = .models
             await shot("models", window: window, dir: dir, settle: 1.5)
+
+            // Local Server: running, with a few real requests in its log.
             state.selection = .server
+            let server = ServerController.shared
+            server.start()
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if server.running { await tourRequests(port: server.port, model: state.loadedInfo?.name ?? "model") }
             await shot("server", window: window, dir: dir, settle: 1.5)
+            server.stop()
             NSApp.terminate(nil)
+        }
+    }
+
+    /// Calls the running local server so its request log has something to show.
+    private static func tourRequests(port: Int, model: String) async {
+        let base = "http://127.0.0.1:\(port)/v1"
+        _ = try? await URLSession.shared.data(from: URL(string: "\(base)/models")!)
+        for prompt in ["Say hello in five words.", "Name three planets, comma-separated."] {
+            var req = URLRequest(url: URL(string: "\(base)/chat/completions")!)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body: [String: Any] = ["model": model, "messages": [["role": "user", "content": prompt]],
+                                       "max_tokens": 40, "enable_thinking": false]
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            _ = try? await URLSession.shared.data(for: req)
         }
     }
 

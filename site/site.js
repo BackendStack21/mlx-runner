@@ -28,7 +28,7 @@
 
   // Reveal on scroll. Hidden only once JS has tagged them, so no-JS readers see everything.
   if (!reduced) {
-    for (const el of document.querySelectorAll(".race-card, .ceiling-copy, .gauge, .pipeline, .cards > li, .shot-panel .window, .term, .code-card, .dl-card, .steps > li")) {
+    for (const el of document.querySelectorAll(".race-card, .ceiling-copy, .gauge, .pipeline, .cards > li, .carousel, .term, .code-card, .dl-card, .steps > li")) {
       const r = el.getBoundingClientRect();
       if (r.top < innerHeight) continue; // already on screen: leave it alone
       el.classList.add("reveal");
@@ -39,11 +39,11 @@
 
   // ── 1. hero: stream an answer at each model's measured decode speed ──
   const MODELS = [
-    { name: "Qwen2.5 0.5B Instruct · 4-bit", rate: 285 },
-    { name: "Qwen3 0.6B · 4-bit", rate: 247 },
-    { name: "Llama 3.2 1B Instruct · 4-bit", rate: 183 },
-    { name: "Phi-3.5 mini · 4-bit", rate: 65 },
-    { name: "Mistral 7B v0.3 · 4-bit", rate: 38.6 },
+    { name: "Qwen2.5 0.5B Instruct · 4-bit", rate: 358 },
+    { name: "Qwen3 0.6B · 4-bit", rate: 289 },
+    { name: "Llama 3.2 1B Instruct · 4-bit", rate: 203 },
+    { name: "Phi-3.5 mini · 4-bit", rate: 70 },
+    { name: "Mistral 7B v0.3 · 4-bit", rate: 41.0 },
   ];
   const stream = $("stream");
   if (stream) {
@@ -214,28 +214,60 @@
     onVisible(term, replay, 0.4);
   }
 
-  // ── 4. app tour tabs (WAI-ARIA tabs with arrow keys) ──
-  const tabs = [...document.querySelectorAll('[role="tab"]')];
-  function select(tab, focus) {
-    for (const t of tabs) {
-      const on = t === tab;
-      t.setAttribute("aria-selected", String(on));
-      t.tabIndex = on ? 0 : -1;
-      $(t.getAttribute("aria-controls")).hidden = !on;
-    }
-    if (focus) tab.focus();
-  }
-  tabs.forEach((t, i) => {
-    t.addEventListener("click", () => select(t));
-    t.addEventListener("keydown", (e) => {
-      const d = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
-      if (d) select(tabs[(i + d + tabs.length) % tabs.length], true);
-      else if (e.key === "Home") select(tabs[0], true);
-      else if (e.key === "End") select(tabs[tabs.length - 1], true);
-      else return;
-      e.preventDefault();
+  // ── 4. tab lists (WAI-ARIA tabs with arrow keys). The app tour's tabs drive a scroll-snap carousel:
+  //      selecting one scrolls to its slide, and swiping or the arrows move the selection. ──
+  for (const list of document.querySelectorAll('[role="tablist"]')) {
+    const tabs = [...list.querySelectorAll('[role="tab"]')];
+    const panels = tabs.map((t) => $(t.getAttribute("aria-controls")));
+    const carousel = list.closest(".carousel");
+    const slides = carousel ? carousel.querySelector(".slides") : null;
+    let current = Math.max(0, tabs.findIndex((t) => t.getAttribute("aria-selected") === "true"));
+    const mark = (i) => {
+      current = i;
+      tabs.forEach((t, j) => {
+        t.setAttribute("aria-selected", String(i === j));
+        t.tabIndex = i === j ? 0 : -1;
+        if (!slides) panels[j].hidden = i !== j;
+      });
+    };
+    const select = (i, focus) => {
+      mark(i);
+      if (slides) slides.scrollTo({ left: panels[i].offsetLeft - slides.offsetLeft, behavior: reduced ? "auto" : "smooth" });
+      if (focus) tabs[i].focus();
+    };
+    tabs.forEach((t, i) => {
+      t.addEventListener("click", (e) => {
+        e.preventDefault();
+        select(i);
+      });
+      t.addEventListener("keydown", (e) => {
+        const d = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+        if (d) select((i + d + tabs.length) % tabs.length, true);
+        else if (e.key === "Home") select(0, true);
+        else if (e.key === "End") select(tabs.length - 1, true);
+        else return;
+        e.preventDefault();
+      });
     });
-  });
+    if (!slides) continue;
+    let pending = false;
+    slides.addEventListener(
+      "scroll",
+      () => {
+        if (pending) return;
+        pending = true;
+        requestAnimationFrame(() => {
+          pending = false;
+          const x = slides.scrollLeft + slides.offsetLeft;
+          const i = panels.findIndex((p) => Math.abs(p.offsetLeft - x) < p.offsetWidth / 2);
+          if (i >= 0 && i !== current) mark(i);
+        });
+      },
+      { passive: true },
+    );
+    carousel.querySelector(".car-btn.prev").addEventListener("click", () => select((current - 1 + panels.length) % panels.length));
+    carousel.querySelector(".car-btn.next").addEventListener("click", () => select((current + 1) % panels.length));
+  }
 
   // ── 5. live release data ──
   const config = JSON.parse($("release-config").textContent);

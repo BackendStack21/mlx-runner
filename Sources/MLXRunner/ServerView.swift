@@ -28,6 +28,7 @@ final class ServerController {
     var effectiveAPIKey: String? { (allowLAN || requireAPIKey) ? apiKey : nil }
 
     private static func storedOrNewKey() -> String {
+        if DevSnapshot.isActive { return OpenAIServer.generateAPIKey() }  // screenshots never show the real key
         if let k = UserDefaults.standard.string(forKey: "serverAPIKey"), !k.isEmpty { return k }
         let k = OpenAIServer.generateAPIKey()
         UserDefaults.standard.set(k, forKey: "serverAPIKey")
