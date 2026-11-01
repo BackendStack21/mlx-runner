@@ -38,6 +38,19 @@ struct QKVPostParams { var D: Int32; var nH: Int32; var nKV: Int32; var rowStrid
 struct NormParams { var dim: Int32; var headsPerRow: Int32; var rowStride: Int32; var eps: Float }
 struct AttnParams { var D: Int32; var nH: Int32; var nKV: Int32; var qStride: Int32; var maxSeq: Int32; var offset: Int32; var scale: Float; var outStride: Int32; var T: Int32 = 1 }
 struct EWParams { var n: Int32; var stride: Int32; var cols: Int32; var pad: Int32 = 0 }
+/// GPU token selection (`sample_token`); `V` is the number of logits considered, `pos` the
+/// position of the token whose logits these are (the result goes to hist[pos + 1]).
+public struct SampleParams {
+    var V: Int32; var pos: Int32; var window: Int32; var topK: Int32
+    var penalty: Float; var temperature: Float; var topP: Float; var minP: Float
+
+    /// `vocab`: how many logits to consider (the tokenizer's vocabulary may be smaller than lm_head).
+    public init(_ p: SamplingParameters, vocab: Int) {
+        V = Int32(vocab); pos = 0
+        window = Int32(max(0, p.repetitionWindow)); topK = Int32(p.topK)
+        penalty = p.repetitionPenalty; temperature = p.temperature; topP = p.topP; minP = p.minP
+    }
+}
 
 /// Shared Metal state: device, queue, and the compiled kernel library.
 public final class GPU: @unchecked Sendable {

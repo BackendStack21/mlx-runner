@@ -188,16 +188,16 @@ final class Linear {
     }
 
     /// `pso` must come from `lookupPipeline()` of this layer.
-    func encodeLookup(_ enc: MTLComputeCommandEncoder, pso: MTLComputePipelineState, ids: MTLBuffer, out: MTLBuffer, T: Int) {
+    func encodeLookup(_ enc: MTLComputeCommandEncoder, pso: MTLComputePipelineState, ids: MTLBuffer, idsOffset: Int = 0, out: MTLBuffer, T: Int) {
         enc.setComputePipelineState(pso)
         if let s = scales, let b = biases, s.dtype.suffix != nil {
             enc.set(weight, 0); enc.set(s, 1); enc.set(b, 2)
-            enc.set(ids, 0, 3); enc.set(out, 0, 4)
+            enc.set(ids, idsOffset, 3); enc.set(out, 0, 4)
             enc.params(MMParams(K: Int32(inDim), O: Int32(outDim), T: Int32(T), gs: Int32(groupSize), xStride: 0, yStride: 0), 5)
             enc.dispatchThreads(MTLSize(width: inDim / 8, height: T, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: min(256, inDim / 8), height: 1, depth: 1))
         } else {
-            enc.set(weight, 0); enc.set(ids, 0, 3); enc.set(out, 0, 4)
+            enc.set(weight, 0); enc.set(ids, idsOffset, 3); enc.set(out, 0, 4)
             enc.params(MMParams(K: Int32(inDim), O: Int32(outDim), T: Int32(T), gs: 0, xStride: 0, yStride: 0), 5)
             enc.dispatchThreads(MTLSize(width: inDim, height: T, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: min(256, inDim), height: 1, depth: 1))
@@ -211,12 +211,18 @@ final class RMSNorm {
     let addPSO: MTLComputePipelineState
     let eps: Float
 
+    /// Threads per row: one float4 each, up to 1024 (dim 4096) and the pipelines' maximum.
+    let threads: Int
+
     init(_ store: WeightStore, _ name: String, eps: Float, dim: Int) throws {
         weight = try store.require(name)
         guard weight.shape == [dim] else { throw EngineError.invalidFile("\(name): expected shape [\(dim)], found \(weight.shape)") }
+        guard dim % 4 == 0 else { throw EngineError.unsupported("\(name): dimension \(dim) is not a multiple of 4") }
         guard let sfx = weight.dtype.suffix else { throw EngineError.unsupported("\(name) dtype") }
         pso = try GPU.shared.pipeline("rms_norm_\(sfx)")
         addPSO = try GPU.shared.pipeline("add_rms_norm_\(sfx)")
+        let maxThreads = min(pso.maxTotalThreadsPerThreadgroup, addPSO.maxTotalThreadsPerThreadgroup)
+        threads = max(32, min(1024, maxThreads, dim / 4) / 32 * 32)
         self.eps = eps
     }
 
@@ -228,7 +234,6 @@ final class RMSNorm {
         enc.set(y, yOffset, 1)
         enc.set(weight, 2)
         enc.params(NormParams(dim: Int32(dim), headsPerRow: Int32(headsPerRow), rowStride: Int32(rowStride), eps: eps), 3)
-        let threads = dim >= 1024 ? 256 : (dim >= 256 ? 128 : 32)
         enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
     }
@@ -292,7 +297,16 @@ public final class Transformer {
 
     // Scratch buffers sized for `maxBatch` tokens.
     let maxBatch = 512
-    private let ids: MTLBuffer
+    /// Token ids by position (maxSeq + 1 entries): the CPU writes prompt tokens, the GPU sampler
+    /// appends generated ones, and every step's embedding lookup reads its tokens from here.
+    private let hist: MTLBuffer
+    /// xorshift64 state and pool-width hint of the GPU sampler; per-position status of its
+    /// results (0 ok, 1 non-finite logits); pool size and attempts of the last run (profiling).
+    private let rngState: MTLBuffer
+    private let sampleStatus: MTLBuffer
+    private let sampleDiag: MTLBuffer
+    private let samplePSO: MTLComputePipelineState
+    private let sampleThreads: Int
     private let h: MTLBuffer
     let xn: MTLBuffer
     let qkvBuf: MTLBuffer
@@ -326,9 +340,11 @@ public final class Transformer {
     private let addPSO: MTLComputePipelineState
     private let embedPSO: MTLComputePipelineState
     /// The next decode step (T = 1, at `offset`), encoded while the previous one ran on the GPU.
-    /// Encoding does not depend on the token id (read from `ids` at execution time), only on
+    /// Encoding does not depend on the token id (read from `hist` at execution time), only on
     /// the position, so it is committed only for an exact (T = 1, offset) match.
     private var prepared: (cb: MTLCommandBuffer, offset: Int)?
+    /// Developer profiling only (`profile`): kernel classes left out of `encode`.
+    var profileSkip: Set<String> = []
 
     private let qkvCols: Int
     public private(set) var lastGPUTime: Double = 0
@@ -364,7 +380,12 @@ public final class Transformer {
 
         qkvCols = (c.numHeads + 2 * c.numKVHeads) * c.headDim
         let H = c.hiddenSize, I = c.intermediateSize, B = maxBatch
-        ids = try gpu.buffer(B * 4)
+        hist = try gpu.buffer((seq + 1) * 4)
+        rngState = try gpu.buffer(16)
+        sampleStatus = try gpu.buffer((seq + 1) * 4)
+        sampleDiag = try gpu.buffer(16)
+        samplePSO = try gpu.pipeline("sample_token")
+        sampleThreads = min(1024, samplePSO.maxTotalThreadsPerThreadgroup) / 32 * 32
         h = try gpu.buffer(B * H * 4)
         xn = try gpu.buffer(B * H * 4)
         qkvBuf = try gpu.buffer(B * qkvCols * 4)
@@ -445,8 +466,8 @@ public final class Transformer {
         if T == 1, computeLogits, !allLogits, let p = prepared, p.offset == offset { ready = p.cb }
         prepared = nil
         let cb = try ready ?? encode(T: T, offset: offset, computeLogits: computeLogits, allLogits: allLogits)
-        // The previous step has completed (waited below), so `ids` is free to overwrite.
-        tokens.withUnsafeBytes { raw in ids.contents().copyMemory(from: raw.baseAddress!, byteCount: raw.count) }
+        // Nothing is in flight (the previous step was waited for), so `hist` is free to write.
+        writeHistory(tokens, at: offset)
         cb.commit()
         // Overlap CPU encoding of the likely next decode step (the following position) with this
         // step's GPU work. It is only committed after this buffer completes, on an exact match.
@@ -461,20 +482,107 @@ public final class Transformer {
         }
     }
 
+    private func writeHistory(_ tokens: [Int32], at offset: Int) {
+        tokens.withUnsafeBytes { raw in (hist.contents() + offset * 4).copyMemory(from: raw.baseAddress!, byteCount: raw.count) }
+    }
+
+    // MARK: Pipelined decoding with GPU token selection
+
+    /// One decode step committed to the GPU; `finish` reads back its token.
+    public struct DecodeStep {
+        let cb: MTLCommandBuffer
+        /// Position of the token this step processed; the sampled token lands at `offset + 1`.
+        public let offset: Int
+    }
+
+    /// Seeds the GPU sampler's xorshift64 generator. Call before `prefill` (nothing may be in flight).
+    public func seedSampler(_ seed: UInt64) {
+        rngState.contents().storeBytes(of: seed == 0 ? 0x9E3779B97F4A7C15 : seed, as: UInt64.self)
+        rngState.contents().storeBytes(of: Float(8), toByteOffset: 8, as: Float.self)   // pool-width hint
+    }
+
+    /// Runs the prompt tokens at offset..<offset+count and selects the first token from the last row's
+    /// logits on the GPU. Returns it (also stored at hist[offset + count], the position it will be
+    /// processed at). Must not be called while a `DecodeStep` is in flight.
+    public func prefill(_ tokens: [Int32], offset: Int, sample: SampleParams, isCancelled: (() -> Bool)? = nil) throws -> Int {
+        guard !tokens.isEmpty, offset + tokens.count < maxSeq else { throw EngineError.contextFull }
+        let rows = embed.outDim
+        guard tokens.allSatisfy({ $0 >= 0 && Int($0) < rows }) else {
+            throw EngineError.invalidFile("token id outside the embedding table (\(rows) rows)")
+        }
+        prepared = nil
+        var start = 0
+        while start < tokens.count {
+            if start > 0, isCancelled?() == true { throw EngineError.cancelled }
+            let n = min(maxBatch, tokens.count - start)
+            let last = start + n == tokens.count
+            let at = offset + start
+            let cb = try encode(T: n, offset: at, computeLogits: last, allLogits: false, sample: last ? sample : nil)
+            writeHistory(Array(tokens[start..<start + n]), at: at)
+            cb.commit()
+            cb.waitUntilCompleted()
+            lastGPUTime = cb.gpuEndTime - cb.gpuStartTime
+            if let err = cb.error { throw EngineError.kernelCompile("GPU error: \(err.localizedDescription)") }
+            start += n
+        }
+        return try sampledToken(at: offset + tokens.count)
+    }
+
+    /// Commits the decode step for the token at hist[offset] (written by the CPU or by the previous
+    /// step's sampler); its sampled token goes to hist[offset + 1]. Returns without waiting: commit the
+    /// following step before calling `finish` and the GPU runs both back to back. Steps must be
+    /// committed and finished in position order, at most two in flight.
+    public func beginDecodeStep(offset: Int, sample: SampleParams) throws -> DecodeStep {
+        guard offset >= 0, offset + 1 < maxSeq else { throw EngineError.contextFull }
+        prepared = nil
+        let cb = try encode(T: 1, offset: offset, computeLogits: true, allLogits: false, sample: sample)
+        cb.commit()
+        return DecodeStep(cb: cb, offset: offset)
+    }
+
+    /// Waits for the step and returns the token it sampled (hist[offset + 1]).
+    public func finish(_ step: DecodeStep) throws -> Int {
+        step.cb.waitUntilCompleted()
+        lastGPUTime = step.cb.gpuEndTime - step.cb.gpuStartTime
+        if let err = step.cb.error { throw EngineError.kernelCompile("GPU error: \(err.localizedDescription)") }
+        return try sampledToken(at: step.offset + 1)
+    }
+
+    /// The last computed logits row (valid until the next step).
+    public var logitsPointer: UnsafeMutablePointer<Float> { logits.contents().bindMemory(to: Float.self, capacity: lmHead.outDim) }
+
+    /// The token the sampler stored at `pos` (and its status). Both are per position, so a step
+    /// that has already been committed for the following position cannot overwrite them.
+    private func sampledToken(at pos: Int) throws -> Int {
+        guard sampleStatus.contents().load(fromByteOffset: pos * 4, as: Int32.self) == 0 else {
+            throw EngineError.invalidOutput("non-finite logits")
+        }
+        let t = Int(hist.contents().load(fromByteOffset: pos * 4, as: Int32.self))
+        guard t >= 0, t < embed.outDim else { throw EngineError.invalidOutput("sampled token \(t) outside the vocabulary") }
+        return t
+    }
+
     /// Encodes one forward pass over T tokens at positions offset..<offset+T. Token ids are read from
-    /// `ids` when the buffer executes, so the encoding depends only on (T, offset, computeLogits, allLogits).
-    private func encode(T: Int, offset: Int, computeLogits: Bool, allLogits: Bool) throws -> MTLCommandBuffer {
+    /// `hist` when the buffer executes, so the encoding depends only on (T, offset, computeLogits, allLogits).
+    /// With `sample`, the last row's logits are turned into a token on the GPU (see `sample_token`).
+    private func encode(T: Int, offset: Int, computeLogits: Bool, allLogits: Bool, sample: SampleParams? = nil) throws -> MTLCommandBuffer {
         let c = config
         let H = c.hiddenSize, D = c.headDim, I = c.intermediateSize
         let nH = c.numHeads, nKV = c.numKVHeads
         guard T > 0, T <= maxBatch, offset >= 0, offset + T <= maxSeq else { throw EngineError.contextFull }
+        if sample != nil { guard computeLogits, !allLogits, offset + T < maxSeq else { throw EngineError.contextFull } }
 
         guard let cb = GPU.shared.queue.makeCommandBufferWithUnretainedReferences(),
               let enc = cb.makeComputeCommandEncoder(dispatchType: .serial) else {
             throw EngineError.noMetalDevice
         }
-        embed.encodeLookup(enc, pso: embedPSO, ids: ids, out: h, T: T)
-        layers[0].inputNorm.encode(enc, x: h, y: xn, dim: H, rows: T, rowStride: H)
+        embed.encodeLookup(enc, pso: embedPSO, ids: hist, idsOffset: offset * 4, out: h, T: T)
+        // Profiling only: every flag is false in normal use.
+        let skip = profileSkip
+        let skipNorm = skip.contains("norm"), skipPost = skip.contains("post"), skipAttn = skip.contains("attn")
+        let skipSilu = skip.contains("silu"), skipQKV = skip.contains("qkv"), skipO = skip.contains("o")
+        let skipGateUp = skip.contains("gateup"), skipDown = skip.contains("down"), skipLMHead = skip.contains("lmhead")
+        if !skipNorm { layers[0].inputNorm.encode(enc, x: h, y: xn, dim: H, rows: T, rowStride: H) }
 
         let kCol = nH * D, vCol = (nH + nKV) * D
         let decode = T == 1
@@ -482,7 +590,8 @@ public final class Transformer {
         let useSplit = decode && attnSplitPSO != nil && offset + 1 >= attnSplitMinContext
         for (li, layer) in layers.enumerated() {
             // Attention block: [q|k|v] projection → norm/rope/cache → attention → o_proj
-            if layer.qkvFusable && Linear.canFuse(layer.qkv, T: T) {
+            if skipQKV {
+            } else if layer.qkvFusable && Linear.canFuse(layer.qkv, T: T) {
                 Linear.encodeFusedDecode(enc, layer.qkv, x: xn, xStride: H, y: qkvBuf, yStride: qkvCols, T: T)
             } else if layer.qkv.count == 1 {
                 layer.qkv[0].encode(enc, x: xn, xStride: H, y: qkvBuf, yStride: qkvCols, T: T)
@@ -492,6 +601,7 @@ public final class Transformer {
                 layer.qkv[2].encode(enc, x: xn, xStride: H, y: qkvBuf, yOffset: vCol * 4, yStride: qkvCols, T: T)
             }
 
+            if !skipPost {
             enc.setComputePipelineState(layer.qkvPostPSO)
             enc.set(qkvBuf, 0, 0)
             enc.set(invFreq, 0, 1)
@@ -507,11 +617,13 @@ public final class Transformer {
                                      rotDim: Int32(c.rotaryDim), eps: c.rmsNormEps, hasNorm: layer.qNorm != nil ? 1 : 0), 6)
             enc.dispatchThreadgroups(MTLSize(width: nH + 2 * nKV, height: T, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: D, height: 1, depth: 1))
+            }
 
             let attnParams = AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(qkvCols),
                                         maxSeq: Int32(maxSeq), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor / Float(D).squareRoot(),
                                         outStride: Int32(nH * D), T: Int32(T))
-            if useSplit, let (split, combine) = attnSplitPSO, let partials = attnPartials {
+            if skipAttn {
+            } else if useSplit, let (split, combine) = attnSplitPSO, let partials = attnPartials {
                 // Partials are reused by every layer: the serial encoder orders the dispatches.
                 enc.setComputePipelineState(split)
                 enc.set(qkvBuf, 0, 0)
@@ -538,11 +650,12 @@ public final class Transformer {
                                          threadsPerThreadgroup: MTLSize(width: attnThreads, height: 1, depth: 1))
             }
 
-            layer.o.encode(enc, x: attnBuf, xStride: nH * D, y: tmp, yStride: H, T: T)
-            layer.postNorm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T)
+            if !skipO { layer.o.encode(enc, x: attnBuf, xStride: nH * D, y: tmp, yStride: H, T: T) }
+            if !skipNorm { layer.postNorm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T) }
 
             // MLP block: [gate|up] → SiLU(gate)·up → down_proj
-            if layer.gateUpFusable && Linear.canFuse(layer.gateUp, T: T) {
+            if skipGateUp {
+            } else if layer.gateUpFusable && Linear.canFuse(layer.gateUp, T: T) {
                 Linear.encodeFusedDecode(enc, layer.gateUp, x: xn, xStride: H, y: guBuf, yStride: 2 * I, T: T)
             } else if layer.gateUp.count == 1 {
                 layer.gateUp[0].encode(enc, x: xn, xStride: H, y: guBuf, yStride: 2 * I, T: T)
@@ -550,26 +663,43 @@ public final class Transformer {
                 layer.gateUp[0].encode(enc, x: xn, xStride: H, y: guBuf, yOffset: 0, yStride: 2 * I, T: T)
                 layer.gateUp[1].encode(enc, x: xn, xStride: H, y: guBuf, yOffset: I * 4, yStride: 2 * I, T: T)
             }
+            if !skipSilu {
             enc.setComputePipelineState(siluPSO)
             enc.set(guBuf, 0, 0)
             enc.set(mlpBuf, 0, 1)
             enc.params(EWParams(n: 0, stride: Int32(2 * I), cols: Int32(I)), 2)
             enc.dispatchThreads(MTLSize(width: I, height: T, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-            layer.down.encode(enc, x: mlpBuf, xStride: I, y: tmp, yStride: H, T: T)
+            }
+            if !skipDown { layer.down.encode(enc, x: mlpBuf, xStride: I, y: tmp, yStride: H, T: T) }
 
             // Residual add fused with the next norm (next layer's input norm, or the final norm).
-            if li + 1 < layers.count {
+            if skipNorm {
+            } else if li + 1 < layers.count {
                 layers[li + 1].inputNorm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T)
             } else if computeLogits {
                 norm.encodeAdd(enc, h: h, residual: tmp, y: xn, dim: H, rows: T)
             }
         }
 
-        if computeLogits && allLogits {
+        if skipLMHead {
+        } else if computeLogits && allLogits {
             lmHead.encode(enc, x: xn, xStride: H, y: logitsAll, yStride: lmHead.outDim, T: T)
         } else if computeLogits {
             lmHead.encode(enc, x: xn, xOffset: (T - 1) * H * 4, xStride: H, y: logits, yStride: lmHead.outDim, T: 1)
+        }
+        if var sp = sample {
+            sp.V = Int32(min(Int(sp.V), lmHead.outDim))
+            sp.pos = Int32(offset + T - 1)
+            enc.setComputePipelineState(samplePSO)
+            enc.set(logits, 0, 0)
+            enc.set(hist, 0, 1)
+            enc.set(rngState, 0, 2)
+            enc.set(sampleStatus, 0, 3)
+            enc.params(sp, 4)
+            enc.set(sampleDiag, 0, 5)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: sampleThreads, height: 1, depth: 1))
         }
         enc.endEncoding()
         return cb
@@ -618,6 +748,24 @@ extension Transformer {
         sweep("down", { [$0.down] }, x: mlpBuf, T: 4)
         let tLM = time(20) { lmHead.encode($0, x: xn, xStride: H, y: logits, yStride: lmHead.outDim, T: 1) }
         out += String(format: "lm_head matvec: %.3f ms  (%.0f GB/s, cache-warm)\n", tLM * 1000, bytes(lmHead) / tLM / 1e9)
+        // Decode step breakdown: the step without each kernel class (its cost includes dispatch gaps).
+        func stepTime(_ skip: Set<String>) -> Double {
+            profileSkip = skip
+            defer { profileSkip = [] }
+            var best = Double.infinity
+            for _ in 0..<5 {
+                let cb = try! encode(T: 1, offset: 16, computeLogits: true, allLogits: false)
+                cb.commit(); cb.waitUntilCompleted()
+                best = min(best, cb.gpuEndTime - cb.gpuStartTime)
+            }
+            return best
+        }
+        let full = stepTime([])
+        out += String(format: "decode step @16: %.3f ms; without", full * 1000)
+        for cls in ["qkv", "o", "gateup", "down", "lmhead", "post", "attn", "norm", "silu"] {
+            out += String(format: " %@ -%.3f", cls as NSString, (full - stepTime([cls])) * 1000)
+        }
+        out += String(format: "; matvecs only %.3f ms\n", stepTime(["post", "attn", "norm", "silu"]) * 1000)
         let l0 = layers[0]
         let tAdd = time(500) { enc in self.add(enc, tmp, xn, H) }
         out += String(format: "tiny dependent dispatch: %.1f us\n", tAdd * 1e6)
@@ -635,6 +783,45 @@ extension Transformer {
     }
 }
 
+extension Transformer {
+    /// Developer micro-benchmark of the GPU token selection on the current logits (run a forward
+    /// pass first): GPU time per dispatch, pool size and attempts for the given parameters.
+    public func profileSampler(_ params: SamplingParameters, repeats: Int = 50) -> String {
+        var sp = SampleParams(params, vocab: lmHead.outDim)
+        sp.pos = 0
+        seedSampler(1)
+        // The penalty edits logits in place, so each dispatch works on a fresh copy; the copies'
+        // own cost is measured separately and subtracted.
+        let scratch = try! GPU.shared.buffer(logits.length)
+        func run(sample: Bool) -> Double {
+            let cb = GPU.shared.queue.makeCommandBuffer()!
+            for _ in 0..<repeats {
+                let blit = cb.makeBlitCommandEncoder()!
+                blit.copy(from: logits, sourceOffset: 0, to: scratch, destinationOffset: 0, size: lmHead.outDim * 4)
+                blit.endEncoding()
+                guard sample else { continue }
+                let enc = cb.makeComputeCommandEncoder(dispatchType: .serial)!
+                enc.setComputePipelineState(samplePSO)
+                enc.set(scratch, 0, 0); enc.set(hist, 0, 1); enc.set(rngState, 0, 2); enc.set(sampleStatus, 0, 3)
+                enc.params(sp, 4)
+                enc.set(sampleDiag, 0, 5)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: sampleThreads, height: 1, depth: 1))
+                enc.endEncoding()
+            }
+            cb.commit(); cb.waitUntilCompleted()
+            return (cb.gpuEndTime - cb.gpuStartTime) / Double(repeats)
+        }
+        let copies = run(sample: false)
+        let both = run(sample: true)
+        let diag = sampleDiag.contents().bindMemory(to: Int32.self, capacity: 2)
+        let l = UnsafeBufferPointer(start: logitsPointer, count: lmHead.outDim)
+        let m = l.max() ?? 0
+        let near = l.reduce(0) { $0 + ($1 >= m - 8 ? 1 : 0) }, tied = l.reduce(0) { $0 + ($1 == m ? 1 : 0) }
+        return String(format: "sampler T=%.1f k=%d: %.1f us per token (pool %d, attempts %d, %d threads; max %.2f, %d within 8, %d tied)", params.temperature, params.topK,
+                      max(0, both - copies) * 1e6, diag[0], diag[1], sampleThreads, m, near, tied)
+    }
+}
+
 extension RMSNorm {
     /// h += residual; y = norm(h)  — one dispatch.
     func encodeAdd(_ enc: MTLComputeCommandEncoder, h: MTLBuffer, residual: MTLBuffer, y: MTLBuffer, dim: Int, rows: Int) {
@@ -644,7 +831,6 @@ extension RMSNorm {
         enc.set(y, 0, 2)
         enc.set(weight, 3)
         enc.params(NormParams(dim: Int32(dim), headsPerRow: 1, rowStride: Int32(dim), eps: eps), 4)
-        let threads = dim >= 1024 ? 256 : (dim >= 256 ? 128 : 32)
         enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
     }

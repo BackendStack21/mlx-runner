@@ -129,6 +129,7 @@ inline void unpack16(device const uchar* p, thread float4* q) {
 // Fused decode matvec over up to three matrices that share K and quantization
 // (q/k/v or gate/up). Output rows are concatenated: [A rows | B rows | C rows].
 // p.o1, p.o2 = row counts of A and B (multiples of 8); optional per-row bias.
+// (2 rows per simdgroup for small matrices was measured slower in the full decode step.)
 template <int BITS, typename T>
 kernel void qmv(device const uchar* wA [[buffer(0)]],
                 device const T*     sA [[buffer(1)]],
@@ -585,8 +586,9 @@ kernel void rms_norm(device const float* x [[buffer(0)]],
     const int t = int(row) / p.headsPerRow, h = int(row) % p.headsPerRow;
     device const float* xr = x + t * p.rowStride + h * p.dim;
     device float* yr = y + t * p.rowStride + h * p.dim;
+    const int n4 = p.dim / 4;   // dim is a multiple of 4 and the rows are 16-byte aligned (checked on the host)
     float ss = 0.0f;
-    for (int i = int(tid); i < p.dim; i += int(tsz)) { const float v = xr[i]; ss += v * v; }
+    for (int i = int(tid); i < n4; i += int(tsz)) { const float4 v = ((device const float4*)xr)[i]; ss += dot(v, v); }
     ss = simd_sum(ss);
     threadgroup float buf[32];
     if (lane == 0) buf[sgid] = ss;
@@ -598,7 +600,11 @@ kernel void rms_norm(device const float* x [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float inv = rsqrt(buf[0] / float(p.dim) + p.eps);
-    for (int i = int(tid); i < p.dim; i += int(tsz)) yr[i] = xr[i] * inv * float(w[i]);
+    for (int i = int(tid); i < n4; i += int(tsz)) {
+        const float4 v = ((device const float4*)xr)[i];
+        const float4 ww = float4(float(w[4 * i]), float(w[4 * i + 1]), float(w[4 * i + 2]), float(w[4 * i + 3]));
+        ((device float4*)yr)[i] = v * inv * ww;
+    }
 }
 
 // Fused post-projection step, one threadgroup (D threads) per (head, token):
@@ -671,8 +677,13 @@ kernel void add_rms_norm(device float*       hbuf [[buffer(0)]],
     device float* hr = hbuf + row * p.rowStride;
     device const float* rr = r + row * p.rowStride;
     device float* yr = y + row * p.rowStride;
+    const int n4 = p.dim / 4;   // dim is a multiple of 4 and the rows are 16-byte aligned (checked on the host)
     float ss = 0.0f;
-    for (int i = int(tid); i < p.dim; i += int(tsz)) { const float v = hr[i] + rr[i]; hr[i] = v; ss += v * v; }
+    for (int i = int(tid); i < n4; i += int(tsz)) {
+        const float4 v = ((device const float4*)hr)[i] + ((device const float4*)rr)[i];
+        ((device float4*)hr)[i] = v;
+        ss += dot(v, v);
+    }
     ss = simd_sum(ss);
     threadgroup float buf[32];
     if (lane == 0) buf[sgid] = ss;
@@ -680,7 +691,11 @@ kernel void add_rms_norm(device float*       hbuf [[buffer(0)]],
     float tot = 0;
     for (uint s = 0; s < nsg; s++) tot += buf[s];
     const float inv = rsqrt(tot / float(p.dim) + p.eps);
-    for (int i = int(tid); i < p.dim; i += int(tsz)) yr[i] = hr[i] * inv * float(w[i]);
+    for (int i = int(tid); i < n4; i += int(tsz)) {
+        const float4 v = ((device const float4*)hr)[i];
+        const float4 ww = float4(float(w[4 * i]), float(w[4 * i + 1]), float(w[4 * i + 2]), float(w[4 * i + 3]));
+        ((device float4*)yr)[i] = v * inv * ww;
+    }
 }
 
 // Causal attention over the KV cache with grouped-query heads.
@@ -1038,6 +1053,214 @@ kernel void add_bias(device float*      y [[buffer(0)]],
     const int o = int(gid.x), t = int(gid.y);
     if (o >= p.cols) return;
     y[t * p.stride + o] += float(b[o]);
+}
+
+// ---------------------------------------------------------------------------
+// Token selection on the GPU, in the same command buffer as the forward pass,
+// so the next decode step can be queued before this one has finished and the
+// GPU never waits for the CPU. One threadgroup: repetition penalty, then argmax
+// (greedy) or exact top-k → softmax → min-p → top-p → one xorshift draw. The
+// token goes to hist[pos + 1], which the next step's embedding lookup reads.
+// ---------------------------------------------------------------------------
+struct SampleParams { int V; int pos; int window; int topK; float penalty; float temperature; float topP; float minP; };
+
+#define SMP_CAP 1024     // candidate pool (the exact top-k is sorted out of at most this many logits)
+
+// Order-preserving float → uint key (larger value → larger key) and back.
+inline uint smp_key(float f) { const uint u = as_type<uint>(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
+inline float smp_val(ulong key) { const uint u = uint(key >> 32); return as_type<float>((u & 0x80000000u) ? (u & 0x7fffffffu) : ~u); }
+inline int smp_id(ulong key) { return int(~uint(key)); }
+
+kernel void sample_token(device float*          logits [[buffer(0)]],
+                         device int*            hist   [[buffer(1)]],
+                         device ulong*          rng    [[buffer(2)]],   // [0] xorshift64 state, then the pool-width hint (float)
+                         device int*            status [[buffer(3)]],   // status[pos + 1]: 0 ok, 1 non-finite logits
+                         constant SampleParams& p      [[buffer(4)]],
+                         device int*            diag   [[buffer(5)]],   // [0] pool size, [1] attempts (profiling)
+                         uint tid  [[thread_index_in_threadgroup]],
+                         uint tsz  [[threads_per_threadgroup]],
+                         uint sgid [[simdgroup_index_in_threadgroup]],
+                         uint nsg  [[simdgroups_per_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float shf[32];
+    threadgroup int   shi[32];
+    threadgroup ulong cand[SMP_CAP];
+    threadgroup ulong sorted[SMP_CAP];
+    threadgroup float prob[SMP_CAP];
+    threadgroup atomic_uint np;
+    const int V = p.V, pos = p.pos;
+
+    // 1. Repetition penalty, once per distinct token among the last `window` of hist[0...pos].
+    if (p.penalty != 1.0f) {
+        const int n = min(p.window, pos + 1);
+        for (int j = int(tid); j < n; j += int(tsz)) {
+            const int t = hist[pos - j];
+            bool dup = false;
+            for (int j2 = 0; j2 < j; j2++) dup = dup || (hist[pos - j2] == t);
+            if (!dup && t >= 0 && t < V) { const float v = logits[t]; logits[t] = v > 0.0f ? v / p.penalty : v * p.penalty; }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+
+    // 2. Max logit and its lowest index. Passes over the logits take 8 contiguous values per lane
+    //    (two vector loads in flight) so they are not bound by load latency.
+    const int V8 = V & ~7;
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int i0 = int(tid) * 8; i0 < V8; i0 += int(tsz) * 8) {
+        const float4 a = *(device const float4*)(logits + i0), b = *(device const float4*)(logits + i0 + 4);
+        const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+        for (int j = 0; j < 8; j++) if (v[j] > best) { best = v[j]; bi = i0 + j; }
+    }
+    for (int i = V8 + int(tid); i < V; i += int(tsz)) { const float v = logits[i]; if (v > best) { best = v; bi = i; } }
+    const float sm = simd_max(best);
+    const int si = simd_min(best == sm ? bi : 0x7fffffff);
+    if (lane == 0) { shf[sgid] = sm; shi[sgid] = si; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0) {
+        const float v = lane < nsg ? shf[lane] : -INFINITY;
+        const int j = lane < nsg ? shi[lane] : 0x7fffffff;
+        const float mm = simd_max(v);
+        const int ii = simd_min(v == mm ? j : 0x7fffffff);
+        if (lane == 0) { shf[0] = mm; shi[0] = ii; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float M = shf[0];
+    const int argmax = shi[0];
+    if (!isfinite(M)) { if (tid == 0) { hist[pos + 1] = 0; status[pos + 1] = 1; diag[0] = 0; diag[1] = 0; } return; }
+    if (p.temperature <= 0.001f) { if (tid == 0) { hist[pos + 1] = argmax; status[pos + 1] = 0; diag[0] = 0; diag[1] = 0; } return; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. Pool = { x >= M - delta } with k <= |pool| <= SMP_CAP, so it holds the exact top k. delta
+    //    starts from the width that worked last step (kept in the state buffer) and is bisected on
+    //    a miss; each attempt is one pass with one atomic per 32 logits. If more than the cap tie
+    //    at the maximum (delta = 0), an index bound is bisected instead, so the lowest ids win.
+    //    k is capped at SMP_CAP (the CPU sampler caps a disabled top-k at 512 for the same reason).
+    const int k = min(p.topK > 0 ? min(p.topK, V) : min(512, V), SMP_CAP);
+    // Aim for a pool of at most ~2k so sorting it stays cheap (SMP_CAP is the hard limit).
+    const uint cap = uint(min(SMP_CAP, max(2 * k, 128)));
+    device float* hint = (device float*)(rng + 1);
+    float delta = hint[0];
+    if (!(delta > 0.0f) || !(delta < 1.0e6f)) delta = 8.0f;
+    float loD = 0.0f, hiD = INFINITY;   // |pool| < k at loD, > cap at hiD
+    int limitB = V, loB = 0, hiB = V;   // index bound, used only once delta has reached 0
+    uint count = 0;
+    int attempts = 0;
+    for (int attempt = 0; attempt < 64; attempt++) {
+        attempts++;
+        if (tid == 0) atomic_store_explicit(&np, 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float thr = M - delta;
+        // 256 logits per simdgroup step (8 per lane); one atomic reserves the step's pool slots.
+        for (int base = int(sgid) * 256; base < V8; base += int(nsg) * 256) {
+            const int i0 = base + int(lane) * 8;
+            float v[8];
+            if (i0 < V8) {
+                const float4 a = *(device const float4*)(logits + i0), b = *(device const float4*)(logits + i0 + 4);
+                v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+            } else {
+                for (int j = 0; j < 8; j++) v[j] = -INFINITY;
+            }
+            uint c = 0;
+            for (int j = 0; j < 8; j++) c += (v[j] >= thr && i0 + j < limitB) ? 1u : 0u;
+            const uint total = simd_sum(c);
+            if (total == 0u) continue;
+            uint slot = 0;
+            if (lane == 0) slot = atomic_fetch_add_explicit(&np, total, memory_order_relaxed);
+            slot = simd_broadcast(slot, 0) + simd_prefix_exclusive_sum(c);
+            for (int j = 0; j < 8; j++) {
+                if (v[j] >= thr && i0 + j < limitB) {
+                    if (slot < SMP_CAP) cand[slot] = (ulong(smp_key(v[j])) << 32) | ulong(~uint(i0 + j));
+                    slot++;
+                }
+            }
+        }
+        for (int i = V8 + int(tid); i < V && i < limitB; i += int(tsz)) {
+            const float v = logits[i];
+            if (v >= thr) {
+                const uint slot = atomic_fetch_add_explicit(&np, 1u, memory_order_relaxed);
+                if (slot < SMP_CAP) cand[slot] = (ulong(smp_key(v)) << 32) | ulong(~uint(i));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        count = atomic_load_explicit(&np, memory_order_relaxed);
+        if (count >= uint(k) && count <= cap) break;
+        if (delta == 0.0f) {                                // ties at the max: bisect the index bound
+            if (count > cap) hiB = limitB; else loB = limitB;
+            limitB = (loB + hiB) / 2;
+            if (limitB <= loB || limitB >= hiB) break;
+        } else if (count > cap) {
+            hiD = delta;
+            delta = loD > 0.0f ? 0.5f * (loD + hiD) : 0.5f * delta;
+            // The interval collapsed, or the threshold can no longer move: only the max level fits.
+            if (delta <= loD || delta >= hiD || M - delta >= M) delta = 0.0f;
+        } else {
+            if (delta >= 1.0e6f) break;                     // fewer than k finite logits: take what there is
+            loD = delta;
+            delta = hiD < INFINITY ? 0.5f * (loD + hiD) : 4.0f * max(delta, 0.25f);
+            if (delta <= loD || delta >= hiD) break;        // no float between the bounds: keep this pool
+        }
+    }
+    if (tid == 0) { if (delta > 0.0f) hint[0] = delta; diag[0] = int(count); diag[1] = attempts; }
+    const int pool = int(min(count, uint(SMP_CAP)));
+    const int n = min(k, pool);
+
+    // 5. Sort descending (value, then lowest index). Keys are distinct, so a rank sort (one pass
+    //    per entry over the pool) is cheapest for the usual small pool; large pools use a bitonic
+    //    network over the whole SMP_CAP array (unused slots hold 0, the smallest key).
+    if (pool <= 256) {
+        for (int i = int(tid); i < pool; i += int(tsz)) {
+            const ulong me = cand[i];
+            uint r = 0;
+            for (int j = 0; j < pool; j++) r += cand[j] > me ? 1u : 0u;
+            if (int(r) < n) sorted[r] = me;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (int i = pool + int(tid); i < SMP_CAP; i += int(tsz)) cand[i] = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint size = 2; size <= SMP_CAP; size <<= 1) {
+            for (uint stride = size >> 1; stride > 0; stride >>= 1) {
+                for (uint q = tid; q < SMP_CAP / 2; q += tsz) {
+                    const uint i = (q / stride) * (stride * 2) + (q % stride), j = i + stride;
+                    const bool desc = (i & size) == 0;
+                    const ulong a = cand[i], b = cand[j];
+                    if ((a < b) == desc) { cand[i] = b; cand[j] = a; }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        for (int i = int(tid); i < n; i += int(tsz)) sorted[i] = cand[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // 6. Softmax over the top k, min-p and top-p cuts, one draw.
+    const float invT = 1.0f / p.temperature;
+    for (int i = int(tid); i < n; i += int(tsz)) prob[i] = exp((smp_val(sorted[i]) - M) * invT);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < n; i++) total += prob[i];
+        int cut = n;
+        if (p.minP > 0.0f) {
+            const float th = p.minP * prob[0];
+            for (int i = 0; i < n; i++) if (prob[i] < th) { cut = i; break; }
+        }
+        if (p.topP < 1.0f) {
+            float acc = 0.0f;
+            for (int i = 0; i < cut; i++) { acc += prob[i] / total; if (acc >= p.topP) { cut = i + 1; break; } }
+        }
+        cut = max(1, cut);
+        float tot = 0.0f;
+        for (int i = 0; i < cut; i++) tot += prob[i];
+        ulong s = rng[0];
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        rng[0] = s;
+        float r = float(s >> 40) * (1.0f / 16777216.0f);
+        int chosen = smp_id(sorted[cut - 1]);
+        for (int i = 0; i < cut; i++) { r -= prob[i] / tot; if (r <= 0.0f) { chosen = smp_id(sorted[i]); break; } }
+        hist[pos + 1] = chosen; status[pos + 1] = 0;
+    }
 }
 
 // Explicit instantiations ----------------------------------------------------

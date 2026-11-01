@@ -187,3 +187,142 @@ struct MatmulKernelTests {
         assertClose(got, ref, tol: 1e-5, "embedding")
     }
 }
+
+@Suite("GPU token selection")
+struct SampleKernelTests {
+    /// Runs `sample_token` `draws` times over the same logits and history; returns the drawn tokens
+    /// and the final pool size / attempt count.
+    func gpuSample(_ logits: [Float], _ params: SamplingParameters, history: [Int32] = [], draws: Int = 1,
+                   seed: UInt64 = 1) throws -> (tokens: [Int], pool: Int, attempts: Int) {
+        let pso = try GPU.shared.pipeline("sample_token")
+        let threads = min(1024, pso.maxTotalThreadsPerThreadgroup) / 32 * 32
+        let hist = try GPU.shared.buffer((history.count + 2) * 4)
+        history.withUnsafeBytes { hist.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+        let state = try GPU.shared.buffer(16)
+        state.contents().storeBytes(of: seed, as: UInt64.self)
+        state.contents().storeBytes(of: Float(8), toByteOffset: 8, as: Float.self)
+        let status = try GPU.shared.buffer((history.count + 2) * 4)
+        let diag = try GPU.shared.buffer(16)
+        var tokens: [Int] = []
+        let pos = max(0, history.count - 1)
+        for _ in 0..<draws {
+            let lb = makeBuffer(logits)   // the penalty edits logits in place: fresh copy per draw
+            var sp = SampleParams(params, vocab: logits.count)
+            sp.pos = Int32(pos)
+            runGPU { enc in
+                enc.setComputePipelineState(pso)
+                enc.set(lb, 0, 0); enc.set(hist, 0, 1); enc.set(state, 0, 2); enc.set(status, 0, 3)
+                enc.params(sp, 4)
+                enc.set(diag, 0, 5)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
+            }
+            #expect(status.contents().load(fromByteOffset: (pos + 1) * 4, as: Int32.self) == 0, "status")
+            tokens.append(Int(hist.contents().load(fromByteOffset: (pos + 1) * 4, as: Int32.self)))
+        }
+        let d = diag.contents().bindMemory(to: Int32.self, capacity: 2)
+        return (tokens, Int(d[0]), Int(d[1]))
+    }
+
+    /// Peaked logits with a long tail and a few exact ties, like a language model's.
+    func testLogits(_ V: Int, seed: UInt64 = 3) -> [Float] {
+        var rng = RNG(s: seed)
+        var l = (0..<V).map { _ in -12 + 6 * rng.float() }
+        for i in stride(from: 0, to: V, by: 97) { l[i] += 8 + 4 * rng.float() }
+        l[5] = 7.25; l[777] = 7.25; l[V - 1] = 7.25
+        return l
+    }
+
+    @Test func greedyMatchesCPUArgmaxIncludingTiesAndPenalty() throws {
+        var params = SamplingParameters()
+        params.temperature = 0
+        for V in [1000, 32768, 151936] {
+            var l = testLogits(V)
+            l[300] = 30; l[9] = 30   // tie at the max: the lowest index wins
+            params.repetitionPenalty = 1
+            #expect(try gpuSample(l, params).tokens == [9])
+            // Penalising token 9 (recent) hands the win to 300.
+            params.repetitionPenalty = 1.3
+            params.repetitionWindow = 64
+            let history: [Int32] = [1, 2, 9, 9, 4]
+            let cpu = { () -> Int in
+                let p = UnsafeMutablePointer<Float>.allocate(capacity: V); p.initialize(from: l, count: V)
+                var s = Sampler(params: params, rng: XorShift(seed: 1))
+                return s.sample(p, count: V, recent: history.map { Int($0) }.suffix(64))
+            }()
+            #expect(cpu == 300)
+            #expect(try gpuSample(l, params, history: history).tokens == [cpu])
+        }
+    }
+
+    @Test func nonFiniteLogitsAreReported() throws {
+        var l = testLogits(4096)
+        l[7] = .infinity
+        let pso = try GPU.shared.pipeline("sample_token")
+        let hist = try GPU.shared.buffer(64), state = try GPU.shared.buffer(16), status = try GPU.shared.buffer(64), diag = try GPU.shared.buffer(16)
+        var sp = SampleParams(SamplingParameters(), vocab: l.count)
+        sp.pos = 0
+        let lb = makeBuffer(l)
+        runGPU { enc in
+            enc.setComputePipelineState(pso)
+            enc.set(lb, 0, 0); enc.set(hist, 0, 1); enc.set(state, 0, 2); enc.set(status, 0, 3)
+            enc.params(sp, 4)
+            enc.set(diag, 0, 5)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        #expect(status.contents().load(fromByteOffset: 4, as: Int32.self) == 1)
+        #expect(hist.contents().load(fromByteOffset: 4, as: Int32.self) == 0, "a valid id is left for the queued next step")
+    }
+
+    /// The GPU draws follow the CPU sampler's distribution: same support (top-k, min-p and top-p
+    /// cuts) and matching frequencies.
+    @Test(arguments: [(40, Float(0.95), Float(0)), (0, Float(1), Float(0)), (200, Float(0.8), Float(0.05)), (5, Float(1), Float(0))])
+    func sampledDistributionMatchesCPU(topK: Int, topP: Float, minP: Float) throws {
+        var params = SamplingParameters()
+        params.temperature = 0.9
+        params.topK = topK; params.topP = topP; params.minP = minP
+        params.repetitionPenalty = 1.1
+        let V = 32768
+        let l = testLogits(V, seed: 11)
+        let history: [Int32] = (0..<40).map { Int32($0 * 97) }   // penalise some of the peaks
+        let p = UnsafeMutablePointer<Float>.allocate(capacity: V); p.initialize(from: l, count: V)
+        var s = Sampler(params: params, rng: XorShift(seed: 1))
+        let distOpt = s.distribution(p, count: V, recent: history.map { Int($0) }.suffix(64))
+        let dist = try #require(distOpt)
+        let cpu = Dictionary(uniqueKeysWithValues: dist.map { ($0.id, $0.p) })
+        let draws = 3000
+        let r = try gpuSample(l, params, history: history, draws: draws)
+        #expect(r.pool >= dist.count && r.pool <= 1024, "pool \(r.pool) after \(r.attempts) attempts")
+        var freq: [Int: Int] = [:]
+        for t in r.tokens { freq[t, default: 0] += 1 }
+        for (t, n) in freq { #expect(cpu[t] != nil, "token \(t) drawn \(n) times is outside the CPU distribution") }
+        for (t, pr) in cpu where pr > 0.01 {
+            let f = Float(freq[t] ?? 0) / Float(draws)
+            let sigma = (pr * (1 - pr) / Float(draws)).squareRoot()
+            #expect(abs(f - pr) < 4.5 * sigma + 0.002, "token \(t): p \(pr) drawn \(f)")
+        }
+    }
+
+    @Test func hugeTopKIsCappedWithoutExtraPasses() throws {
+        var params = SamplingParameters()
+        params.temperature = 1; params.topK = 5000; params.topP = 1; params.repetitionPenalty = 1
+        let r = try gpuSample(testLogits(40000), params, draws: 5)
+        #expect(r.pool >= 1024 && r.pool <= 1024 * 2, "pool \(r.pool)")
+        #expect(r.attempts <= 12, "attempts \(r.attempts)")
+    }
+
+    @Test func tiesAtTheTopAndTinyVocabularies() throws {
+        var params = SamplingParameters()
+        params.temperature = 1; params.topK = 3; params.topP = 1; params.repetitionPenalty = 1
+        // 2000 logits tied at the max: the top 3 are the three lowest ids, drawn with equal probability.
+        let l = [Float](repeating: 1, count: 2000)
+        let r = try gpuSample(l, params, draws: 60)
+        #expect(Set(r.tokens) == [0, 1, 2], "\(Set(r.tokens))")
+        #expect(r.attempts < 40, "attempts \(r.attempts)")
+        // Fewer logits than k.
+        params.topK = 40
+        let small: [Float] = [0.5, 2, -1]
+        let r2 = try gpuSample(small, params, draws: 200)
+        #expect(Set(r2.tokens).isSubset(of: [0, 1, 2]))
+        #expect(r2.tokens.filter { $0 == 1 }.count > 100)
+    }
+}
