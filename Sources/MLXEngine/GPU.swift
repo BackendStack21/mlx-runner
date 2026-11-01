@@ -179,12 +179,24 @@ extension MTLComputeCommandEncoder {
     }
 }
 
-// MARK: - Safetensors (zero-copy via mmap)
+// MARK: - Safetensors
 
+/// One safetensors shard in Metal buffers. The kernels use 16-byte vector loads, so every
+/// tensor must start on a 16-byte boundary. A file whose tensors all do is wrapped in place
+/// (mmap, zero-copy). MLX-written files never do (the header is padded to 8 bytes, and 2-byte
+/// tensors such as Gemma 4's `layer_scalar` shift everything after them), so their tensors are
+/// copied once, in file order, each into its own buffer, and the mapping is released: the GPU
+/// then holds exactly one copy of the weights. (Copying while the mapping stayed referenced
+/// doubled the working set — a 9 GB model needed 18 GB. One arena for all tensors measured
+/// 6% slower at 1K context on the smallest model, so each tensor keeps its own buffer.)
 final class SafeTensorFile {
-    let buffer: MTLBuffer
+    /// The mapped file (zero-copy) or, for copied files, a buffer per tensor.
+    private let buffer: MTLBuffer?
+    private var buffers: [String: MTLBuffer] = [:]
     private(set) var infos: [String: (dtype: DType, shape: [Int], start: Int, end: Int)] = [:]
     let url: URL
+    /// Bytes of weights held in Metal buffers.
+    private(set) var byteCount = 0
 
     init(url: URL, device: MTLDevice) throws {
         self.url = url
@@ -201,13 +213,8 @@ final class SafeTensorFile {
         }
         // Ask the kernel to start paging weights in now.
         madvise(ptr, mapped, MADV_WILLNEED)
-        guard let buf = device.makeBuffer(bytesNoCopy: ptr, length: mapped, options: .storageModeShared, deallocator: { p, len in
-            munmap(p, len)
-        }) else {
-            munmap(ptr, mapped)
-            throw EngineError.invalidFile("cannot wrap \(url.lastPathComponent) in a Metal buffer")
-        }
-        buffer = buf
+        var mappingOwned = true   // released below unless the mapping becomes the buffer
+        defer { if mappingOwned { munmap(ptr, mapped) } }
         let base = ptr.assumingMemoryBound(to: UInt8.self)
         let file = url.lastPathComponent
         guard size >= 8 else { throw EngineError.invalidFile("\(file) is truncated") }
@@ -250,17 +257,32 @@ final class SafeTensorFile {
             }
             infos[name] = (dtype, shape.map { Int($0) }, dataStart + Int(offs[0]), dataStart + Int(offs[1]))
         }
+
+        if infos.values.allSatisfy({ $0.start % 16 == 0 }) {
+            guard let buf = device.makeBuffer(bytesNoCopy: ptr, length: mapped, options: .storageModeShared, deallocator: { p, len in
+                munmap(p, len)
+            }) else { throw EngineError.invalidFile("cannot wrap \(file) in a Metal buffer") }
+            buffer = buf
+            byteCount = size
+            mappingOwned = false
+            return
+        }
+        // Copy in file order (sequential read), one buffer per tensor.
+        buffer = nil
+        for (name, i) in infos.sorted(by: { $0.value.start < $1.value.start }) {
+            let len = i.end - i.start
+            guard let b = device.makeBuffer(bytes: base + i.start, length: max(len, 16), options: .storageModeShared) else {
+                throw EngineError.outOfMemory("could not allocate \(ByteCountFormatter.string(fromByteCount: Int64(len), countStyle: .file)) for \(name) in \(file)")
+            }
+            buffers[name] = b
+            byteCount += len
+            infos[name] = (i.dtype, i.shape, 0, len)
+        }
     }
 
     func tensor(_ name: String) -> Tensor? {
-        guard let i = infos[name] else { return nil }
-        // Kernels use vector loads; copy the rare misaligned tensor into its own buffer.
-        if i.start % 16 != 0 {
-            let len = i.end - i.start
-            let copy = buffer.device.makeBuffer(bytes: buffer.contents() + i.start, length: max(len, 16), options: .storageModeShared)!
-            return Tensor(buffer: copy, offset: 0, dtype: i.dtype, shape: i.shape)
-        }
-        return Tensor(buffer: buffer, offset: i.start, dtype: i.dtype, shape: i.shape)
+        guard let i = infos[name], let b = buffer ?? buffers[name] else { return nil }
+        return Tensor(buffer: b, offset: i.start, dtype: i.dtype, shape: i.shape)
     }
 }
 
@@ -321,5 +343,5 @@ final class WeightStore {
         return t
     }
 
-    var totalBytes: Int { files.reduce(0) { $0 + $1.buffer.length } }
+    var totalBytes: Int { files.reduce(0) { $0 + $1.byteCount } }
 }

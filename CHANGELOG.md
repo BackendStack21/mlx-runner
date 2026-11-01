@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1
+
+- Fixes the GPU out-of-memory error when running a large model such as Gemma 4 12B on a 16 GB Mac. MLX writes `safetensors` without the 16-byte alignment the kernels need, so every tensor was copied into its own Metal buffer while the mapped file stayed referenced: the GPU held two copies of the weights (18 GB for a 9 GB model). Shards are now copied once, in file order, into a page-aligned buffer and the mapping is released. Loading is faster too: Gemma 4 12B 156 s → 25 s from disk, 11 s from the page cache; Mistral 7B 3.3 → 2.9 s.
+- Sliding-window layers (Gemma 2, 3 and 4) keep a ring of window + 512 K/V rows instead of the whole context: Gemma 4 12B at 8K context needs 0.5 GB of cache instead of 2.7 GB, and runs at 32K on 16 GB. A request whose shared prefix with the previous one ends more than 512 tokens before that request's end no longer reuses the cache (its rows are gone); it is processed from the start.
+- A GPU out-of-memory failure is reported as such, with the advice to lower the context length, instead of as a kernel compilation error; the load-time memory check includes the scratch buffers.
+
 ## 1.2.0
 
 Gemma support (`gemma`, `gemma2`, `gemma3` / `gemma3_text`, `gemma4` / `gemma4_text`, `gemma4_unified`):

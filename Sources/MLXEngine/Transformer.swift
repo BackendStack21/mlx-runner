@@ -300,6 +300,10 @@ final class TransformerLayer {
     /// nil for a KV-shared layer (it attends over `spec.kvSource`'s cache).
     let kCache: MTLBuffer?
     let vCache: MTLBuffer?
+    /// Rows in the K/V cache: the whole context, or for a sliding-window layer the window plus
+    /// one batch (position p lives at row p mod cacheLen; a batch's T new rows must not land
+    /// on rows its own queries still read).
+    let cacheLen: Int
     /// Gemma 4 per-layer input: gate (H → P), projection (P → H) and its norm.
     let pleGate: Linear?
     let pleProj: Linear?
@@ -367,13 +371,52 @@ final class TransformerLayer {
         qkvFusable = qkv.count > 1 && Linear.fusable(qkv)
         gateUpFusable = gateUp.count > 1 && Linear.fusable(gateUp)
         qkvPostPSO = try GPU.shared.pipeline("qkv_post_\(qNorm?.weight.dtype.suffix ?? "f32")")
+        cacheLen = c.cacheRows(spec, context: maxSeq)
+        // A batch's new rows must never land on rows its own queries read (see cacheRows).
+        guard cacheLen == maxSeq || cacheLen >= c.slidingWindow + ModelConfig.maxBatch else {
+            throw EngineError.invalidFile("\(p): KV cache of \(cacheLen) rows for a window of \(c.slidingWindow)")
+        }
         if spec.hasOwnKV {
-            let cacheBytes = nKV * maxSeq * D * 2
+            let cacheBytes = nKV * cacheLen * D * 2
             kCache = try GPU.shared.buffer(cacheBytes)
             vCache = try GPU.shared.buffer(cacheBytes)
         } else {
             kCache = nil; vCache = nil
         }
+    }
+}
+
+extension Transformer {
+    /// Upper bound on the scratch buffers `init` allocates for a config (the load-time memory
+    /// check adds it to the weights and the KV caches). A test keeps it above `scratchAllocated`.
+    public static func scratchBytes(config c: ModelConfig) -> Int {
+        let B = maxBatch, H = c.hiddenSize
+        let I = c.intermediateSize * (c.isGemma4 ? 2 : 1)   // Gemma 4's KV-shared layers double the MLP
+        let qkv = c.layers.map { (c.numHeads + 2 * $0.numKVHeads) * $0.headDim }.max() ?? 0
+        let attn = c.layers.map { c.numHeads * $0.headDim }.max() ?? 0
+        let maxD = c.layers.map(\.headDim).max() ?? 0
+        var bytes = B * 4 * (3 * H + qkv + attn + 3 * I)                     // h, xn, tmp, qkv, attn, gate|up, mlp
+        bytes += (1 + maxVerifyTokens) * max(c.vocabSize, 1) * 4             // logits, logitsAll
+        bytes += c.numHeads * attnSplitVirtualSG * (maxD + 2) * 4           // split-attention partials
+        if c.perLayerInputSize > 0 {
+            let LP = c.perLayerInputSize * c.numLayers
+            bytes += B * 4 * (2 * LP + c.perLayerInputSize)                   // per-layer inputs: raw, inputs, gate
+        }
+        return bytes
+    }
+}
+
+extension EngineError {
+    /// The engine error for a failed command buffer: an out-of-memory failure gets an
+    /// actionable message, anything else is reported as a GPU error.
+    static func gpu(_ err: Error) -> EngineError {
+        let ns = err as NSError
+        let d = err.localizedDescription
+        if (ns.domain == MTLCommandBufferErrorDomain && ns.code == MTLCommandBufferError.outOfMemory.rawValue)
+            || d.contains("OutOfMemory") || d.lowercased().contains("insufficient memory") {
+            return .outOfMemory("the GPU ran out of memory while running the model. Lower the context length (Settings) or use a smaller model.")
+        }
+        return .kernelCompile("GPU error: \(d)")
     }
 }
 
@@ -389,7 +432,14 @@ public final class Transformer {
     let quantDescription: String
 
     // Scratch buffers sized for `maxBatch` tokens.
-    let maxBatch = 512
+    static let maxBatch = ModelConfig.maxBatch
+    let maxBatch = Transformer.maxBatch
+    /// One past the highest position any committed step has written to the KV caches. Ring
+    /// caches alias positions, so a resumed run must know about every write, including those
+    /// of a cancelled prefill or a rejected draft that the caller's own bookkeeping dropped.
+    public private(set) var writtenHigh = 0
+    /// Scratch bytes `init` actually allocated (checked against `scratchBytes(config:)` by a test).
+    private(set) var scratchAllocated = 0
     /// Token ids by position (maxSeq + 1 entries): the CPU writes prompt tokens, the GPU sampler
     /// appends generated ones, and every step's embedding lookup reads its tokens from here.
     private let hist: MTLBuffer
@@ -517,15 +567,17 @@ public final class Transformer {
         sampleDiag = try gpu.buffer(16)
         samplePSO = try gpu.pipeline("sample_token")
         sampleThreads = min(1024, samplePSO.maxTotalThreadsPerThreadgroup) / 32 * 32
-        h = try gpu.buffer(B * H * 4)
-        xn = try gpu.buffer(B * H * 4)
-        qkvBuf = try gpu.buffer(B * qkvMax * 4)
-        attnBuf = try gpu.buffer(B * attnMax * 4)
-        guBuf = try gpu.buffer(B * 2 * I * 4)
-        mlpBuf = try gpu.buffer(B * I * 4)
-        tmp = try gpu.buffer(B * H * 4)
-        logits = try gpu.buffer(lmHead.outDim * 4)
-        logitsAll = try gpu.buffer(Self.maxVerifyTokens * lmHead.outDim * 4)
+        var scratch = 0
+        func buffer(_ n: Int) throws -> MTLBuffer { scratch += n; return try gpu.buffer(n) }
+        h = try buffer(B * H * 4)
+        xn = try buffer(B * H * 4)
+        qkvBuf = try buffer(B * qkvMax * 4)
+        attnBuf = try buffer(B * attnMax * 4)
+        guBuf = try buffer(B * 2 * I * 4)
+        mlpBuf = try buffer(B * I * 4)
+        tmp = try buffer(B * H * 4)
+        logits = try buffer(lmHead.outDim * 4)
+        logitsAll = try buffer(Self.maxVerifyTokens * lmHead.outDim * 4)
         var freqBuffers: [[Float]: MTLBuffer] = [:]
         ropeFreqs = c.layers.map { l in
             if let b = freqBuffers[l.invFreq] { return b }
@@ -580,7 +632,7 @@ public final class Transformer {
             }
             kernels[D] = k
         }
-        attnPartials = partialBytes > 0 ? try gpu.buffer(partialBytes) : nil
+        attnPartials = partialBytes > 0 ? try buffer(partialBytes) : nil
         attnKernels = kernels
 
         if c.perLayerInputSize > 0 {
@@ -594,11 +646,12 @@ public final class Transformer {
                                  modelProj: try Linear(store, "model.per_layer_model_projection", inDim: H, outDim: LP),
                                  // The reference normalises proj(h) / sqrt(H): RMSNorm(x / sqrt(H), eps) == RMSNorm(x, eps · H).
                                  norm: try RMSNorm(store, "model.per_layer_projection_norm.weight", eps: c.rmsNormEps * Float(H), dim: P),
-                                 raw: try gpu.buffer(B * LP * 4), inputs: try gpu.buffer(B * LP * 4), gateBuf: try gpu.buffer(B * P * 4),
+                                 raw: try buffer(B * LP * 4), inputs: try buffer(B * LP * 4), gateBuf: try buffer(B * P * 4),
                                  addPSO: try gpu.pipeline("add_scaled"), gatePSO: try gpu.pipeline("gelu_tanh_gate"))
         } else {
             ple = nil
         }
+        scratchAllocated = scratch
         switch c.activation {
         case .silu: siluPSO = try gpu.pipeline("silu_mul")
         case .geluTanh: siluPSO = try gpu.pipeline("gelu_tanh_mul")
@@ -644,6 +697,7 @@ public final class Transformer {
         // Nothing is in flight (the previous step was waited for), so `hist` is free to write.
         writeHistory(tokens, at: offset)
         cb.commit()
+        writtenHigh = max(writtenHigh, offset + T)
         // Overlap CPU encoding of the likely next decode step (the following position) with this
         // step's GPU work. It is only committed after this buffer completes, on an exact match.
         if computeLogits, offset + T < maxSeq, let next = try? encode(T: 1, offset: offset + T, computeLogits: true, allLogits: false) {
@@ -653,7 +707,7 @@ public final class Transformer {
         lastGPUTime = cb.gpuEndTime - cb.gpuStartTime
         if let err = cb.error {
             prepared = nil
-            throw EngineError.kernelCompile("GPU error: \(err.localizedDescription)")
+            throw EngineError.gpu(err)
         }
     }
 
@@ -669,6 +723,24 @@ public final class Transformer {
         /// Position of the token this step processed; the sampled token lands at `offset + 1`.
         public let offset: Int
     }
+
+    /// How much of the KV cache a new run sharing its first `common` tokens with the previous
+    /// writes can keep. Sliding-window layers hold only the latest rows, so once writing went on
+    /// for more than a batch past the divergence point (`writtenHigh`, which counts cancelled
+    /// prefills and rejected drafts too), the rows the resumed run would read are gone: the
+    /// prompt is processed from the start. `previousLength` is the caller's own count, used
+    /// when it is larger (it never should be).
+    public func reusablePrefix(_ common: Int, previousLength: Int) -> Int {
+        let written = max(previousLength, writtenHigh)
+        for l in layers where l.spec.hasOwnKV && l.cacheLen < maxSeq {
+            if written - common > l.cacheLen - config.slidingWindow + 1 { return 0 }
+        }
+        return common
+    }
+
+    /// Forget the write history: the next run starts at position 0 and overwrites everything
+    /// it will read.
+    public func resetWriteTracking() { writtenHigh = 0 }
 
     /// Seeds the GPU sampler's xorshift64 generator. Call before `prefill` (nothing may be in flight).
     public func seedSampler(_ seed: UInt64) {
@@ -695,9 +767,10 @@ public final class Transformer {
             let cb = try encode(T: n, offset: at, computeLogits: last, allLogits: false, sample: last ? sample : nil)
             writeHistory(Array(tokens[start..<start + n]), at: at)
             cb.commit()
+            writtenHigh = max(writtenHigh, at + n)
             cb.waitUntilCompleted()
             lastGPUTime = cb.gpuEndTime - cb.gpuStartTime
-            if let err = cb.error { throw EngineError.kernelCompile("GPU error: \(err.localizedDescription)") }
+            if let err = cb.error { throw EngineError.gpu(err) }
             start += n
         }
         return try sampledToken(at: offset + tokens.count)
@@ -712,6 +785,7 @@ public final class Transformer {
         prepared = nil
         let cb = try encode(T: 1, offset: offset, computeLogits: true, allLogits: false, sample: sample)
         cb.commit()
+        writtenHigh = max(writtenHigh, offset + 1)
         return DecodeStep(cb: cb, offset: offset)
     }
 
@@ -719,7 +793,7 @@ public final class Transformer {
     public func finish(_ step: DecodeStep) throws -> Int {
         step.cb.waitUntilCompleted()
         lastGPUTime = step.cb.gpuEndTime - step.cb.gpuStartTime
-        if let err = step.cb.error { throw EngineError.kernelCompile("GPU error: \(err.localizedDescription)") }
+        if let err = step.cb.error { throw EngineError.gpu(err) }
         return try sampledToken(at: step.offset + 1)
     }
 
@@ -790,7 +864,7 @@ public final class Transformer {
                 enc.set(ropeFreqs[li], 0, 4); enc.set(ropeFreqs[li], 0, 5)
             }
             enc.params(QKVPostParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), rowStride: Int32(qkvCols),
-                                     offset: Int32(offset), maxSeq: Int32(maxSeq), traditional: c.ropeTraditional ? 1 : 0,
+                                     offset: Int32(offset), maxSeq: Int32(kv.cacheLen), traditional: c.ropeTraditional ? 1 : 0,
                                      rotDim: Int32(spec.rotDim), eps: c.rmsNormEps, hasNorm: layer.qNorm != nil ? 1 : 0,
                                      vNorm: c.valueNorm ? 1 : 0, kEqV: spec.kEqV ? 1 : 0), 6)
             // A KV-shared layer only prepares its queries.
@@ -799,7 +873,7 @@ public final class Transformer {
             }
 
             let attnParams = AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(qkvCols),
-                                        maxSeq: Int32(maxSeq), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor * c.queryScale,
+                                        maxSeq: Int32(kv.cacheLen), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor * c.queryScale,
                                         outStride: Int32(nH * D), T: Int32(T), window: Int32(spec.sliding ? c.slidingWindow : 0),
                                         softcap: c.attnLogitSoftcap)
             if skipAttn {

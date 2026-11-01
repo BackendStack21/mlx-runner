@@ -398,6 +398,8 @@ public final class InferenceEngine: @unchecked Sendable {
         var common = 0
         let limit = min(cachedTokens.count, tokens.count - 1)
         while common < limit && cachedTokens[common] == tokens[common] { common += 1 }
+        common = model.reusablePrefix(common, previousLength: cachedTokens.count)
+        if common == 0 { model.resetWriteTracking() }
         stats.cachedPromptTokens = common
 
         let vocab = model.vocabSize
@@ -591,8 +593,9 @@ extension InferenceEngine {
         }
         let cfg = try ModelConfig(directory: directory)
         let ctx = min(contextLength, max(cfg.maxPositionEmbeddings, 256))
-        let kv = cfg.kvBytesPerToken * ctx
-        let need = UInt64(weights + kv)
+        let kv = cfg.kvCacheBytes(context: ctx)
+        let scratch = Transformer.scratchBytes(config: cfg)
+        let need = UInt64(weights + kv + scratch)
         let budget = GPU.shared.device.recommendedMaxWorkingSetSize
         guard need < budget else {
             let f = ByteCountFormatter()

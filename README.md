@@ -9,7 +9,7 @@ A native macOS app for discovering, downloading and chatting with **MLX models f
 ![MLX Runner](site/assets/screenshot-chat.jpg)
 
 - **Zero third-party dependencies.** The project uses the Swift standard library and Apple's system frameworks only: SwiftUI, Foundation, Metal, Network and CryptoKit. It has no SwiftPM packages, no vendored code and no Python.
-- **Native MLX format.** It reads MLX-community repos directly: memory-mapped `safetensors` plus MLX affine quantization at 2, 3, 4, 5, 6 or 8 bits, with group sizes of 32, 64 or 128.
+- **Native MLX format.** It reads MLX-community repos directly: `safetensors` plus MLX affine quantization at 2, 3, 4, 5, 6 or 8 bits, with group sizes of 32, 64 or 128.
 - **Fast.** Hand-written Metal kernels cover every layer:
   - fused decode matvecs
   - simdgroup-matrix GEMMs for prefill
@@ -101,7 +101,7 @@ Each checkpoint above passes end-to-end generation and the prefill-versus-decode
 ## Limitations
 
 - **Unsupported model types:** mixture-of-experts (Mixtral, Qwen3-MoE, Gemma 4 26B-A4B), Gemma 3n, and the vision and audio parts of multimodal models (Gemma 3 and Gemma 4 exports run as text-only). Discover marks unsupported types as not runnable.
-- **Gemma:** no tool calling and no Gemma 4 thinking mode (Gemma 4 runs with thinking off, its template's default). Sliding-window layers keep a full-length KV cache, so long contexts cost as much memory as on a model without sliding windows.
+- **Gemma:** no tool calling and no Gemma 4 thinking mode (Gemma 4 runs with thinking off, its template's default). Sliding-window layers keep a ring of window + 512 K/V rows, so a chat whose shared prefix with the previous request ends more than 512 tokens before that request's end is processed from the start instead of reusing the cache.
 - **Chat templates:** the prompt format is detected (ChatML, Llama 3, Mistral, Phi-3, Gemma, Gemma 4) rather than executed as Jinja, so a model with an unusual template may get a near-match format.
 - **Prefill speed:** about 165 tok/s on a 7B model on an M2 Pro, because the prefill GEMM reaches about 35% of fp32 peak.
 - **Speculative decoding is opt-in.** Prompt-lookup drafting with exact verification is implemented and tested (greedy output is identical), but checking 4 drafted tokens on a 7B model still costs about 3 decode steps. So it only helps when most drafts are accepted (copying or editing text), and it is off by default (`SamplingParameters.speculative`, or `mlxr run --spec`).
@@ -118,10 +118,12 @@ Measured with `mlxr bench` on an **M2 Pro (16 GB)**. Decode is measured with gre
 | Llama 3.2 1B Instruct | 695 MB | 1,180 tok/s | 203 tok/s | 188 tok/s |
 | Phi-3.5 mini | 2.15 GB | 320 tok/s | 70 tok/s | 61 tok/s |
 | Mistral 7B v0.3 | 4.08 GB | 166 tok/s | 41.0 tok/s | 39.5 tok/s |
+| Gemma 3 1B (QAT) | 732 MB | 1,450 tok/s | 195 tok/s | 178 tok/s |
+| Gemma 3 4B | 2.56 GB | 345 tok/s | 67 tok/s | 62 tok/s |
 
 **The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 41.0 tok/s, about 85% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a 3-bit model (which would raise the ceiling to about 60 tok/s, but only 4-bit has an optimized decode kernel so far), or speculative decoding (see Limitations).
 
-Load times stay short because the weights are `mmap`ed and wrapped in Metal buffers with no copy: about 0.5 s for the small models, 1.6 s for Phi-3.5 and 3.3 s for Mistral 7B. Those figures include a warm-up pass that pages the weights in.
+Loading copies the weights once, in file order, into a page-aligned Metal buffer (MLX writes `safetensors` without the 16-byte alignment the kernels' vector loads need), then releases the file mapping, so the GPU holds exactly one copy: about 0.5 s for the small models, 3 s for Mistral 7B and 11 s for the 9 GB Gemma 4 12B from the page cache (25 s from disk). Those figures include a warm-up pass.
 
 ## Build and run
 
@@ -156,7 +158,7 @@ mlxr tokenize <model> "some text"
 Sources/
   MLXEngine/            Inference engine (library)
     Kernels.swift       Metal shader source, compiled at runtime
-    GPU.swift           Device and pipelines; zero-copy safetensors loader
+    GPU.swift           Device and pipelines; safetensors loader (one aligned copy per shard)
     Transformer.swift   Model graph: one command buffer per step, fused kernels
     Tokenizer.swift     BPE from tokenizer.json (byte-level and SentencePiece)
     ChatTemplate.swift  ChatML / Llama 3 / Mistral / Phi-3 prompt formats
@@ -172,7 +174,7 @@ Tests/MLXEngineTests/   Swift Testing suite
 How the engine works:
 
 - **Decode** (one token per step):
-  - q/k/v and gate/up are each one fused quantized matvec over several zero-copy weight matrices, with bias folded in.
+  - q/k/v and gate/up are each one fused quantized matvec over several weight matrices, with bias folded in.
   - Per-head RMSNorm, RoPE and the KV-cache append run as a single kernel.
   - The residual add is fused with the next RMSNorm.
   - Attention uses online softmax across 16 to 32 simdgroups.

@@ -99,7 +99,9 @@ struct GemmaConfigTests {
         #expect(c.layers.map(\.headDim) == [64, 64, 128, 64, 64, 128])
         // Layers 4 and 5 reuse the caches of the last earlier layer of their type.
         #expect(c.layers.map(\.kvSource) == [-1, -1, -1, -1, 3, 2])
-        #expect(c.kvBytesPerToken == 2 * 2 * (3 * 64 + 128))
+        // Sliding layers keep window + one batch of rows, full layers the whole context.
+        #expect(c.kvCacheBytes(context: 4096) == 2 * 2 * (3 * 64 * (16 + 512) + 128 * 4096))
+        #expect(c.kvCacheBytes(context: 256) == 2 * 2 * (3 * 64 + 128) * 256)
         // Proportional RoPE: the whole head rotates, a quarter of the frequencies are non-zero,
         // with exponents over the full head dim.
         let g = c.layers[2]
@@ -151,6 +153,47 @@ struct GemmaModelTests {
         for s in ["two  spaces\tand tab\n\nnew paragraph", "emoji 🚀 ünïcödé", "  indented\n    code"] {
             #expect(tok.decode(tok.encode(s)) == s)
         }
+    }
+
+    /// With a context longer than window + batch the sliding layers keep a ring of rows: a prompt
+    /// past that point must still prefill and decode alike, and a run that went on for more than
+    /// a batch past the divergence point cannot reuse its cache.
+    @Test(.enabled(if: installedModel(gemma3) != nil))
+    func ringCacheMatchesAndLimitsPrefixReuse() throws {
+        guard let dir = installedModel(Self.gemma3) else { return }
+        let model = try Transformer(directory: dir, contextLength: 2048)   // window 512 → 1024 cache rows
+        let tok = try Tokenizer(directory: dir)
+        let text = (0..<120).map { "Line \($0) of a long document about rings, windows and caches." }.joined(separator: " ")
+        let ids = Array(tok.encode(text).map { Int32($0) }.prefix(1200))
+        #expect(ids.count == 1200)
+        let V = model.vocabSize
+        let pre = Array(UnsafeBufferPointer(start: try model.forward(ids, offset: 0), count: V))
+        _ = try model.forward(Array(ids[0..<1100]), offset: 0)
+        var inc: [Float] = []
+        for i in 1100..<ids.count {
+            let l = try model.forward([ids[i]], offset: i)
+            if i == ids.count - 1 { inc = Array(UnsafeBufferPointer(start: l, count: V)) }
+        }
+        #expect(pre.indices.max { pre[$0] < pre[$1] } == inc.indices.max { inc[$0] < inc[$1] })
+        #expect(zip(pre, inc).map { abs($0 - $1) }.max()! < 0.1)
+        #expect(model.reusablePrefix(900, previousLength: 1200) == 900)   // 300 newer rows: the window's rows survive
+        #expect(model.reusablePrefix(500, previousLength: 1200) == 0)     // 700 newer rows overwrote them
+        // The model's own write mark counts what the caller's bookkeeping may have dropped
+        // (a cancelled prefill, rejected drafts): 1200 rows were written whatever the caller says.
+        #expect(model.writtenHigh == 1200)
+        #expect(model.reusablePrefix(500, previousLength: 500) == 0)
+        model.resetWriteTracking()
+        #expect(model.reusablePrefix(500, previousLength: 500) == 500)
+        #expect(model.scratchAllocated <= Transformer.scratchBytes(config: model.config))
+    }
+
+    /// The load-time scratch estimate covers what the engine allocates, on every installed checkpoint.
+    @Test(arguments: installed)
+    func scratchEstimateCoversAllocations(repo: String) throws {
+        guard let dir = installedModel(repo) else { return }
+        let model = try Transformer(directory: dir, contextLength: 512)
+        #expect(model.scratchAllocated <= Transformer.scratchBytes(config: model.config))
+        #expect(Transformer.scratchBytes(config: model.config) < 2 * model.scratchAllocated + (1 << 20))   // and is not wildly loose
     }
 
     /// Prefill and token-by-token decode agree past the sliding window (512 tokens for Gemma 3

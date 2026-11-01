@@ -14,6 +14,9 @@ struct NormParams { int dim; int headsPerRow; int rowStride; float eps; };
 struct AttnParams { int D; int nH; int nKV; int qStride; int maxSeq; int offset; float scale; int outStride; int T; int window; float softcap; };
 // Sliding window (window > 0): the query at position i sees keys i - window < j <= i.
 inline int attn_first_key(constant AttnParams& p, int pos) { return p.window > 0 ? max(0, pos - p.window + 1) : 0; }
+// K/V cache row of position j: caches hold `len` rows (AttnParams / QKVPostParams.maxSeq) and
+// a sliding-window layer keeps only the last ones, position j living at row j mod len.
+inline int kv_slot(int j, int len) { return j < len ? j : j % len; }
 // Gemma 2 attention-score soft-capping: s = tanh(s / cap) * cap. A template parameter of the
 // attention kernels (`_cap` instantiations) so the other models' inner loops do not carry it.
 template <bool CAP>
@@ -730,6 +733,7 @@ kernel void qkv_post(device float*       qkv     [[buffer(0)]],
     const int h = int(tg.x), t = int(tg.y), i = int(tid);
     device float* base = qkv + t * p.rowStride + h * p.D;
     const int pos = p.offset + t;
+    const int row = kv_slot(pos, p.maxSeq);
     const bool isV = h >= p.nH + p.nKV;
     float v = (isV && p.kEqV) ? base[i - p.nKV * p.D] : base[i];
     threadgroup float buf[1024];
@@ -743,7 +747,7 @@ kernel void qkv_post(device float*       qkv     [[buffer(0)]],
             for (uint s = 0; s < nsg; s++) tot += red[s];
             v *= rsqrt(tot / float(p.D) + p.eps);
         }
-        vc[(ulong(h - p.nH - p.nKV) * ulong(p.maxSeq) + ulong(pos)) * ulong(p.D) + i] = half(v);
+        vc[(ulong(h - p.nH - p.nKV) * ulong(p.maxSeq) + ulong(row)) * ulong(p.D) + i] = half(v);
         return;
     }
     const bool isQ = h < p.nH;
@@ -768,7 +772,7 @@ kernel void qkv_post(device float*       qkv     [[buffer(0)]],
         out = first ? v * c - buf[partner] * s : v * c + buf[partner] * s;
     }
     if (isQ) base[i] = out;
-    else kc[(ulong(h - p.nH) * ulong(p.maxSeq) + ulong(pos)) * ulong(p.D) + i] = half(out);
+    else kc[(ulong(h - p.nH) * ulong(p.maxSeq) + ulong(row)) * ulong(p.D) + i] = half(out);
 }
 
 // h += r; y = RMSNorm(h) * w   (residual add fused with the next norm)
@@ -917,7 +921,7 @@ kernel void attention(device const float* qkv [[buffer(0)]],
     for (int j0 = attn_first_key(p, L - 1) + int(sg); j0 < L; j0 += ANSG * AU) {
         half kh[AU][E], vh[AU][E];
         for (int u = 0; u < AU; u++) {
-            const int j = min(j0 + u * ANSG, L - 1);   // clamped: rows past L are loaded but unused
+            const int j = kv_slot(min(j0 + u * ANSG, L - 1), p.maxSeq);   // clamped: rows past L are loaded but unused
             device const half* kp = kb + ulong(j) * ulong(p.D);
             device const half* vp = vb + ulong(j) * ulong(p.D);
             for (int e = 0; e < E; e++) { kh[u][e] = kp[e * 32 + lane]; vh[u][e] = vp[e * 32 + lane]; }
@@ -969,7 +973,7 @@ kernel void attention_split(device const float* qkv  [[buffer(0)]],
     for (int j0 = attn_first_key(p, L - 1) + v; j0 < L; j0 += ASPLIT_V * AU) {
         half kh[AU][E], vh[AU][E];
         for (int u = 0; u < AU; u++) {
-            const int j = min(j0 + u * ASPLIT_V, L - 1);
+            const int j = kv_slot(min(j0 + u * ASPLIT_V, L - 1), p.maxSeq);
             device const half* kp = kb + ulong(j) * ulong(p.D);
             device const half* vp = vb + ulong(j) * ulong(p.D);
             for (int e = 0; e < E; e++) { kh[u][e] = kp[e * 32 + lane]; vh[u][e] = vp[e * 32 + lane]; }
@@ -1030,8 +1034,8 @@ kernel void attention_prefill(device const float* qkv [[buffer(0)]],
     const int jlo = attn_first_key(p, p.offset + t0);   // the first query's first key
     for (int j = jlo + int(sg); j < L; j += NSG) {
         float kv[E], vv[E];
-        device const half* kp = kb + ulong(j) * ulong(p.D);
-        device const half* vp = vb + ulong(j) * ulong(p.D);
+        device const half* kp = kb + ulong(kv_slot(j, p.maxSeq)) * ulong(p.D);
+        device const half* vp = vb + ulong(kv_slot(j, p.maxSeq)) * ulong(p.D);
         for (int e = 0; e < E; e++) { kv[e] = float(kp[e * 32 + lane]); vv[e] = float(vp[e * 32 + lane]); }
         for (int qi = 0; qi < QB; qi++) {
             if (qi >= nq || j > p.offset + t0 + qi) continue;   // causal mask (uniform per simdgroup)
@@ -1122,11 +1126,14 @@ kernel void flash_prefill(device const float* qkv [[buffer(0)]],
     const int qFirst = attn_first_key(p, p.offset + t0);       // first key of the block's first query
     for (int j0 = qFirst / BK * BK; j0 < L; j0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // D is a power of two: row / column from i are shifts; the ring slot costs a modulo only
+        // for positions past the cache length.
         for (int i = int(tid); i < BK * D; i += 128) {
-            const int j = j0 + i / D;
+            const int r = i / D, j = j0 + r;
             const bool ok = j < L;
-            Ks[i] = ok ? float(kb[ulong(j0) * D + i]) : 0.0f;
-            Vs[i] = ok ? float(vb[ulong(j0) * D + i]) : 0.0f;
+            const ulong src = ulong(kv_slot(j, p.maxSeq)) * D + (i - r * D);
+            Ks[i] = ok ? float(kb[src]) : 0.0f;
+            Vs[i] = ok ? float(vb[src]) : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // Skip key blocks that are entirely in the future for all 8 rows of this simdgroup.
