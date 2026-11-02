@@ -132,6 +132,10 @@ case "run":
         case .finished(let s):
             let model = s.modelDraftTokens.map { String(format: " (draft model %d/%d)", s.acceptedModelDraftTokens ?? 0, $0) } ?? ""
             print(String(format: "\n[generated %d tokens at %.1f tok/s, stop: %@, drafts accepted %d/%d%@]", s.generatedTokens, s.tokensPerSecond, s.stopReason, s.acceptedDraftTokens ?? 0, s.draftTokens ?? 0, model))
+            if let c = s.draftCycles, c > 0, let dt = s.draftSeconds, let vt = s.verifySeconds {
+                print(String(format: "[draft model: %d cycles, %.2f tokens/cycle, draft %.1f ms + verify %.1f ms per cycle]", c,
+                             Double(s.acceptedModelDraftTokens ?? 0) / Double(c) + 1, dt / Double(c) * 1000, vt / Double(c) * 1000))
+            }
         }
     }
 

@@ -29,6 +29,10 @@ public struct GenerationStats: Sendable, Hashable, Codable {
     /// The part of the drafts above that came from the draft model (the rest is prompt lookup).
     public var modelDraftTokens: Int? = nil
     public var acceptedModelDraftTokens: Int? = nil
+    /// Draft-model cycles in this request, and the time they spent drafting and verifying.
+    public var draftCycles: Int? = nil
+    public var draftSeconds: Double? = nil
+    public var verifySeconds: Double? = nil
     public init() {}
 }
 
@@ -251,6 +255,9 @@ public final class InferenceEngine: @unchecked Sendable {
                     if let draftDirectory {
                         try Self.checkDraftCompatible(target: directory, targetTokenizer: tok, draft: draftDirectory)
                     }
+                    if draftDirectory != nil, let bits = try ModelConfig(directory: directory).bits, bits != 4 {
+                        throw EngineError.unsupported("\(directory.lastPathComponent) is \(bits)-bit: batched verification needs 4-bit weights, so a draft model cannot help")
+                    }
                     try Self.checkMemory(directories: [directory] + (draftDirectory.map { [$0] } ?? []), contextLength: contextLength)
                     let model = try Transformer(directory: directory, contextLength: contextLength)
                     var draft: Transformer?
@@ -278,14 +285,13 @@ public final class InferenceEngine: @unchecked Sendable {
                     self.tokenizer = tok
                     self.template = tpl
                     self.stopIds = stops
-                    var info = LoadedModelInfo(
+                    let info = LoadedModelInfo(
                         name: directory.lastPathComponent, directory: directory,
                         modelType: model.config.modelType, quantization: model.quantDescription,
                         parameterBytes: model.weightBytes, contextLength: model.maxSeq,
                         layers: model.config.numLayers, hiddenSize: model.config.hiddenSize,
                         chatFormat: tpl.format.rawValue, supportsThinking: tpl.supportsThinkingToggle,
-                        loadSeconds: Date().timeIntervalSince(start), supportsTools: tpl.supportsTools)
-                    info.draftName = draft != nil ? draftDirectory?.lastPathComponent : nil
+                        loadSeconds: Date().timeIntervalSince(start), supportsTools: tpl.supportsTools, draftName: draftDirectory?.lastPathComponent)
                     self.info = info
                     cont.resume(returning: info)
                 } catch {
@@ -466,7 +472,7 @@ public final class InferenceEngine: @unchecked Sendable {
         // (on unless `speculative` is explicitly false).
         let canVerify = model.supportsBatchedVerify && !nameOpen
         let draftModel = canVerify && parameters.speculative != false ? self.draftModel : nil
-        let promptLookup = canVerify && ((parameters.speculative ?? false) || (draftModel != nil && !Self.draftWithoutPromptLookup))
+        let promptLookup = canVerify && ((parameters.speculative ?? false) || draftModel != nil)
         let speculative = promptLookup || draftModel != nil
         // Plain decoding selects tokens on the GPU, so each step is queued before the previous one
         // is read back and the GPU never waits for sampling or detokenisation.
@@ -495,14 +501,8 @@ public final class InferenceEngine: @unchecked Sendable {
             } else {
                 logits = try model.forward(prompt, offset: common, isCancelled: { token.isCancelled })
             }
-            if let draftModel {
-                // The draft is advisory: if it fails, generation simply continues without it.
-                do {
-                    let n = draftCached.count
-                    _ = try draftModel.forward(tokens[n...].map { Int32($0) }, offset: n, isCancelled: { token.isCancelled })
-                    draftCached = tokens
-                } catch EngineError.cancelled { throw EngineError.cancelled } catch { draftOK = false }
-            }
+            // The draft model catches up on the prompt lazily (`proposeFromModel`, after the first
+            // token is out), so the time to first token stays the target's own.
         } catch EngineError.cancelled {
             stats.stopReason = "cancelled"
             emit(.finished(stats))
@@ -683,12 +683,7 @@ public final class InferenceEngine: @unchecked Sendable {
         stats.tokensPerSecond = Double(stats.generatedTokens) / max(dt, 1e-6)
         if drafted > 0 { stats.draftTokens = drafted; stats.acceptedDraftTokens = acceptedDrafts }
         if draftModel != nil { stats.modelDraftTokens = modelDrafted; stats.acceptedModelDraftTokens = modelAccepted }
-        if Self.traceSpeculation, modelCycles > 0 {
-            let c = Double(modelCycles)
-            FileHandle.standardError.write(String(format: "[draft model: %d cycles, accepted %d/%d (%.1f%%), %.2f tokens/cycle, draft %.2f ms + verify %.2f ms per cycle]\n",
-                                                  modelCycles, modelAccepted, modelDrafted, Double(modelAccepted) / Double(max(modelDrafted, 1)) * 100,
-                                                  Double(modelAccepted) / c + 1, draftTime / c * 1000, verifyTime / c * 1000).data(using: .utf8)!)
-        }
+        if modelCycles > 0 { stats.draftCycles = modelCycles; stats.draftSeconds = draftTime; stats.verifySeconds = verifyTime }
         emit(.finished(stats))
     }
 }
@@ -759,11 +754,6 @@ extension InferenceEngine {
     }
 
     // MARK: Draft models
-
-    /// Skip prompt lookup when a draft model is loaded (measurement only: `MLXR_DRAFT_NO_LOOKUP`).
-    static let draftWithoutPromptLookup = ProcessInfo.processInfo.environment["MLXR_DRAFT_NO_LOOKUP"] != nil
-    /// Print per-request draft-model statistics to stderr (`MLXR_SPEC_TRACE`).
-    static let traceSpeculation = ProcessInfo.processInfo.environment["MLXR_SPEC_TRACE"] != nil
 
     /// SHA-256 of a model's tokenizer.json (nil when unreadable).
     public static func tokenizerFingerprint(_ directory: URL) -> String? {

@@ -178,7 +178,11 @@ final class AppState {
     func refreshModels() {
         Task.detached(priority: .userInitiated) {
             let models = ModelStore.scan()
-            await MainActor.run { self.localModels = models }
+            await MainActor.run {
+                self.localModels = models
+                // A draft pick whose model was removed falls back to none (the picker has no such row).
+                if !["", "auto"].contains(self.draftModel), !models.contains(where: { $0.directory.path == self.draftModel }) { self.draftModel = "" }
+            }
         }
     }
 
@@ -194,11 +198,20 @@ final class AppState {
         let models = localModels
         Task {
             do {
-                let draft: URL? = switch draftSetting {
-                case "": nil
-                case "auto": InferenceEngine.autoDraft(for: model.directory, among: models)?.directory
-                default: models.first { $0.directory.path == draftSetting && $0.directory != model.directory }?.directory
-                }
+                // Resolved off the main actor (tokenizer hashing). A saved pick that no longer fits the
+                // model being loaded (another family, or removed) is dropped rather than failing the load.
+                let draft: URL? = await Task.detached(priority: .userInitiated) {
+                    switch draftSetting {
+                    case "": return nil
+                    case "auto": return InferenceEngine.autoDraft(for: model.directory, among: models)?.directory
+                    default:
+                        guard let d = models.first(where: { $0.directory.path == draftSetting }), d.isSupported, d.directory != model.directory,
+                              d.modelType == model.modelType,
+                              let fp = InferenceEngine.tokenizerFingerprint(model.directory), InferenceEngine.tokenizerFingerprint(d.directory) == fp
+                        else { return nil }
+                        return d.directory
+                    }
+                }.value
                 let info = try await engine.load(directory: model.directory, draftDirectory: draft, contextLength: ctx)
                 loadState = .loaded(info)
                 lastModelPath = model.directory.path
