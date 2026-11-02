@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.3.0
+
+Prefill, speculative decoding with a draft model, and a faster 2-token verification. Greedy output is token-identical to 1.2.2 on every supported architecture (Qwen3, Qwen2.5, Llama 3.2, Phi-3.5, Gemma 3, Mistral 7B, Qwen3 8B; short and 1,772-token prompts).
+
+- **Prefill is 1.5× faster.** The quantized prefill GEMM is one template over the per-simdgroup accumulator grid: the 32×32 tile stays for short batches, and a 64×64 tile (4×4 accumulators, two multiply-accumulates per fragment load instead of one, fully unrolled) runs long ones. Both keep every output's arithmetic chain, so results are bit-identical to the old kernel. Padded threadgroup rows and register prefetch measured slower on an M2 Pro and are not used. `flash_prefill` stages K/V as half (exact: the cache is half) with 16-byte loads of the next block during the current one's multiplies, rescales element-wise instead of through a diagonal matrix multiply, and schedules the longest query blocks first: about 1.9× faster at head size 128 and 1.4–1.6× at 256. Qwen3 0.6B prefills 512 tokens at 3,000 tok/s instead of 2,040; a 1,772-token prompt on Llama 3.2 1B goes from 1,081 to 1,596 tok/s. Decode is unchanged.
+- **Draft-model speculative decoding** (`mlxr run --draft <model|auto>`, `mlxr serve --draft`, a "Draft model" picker in the app's inspector, `draft_tokens` / `accepted_draft_tokens` in the server's `usage`). A smaller model of the same family drafts up to `maxVerifyTokens − 1` tokens with the GPU sampler, queued back to back; the target verifies them in one batched pass with the existing exact acceptance rule, so greedy output is identical and sampled output keeps the target's distribution. The draft keeps its own KV cache and prompt-cache mirror, rolls back by position, and is refused at load unless the tokenizers match (same `tokenizer.json`, or the same vocabulary, specials and bytes); the memory check sums both models. `auto` pairs the smallest installed model with the same type and tokenizer at most a quarter the size. Prompt lookup still runs first when it has a match. Qwen3 0.6B drafting for Qwen3 8B and 14B produced identical text to the plain run on short and 1,890-token prompts. **It is off by default and currently slower** (Qwen3 8B: 35.7 → 27.9 tok/s): a verification pass of 3–8 tokens still costs about three decode steps, and the 0.6B's drafts are accepted only about 45% of the time on chat text. It is shipped for measurement and for the day the verify kernel catches up.
+- **Verifying 2 tokens costs half of what it did** (Qwen3 8B: 78.6 → 40.7 ms; Qwen3 0.6B: 10.9 → 5.4 ms): a scalar 2-token matvec reads each weight once for both tokens. Batches of 3–8 tokens use a new simdgroup-matrix kernel (`qmvx4`) that dequantizes each weight once, independent of the token count; on an M2 Pro it is ALU-bound at about 3× a single-token step (replacing the weight loads with constants costs the same), so it is no faster than before for 3–4 tokens and extends the batched path to 8. Batches of 2–8 tokens now use the per-token decode attention kernels, so verification at a 1,900-token context grows with the context like a decode step does (8B: 28.8 ms at T=1, 44 ms at T=2) instead of running the prefill attention over the whole context. `maxVerifyTokens` is 8. `mlxr bench` reports verification at a short and a 1,900-token context.
+- `mlxr bench`'s profile sweeps warm up first and take the best of three: the first sweep after loading read 2–3× slower than the same matvec inside a decode step (first touch of the buffers, GPU clock ramp), which made the small matrices look latency-bound. `MLXR_BENCH_NOPROFILE=1` skips the profile.
+- Tests: the GEMM tiles against the CPU reference up to 517 tokens with odd sizes, tiles agreeing bitwise across batch sizes, prefill vs incremental decode for a 600-token prompt (two batches, the second at offset 512), a verification batch of 2–8 tokens matching one-at-a-time decode with plain and split attention on every installed architecture, exact speculative acceptance on synthetic logits, and self-draft greedy identity.
+
+Not shipped from the same pass, measured and rejected: folding qkv_post into the decode attention, SiLU into the down projection and the residual add + RMSNorm into the next matvec's prologue (bit-identical, but the step got slower: the norm prologue alone cost +2 ms on Qwen3 0.6B, and widening the matvec kernel's template slowed the plain single-token path by 30%).
+
+Against mlx-lm 0.32.2 (mlx 0.32.4) on the same weight files, M2 Pro 16 GB: decode is a 128-step single-token loop at a 16-token context (mlx-lm's `stream_generate` rate, which overlaps its CPU work, in brackets), prefill is a timed raw forward of 512 tokens from an empty cache.
+
+| Model (4-bit) | Decode: MLX Runner | mlx-lm | Prefill 512: MLX Runner | mlx-lm |
+|---|---|---|---|---|
+| Qwen3 0.6B | 298 tok/s | 239 (260) | 3,000 tok/s | 2,340 |
+| Qwen2.5 0.5B | 339 | 244 (296) | 4,240 | 4,030 |
+| Llama 3.2 1B | 202 | 199 (205) | 1,720 | 1,720 |
+| Gemma 3 1B | 188 | 144 (181) | 2,080 | 2,010 |
+| Gemma 2 2B | 94 | 83 (113) | 782 | 791 |
+| Gemma 1.1 2B | 78 | 77 (81) | 763 | 868 |
+| Gemma 4 E2B | 73 | 69 (76) | 770 | 639 |
+| Phi-3.5 mini | 70 | 69 (66) | 466 | 572 |
+| Mistral 7B | 41.0 | 42.0 (41.2) | 227 | 305 |
+
+Decode is level or ahead everywhere (both reach the memory-bandwidth ceiling on the 7B). Prefill is ahead on Qwen3 and Gemma 4, level on Qwen2.5, Llama, Gemma 3 and Gemma 2, and behind on Gemma 1.1 (−12%), Phi-3.5 (−18%) and Mistral 7B (−26%); at 128 tokens, where the 32×32 tile runs, it is 10–35% behind on every model.
+
 ## 1.2.2
 
 - Fixes the chat window freezing during a long reply (any model) and then showing the rest at once, and the transcript going blank when a reply finished. Sampled on an M2 Pro, the main thread was 100% busy in SwiftUI/AppKit layout while the engine (which streams at 6–7 ms per token) had already finished the reply into the stream buffer. Five causes, all in the chat view:
