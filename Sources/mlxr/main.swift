@@ -144,7 +144,8 @@ case "bench":
     let t = try Transformer(directory: dir, contextLength: 4096)
     print("weights: \(formatBytes(t.weightBytes))")
     let quick = ProcessInfo.processInfo.environment["MLXR_BENCH_DECODE"] != nil
-    if !quick { print(try t.profile()) }
+    let noProfile = quick || ProcessInfo.processInfo.environment["MLXR_BENCH_NOPROFILE"] != nil
+    if !noProfile { print(try t.profile()) }
     _ = try t.forward([1], offset: 0)
     for n in (quick ? [] : [128, 512, 2048]) {
         let toks = (0..<n).map { Int32($0 % 1000 + 100) }

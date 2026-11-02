@@ -1017,12 +1017,18 @@ extension Transformer {
     /// Developer micro-benchmarks: matvec bandwidth and per-dispatch overhead.
     public func profile() throws -> String {
         let q = GPU.shared.queue
+        // Best of 3 command buffers after one discarded warm-up: the first touch of freshly
+        // loaded buffers and the GPU clock ramp otherwise make the first sweep look 2-3x slower.
         func time(_ n: Int, _ body: (MTLComputeCommandEncoder) -> Void) -> Double {
-            let cb = q.makeCommandBuffer()!
-            let enc = cb.makeComputeCommandEncoder(dispatchType: .serial)!
-            for _ in 0..<n { body(enc) }
-            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-            return (cb.gpuEndTime - cb.gpuStartTime) / Double(n)
+            var best = Double.infinity
+            for rep in 0..<4 {
+                let cb = q.makeCommandBuffer()!
+                let enc = cb.makeComputeCommandEncoder(dispatchType: .serial)!
+                for _ in 0..<n { body(enc) }
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                if rep > 0 { best = min(best, (cb.gpuEndTime - cb.gpuStartTime) / Double(n)) }
+            }
+            return best
         }
         var out = ""
         let H = config.hiddenSize
