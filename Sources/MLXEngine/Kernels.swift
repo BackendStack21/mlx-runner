@@ -317,10 +317,13 @@ kernel void qmv(device const uchar* wA [[buffer(0)]],
     }
 }
 
-// Small-batch 4-bit matmul (T = 2..8 tokens: speculative verification, short prompts) on
+// Small-batch 4-bit matmul (T = 3..8 tokens: speculative verification, short prompts) on
 // simdgroup matrices. Each weight is loaded and dequantized once, independent of T; the
 // per-token work is one 8×8×8 multiply-accumulate per 64 weights, the tokens padded to 8.
-// A simdgroup owns 8 output rows: C[row][token] += W[row][k] · X[token][k], fp32 throughout.
+// An 8-row fragment: C[row][token] += W[row][k] · X[token][k], fp32 throughout.
+// On an M2 Pro it is ALU-bound at about 3x the T = 1 matvec (with the weight loads replaced by
+// constants it costs the same; half-precision fragments are no faster), so it gains over the
+// per-token kernels only from 3 tokens on (see qmvt4 for 2).
 // No threadgroup strip for the weights: every lane dequantizes exactly the two elements of
 // the W fragment it holds (thread_elements: lane → row fm, columns fn, fn + 1). The sum
 // over k is order-free, so fragment column c of step kk in a 128-wide block stands for
