@@ -817,7 +817,8 @@ public final class Transformer {
     /// selects the next token on the GPU, without waiting (draft models: catching up on the tokens
     /// the target accepted, followed by `beginDecodeStep`s queued back to back). Nothing may be in
     /// flight. The returned step's `offset` is the last token's position. A few tokens run as single-token
-    /// steps (the earlier ones without logits), which the matvec kernels do faster than one batch.
+    /// steps (the earlier ones without logits), which the matvec kernels do faster than one batch; their
+    /// buffers count as one step for the in-flight limit (they share no per-position sampler state).
     public func beginSteps(_ tokens: [Int32], offset: Int, sample: SampleParams) throws -> DecodeStep {
         guard !tokens.isEmpty, tokens.count <= maxBatch, offset >= 0, offset + tokens.count < maxSeq else { throw EngineError.contextFull }
         guard tokens.allSatisfy({ $0 >= 0 && Int($0) < embed.outDim }) else {
