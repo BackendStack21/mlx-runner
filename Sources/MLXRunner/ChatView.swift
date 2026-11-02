@@ -253,6 +253,9 @@ struct MessageRow: View {
     let conversationID: UUID
     let isLast: Bool
     @State private var hovering = false
+    /// The action buttons also track the pointer themselves, so they stay visible while it is on
+    /// them even if the row reports that its hover ended.
+    @State private var hoveringButtons = false
     @State private var editing = false
     @State private var editText = ""
 
@@ -291,7 +294,10 @@ struct MessageRow: View {
                             IconButton("pencil", "Edit") { editText = message.content; editing = true }
                             IconButton("doc.on.doc", "Copy") { copy(message.content) }
                         }
-                        .opacity(hovering ? 1 : 0)
+                        .onHover { hoveringButtons = $0 }
+            .onDisappear { hoveringButtons = false }
+                        .onDisappear { hoveringButtons = false }
+                        .opacity(hovering || hoveringButtons ? 1 : 0)
                     }
                 }
             }
@@ -364,7 +370,8 @@ struct MessageRow: View {
                 IconButton("doc.on.doc", "Copy") { copy(message.content) }
                 if isLast { IconButton("arrow.clockwise", "Regenerate") { state.regenerate(in: conversationID) } }
             }
-            .opacity(hovering ? 1 : 0)
+            .onHover { hoveringButtons = $0 }
+            .opacity(hovering || hoveringButtons ? 1 : 0)
         }
     }
 
