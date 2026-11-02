@@ -145,8 +145,7 @@ case "bench":
     print("weights: \(formatBytes(t.weightBytes))")
     let quick = ProcessInfo.processInfo.environment["MLXR_BENCH_DECODE"] != nil
     let noProfile = quick || ProcessInfo.processInfo.environment["MLXR_BENCH_NOPROFILE"] != nil
-    if !noProfile { print(try t.profile()) }
-    _ = try t.forward([1], offset: 0)
+    if !noProfile { print(try t.profile()) }    _ = try t.forward([1], offset: 0)
     for n in (quick ? [] : [128, 512, 2048]) {
         let toks = (0..<n).map { Int32($0 % 1000 + 100) }
         let s = Date()
@@ -185,16 +184,21 @@ case "bench":
         }
     }
     // Speculative verification cost: one forward over T tokens with logits for every row.
-    for T in 1...Transformer.maxVerifyTokens {
-        let steps = 32
-        let s = Date()
-        var gpu = 0.0
-        for i in 0..<steps {
-            _ = try t.forward((0..<T).map { Int32(600 + $0 + i) }, offset: 64, allLogits: true)
-            gpu += t.lastGPUTime
+    // At a short context and after a 1900-token prompt (the attention part grows with the context).
+    for ctx in [64, 1900] {
+        if ctx > 64 { _ = try t.forward((0..<ctx).map { Int32(100 + $0 % 5000) }, offset: 0) }
+        for T in 1...Transformer.maxVerifyTokens {
+            let steps = 32
+            let s = Date()
+            var gpu = 0.0
+            for i in 0..<steps {
+                _ = try t.forward((0..<T).map { Int32(600 + $0 + i) }, offset: ctx, allLogits: true)
+                gpu += t.lastGPUTime
+            }
+            let dt = Date().timeIntervalSince(s) / Double(steps)
+            let label = ctx > 64 ? "verify @\(ctx)" : "verify"
+            print(String(format: "%@ T=%d: %6.2f ms per pass (%5.2f ms per token, gpu %.2f ms)", label as NSString, T, dt * 1000, dt * 1000 / Double(T), gpu / Double(steps) * 1000))
         }
-        let dt = Date().timeIntervalSince(s) / Double(steps)
-        print(String(format: "verify T=%d: %6.2f ms per pass (%5.2f ms per token, gpu %.2f ms)", T, dt * 1000, dt * 1000 / Double(T), gpu / Double(steps) * 1000))
     }
     for T in [5, 8, 12, 15] {
         let s = Date()

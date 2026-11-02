@@ -440,6 +440,92 @@ kernel void qmvx4(device const uchar* wA [[buffer(0)]],
     }
 }
 
+// Small-batch 4-bit matvec, scalar (TT tokens; instantiated for 2): qmv's algebra (x pre-scaled by
+// 16^-j, so a nibble is extracted by a mask only) with every token's x in registers, so each weight
+// is loaded and unpacked once per TT tokens. KL values per lane per row, R rows per simdgroup share
+// one x read. Token rows past p.T repeat the last token (not stored). Same fused [A|B|C] layout as
+// `qmv` (R divides 8, so a simdgroup's rows stay in one slot).
+#define QTNSG 2
+template <typename T, int TT, int R, int KL>
+kernel void qmvt4(device const uchar* wA [[buffer(0)]],
+                  device const T*     sA [[buffer(1)]],
+                  device const T*     bA [[buffer(2)]],
+                  device const float* x  [[buffer(3)]],
+                  device float*       y  [[buffer(4)]],
+                  constant MMParams&  p  [[buffer(5)]],
+                  device const uchar* wB [[buffer(6)]],
+                  device const T*     sB [[buffer(7)]],
+                  device const T*     bB [[buffer(8)]],
+                  device const uchar* wC [[buffer(9)]],
+                  device const T*     sC [[buffer(10)]],
+                  device const T*     bC [[buffer(11)]],
+                  device const T*     biasA [[buffer(12)]],
+                  device const T*     biasB [[buffer(13)]],
+                  device const T*     biasC [[buffer(14)]],
+                  uint2 tgid [[threadgroup_position_in_grid]],
+                  uint  tid  [[thread_index_in_threadgroup]],
+                  uint  sgid [[simdgroup_index_in_threadgroup]],
+                  uint  lane [[thread_index_in_simdgroup]]) {
+    const int gRow = (int(tgid.x) * QTNSG + int(sgid)) * R;
+    if (gRow >= p.O) return;
+    device const uchar* w; device const T* sc; device const T* bi; device const T* rb;
+    int rowBase;
+    if (gRow < p.o1) { w = wA; sc = sA; bi = bA; rb = biasA; rowBase = gRow; }
+    else if (gRow < p.o1 + p.o2) { w = wB; sc = sB; bi = bB; rb = biasB; rowBase = gRow - p.o1; }
+    else { w = wC; sc = sC; bi = bC; rb = biasC; rowBase = gRow - p.o1 - p.o2; }
+    const int nr = min(R, p.O - gRow);
+    const int nt = min(TT, p.T);
+    const ulong rowBytes = ulong(p.K) / 2;
+    const int gpr = p.K / p.gs;
+    float acc[R][TT];
+    for (int r = 0; r < R; r++) for (int t = 0; t < TT; t++) acc[r][t] = 0.0f;
+    device const uchar* wb = w + ulong(rowBase) * rowBytes;
+    device const T* sb = sc + rowBase * gpr;
+    device const T* bb = bi + rowBase * gpr;
+    const float4 sLo = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    const float4 sHi = sLo * (1.0f / 65536.0f);
+    const uint4 mLo = uint4(0xFu, 0xF0u, 0xF00u, 0xF000u);
+    const uint4 mHi = mLo << 16;
+    constexpr int NW = KL / 8;                  // packed uints per lane per row
+    for (int k = int(lane) * KL; k < p.K; k += 32 * KL) {
+        float4 xv[TT][2 * NW];
+        float xs[TT];
+        for (int t = 0; t < TT; t++) {
+            device const float4* xp = (device const float4*)(x + min(t, nt - 1) * p.xStride + k);
+            float4 sum = float4(0);
+            for (int i = 0; i < 2 * NW; i++) {
+                const float4 v = xp[i];
+                sum += v;
+                xv[t][i] = v * ((i & 1) ? sHi : sLo);
+            }
+            xs[t] = dot(sum, float4(1.0f));
+        }
+        const int g = k / p.gs;
+        const ulong off = ulong(k) >> 1;
+        for (int r = 0; r < R; r++) {
+            const int rr = min(r, nr - 1);
+            uint wv[NW];
+            if (NW == 2) { const uint2 u = *(device const uint2*)(wb + ulong(rr) * rowBytes + off); wv[0] = u.x; wv[NW - 1] = u.y; }
+            else wv[0] = *(device const uint*)(wb + ulong(rr) * rowBytes + off);
+            float4 q[2 * NW];
+            for (int i = 0; i < NW; i++) { q[2 * i] = float4(uint4(wv[i]) & mLo); q[2 * i + 1] = float4(uint4(wv[i]) & mHi); }
+            const float s = float(sb[rr * gpr + g]), b = float(bb[rr * gpr + g]);
+            for (int t = 0; t < TT; t++) {
+                float d = 0.0f;
+                for (int i = 0; i < 2 * NW; i++) d += dot(q[i], xv[t][i]);
+                acc[r][t] += s * d + b * xs[t];
+            }
+        }
+    }
+    for (int r = 0; r < R; r++) {
+        for (int t = 0; t < TT; t++) {
+            const float v = simd_sum(acc[r][t]);
+            if (lane == 0 && r < nr && t < nt)
+                y[t * p.yStride + gRow + r] = v + (p.hasBias ? float(rb[rowBase + r]) : 0.0f);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Prefill path for dense weights (dgemm): tiled GEMM on simdgroup matrices. Y[T, O] = X[T, K] · W[O, K]ᵀ
 // Threadgroup tile: 32 tokens × 32 output rows, K-step 32, 4 simdgroups (2×2),
@@ -1032,15 +1118,18 @@ kernel void attention(device const float* qkv [[buffer(0)]],
                                      (threadgroup const float*)ta, lane, out + t * p.outStride + h * p.D);
 }
 
-// Long-context decode (T = 1), split across threadgroups. The work is the
+// Long-context decode, split across threadgroups. The work is the
 // `attention<E, ASPLIT_V>` kernel's, re-arranged without changing any result:
 // virtual simdgroup v = tg.y * ASPLIT_NSG + sg takes keys v, v+ASPLIT_V, ...
-// for G query heads of KV head tg.x (each K/V row is read once per GQA
+// for G query heads of one KV head (each K/V row is read once per GQA
 // group), and writes its partial (max, sum, acc) per head. attention_combine
 // then merges the ASPLIT_V partials per head in the same order. Large heads
 // (256/512, Gemma) take their query heads in sub-groups of G: tg.z selects the
 // sub-group, so the registers stay bounded and each K/V row is read once per sub-group.
-// Partials layout (floats): pm[nH*V] | pl[nH*V] | pa[nH*V*D], row = h*V + v.
+// A small batch (T = 2..8, speculative verification) runs every query token t as its own
+// decode step at position offset + t: tg.x = kvh · T + t (the tokens of one KV head are
+// neighbours in the grid, so their K/V reads meet in the cache).
+// Partials layout (floats), per token: pm[nH*V] | pl[nH*V] | pa[nH*V*D], row = h*V + v.
 #define ASPLIT_V 32
 #define ASPLIT_NSG 4
 template <int E, int G, bool CAP>
@@ -1052,16 +1141,16 @@ kernel void attention_split(device const float* qkv  [[buffer(0)]],
                             uint3 tg   [[threadgroup_position_in_grid]],
                             uint  sg   [[simdgroup_index_in_threadgroup]],
                             uint  lane [[thread_index_in_simdgroup]]) {
-    const int kvh = int(tg.x);
+    const int t = int(tg.x) % p.T, kvh = int(tg.x) / p.T;
     const int v = int(tg.y) * ASPLIT_NSG + int(sg);
     const int h0 = kvh * (p.nH / p.nKV) + int(tg.z) * G;
     float qr[G][E], acc[G][E], m[G], l[G];
     for (int g = 0; g < G; g++) {
-        device const float* q = qkv + (h0 + g) * p.D;
+        device const float* q = qkv + t * p.qStride + (h0 + g) * p.D;
         for (int e = 0; e < E; e++) { qr[g][e] = q[e * 32 + lane] * p.scale; acc[g][e] = 0.0f; }
         m[g] = -1e30f; l[g] = 0.0f;
     }
-    const int L = p.offset + 1;
+    const int L = p.offset + t + 1;
     device const half* kb = kc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
     device const half* vb = vc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
     for (int j0 = attn_first_key(p, L - 1) + v; j0 < L; j0 += ASPLIT_V * AU) {
@@ -1078,25 +1167,28 @@ kernel void attention_split(device const float* qkv  [[buffer(0)]],
     }
     // Virtual simdgroups with no keys still write (-1e30, 0, 0), exactly like the fused kernel.
     const int rows = p.nH * ASPLIT_V;
+    device float* pt = part + ulong(t) * ulong(rows) * ulong(2 + p.D);
     for (int g = 0; g < G; g++) {
         const int r = (h0 + g) * ASPLIT_V + v;
-        if (lane == 0) { part[r] = m[g]; part[rows + r] = l[g]; }
-        device float* pa = part + 2 * rows + r * p.D;
+        if (lane == 0) { pt[r] = m[g]; pt[rows + r] = l[g]; }
+        device float* pa = pt + 2 * rows + r * p.D;
         for (int e = 0; e < E; e++) pa[e * 32 + lane] = acc[g][e];
     }
 }
 
-// One simdgroup per head: merge the ASPLIT_V partials of attention_split.
+// One simdgroup per (head, token): merge the ASPLIT_V partials of attention_split.
 template <int E>
 kernel void attention_combine(device const float* part [[buffer(0)]],
                               device float*       out  [[buffer(1)]],
                               constant AttnParams& p   [[buffer(2)]],
-                              uint h    [[threadgroup_position_in_grid]],
+                              uint2 tg  [[threadgroup_position_in_grid]],
                               uint lane [[thread_index_in_simdgroup]]) {
+    const int h = int(tg.x), t = int(tg.y);
     const int rows = p.nH * ASPLIT_V;
-    const int r = int(h) * ASPLIT_V;
-    attn_merge<E, ASPLIT_V>((device const float*)(part + r), (device const float*)(part + rows + r),
-                            (device const float*)(part + 2 * rows + r * p.D), lane, out + int(h) * p.D);
+    const int r = h * ASPLIT_V;
+    device const float* pt = part + ulong(t) * ulong(rows) * ulong(2 + p.D);
+    attn_merge<E, ASPLIT_V>((device const float*)(pt + r), (device const float*)(pt + rows + r),
+                            (device const float*)(pt + 2 * rows + r * p.D), lane, out + t * p.outStride + h * p.D);
 }
 
 // Prefill attention: one threadgroup per (head, block of QB queries). Each K/V
@@ -1684,6 +1776,12 @@ INST_QMM_ALL(8)
 #define INST_QMVX(T, TN) \
   template [[host_name("qmvx4_" #TN)]] kernel void qmvx4<T>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const T*, device const uchar*, device const T*, device const T*, device const T*, device const T*, device const T*, uint2, uint, uint, uint);
 INST_QMVX(half, f16) INST_QMVX(bfloat, bf16) INST_QMVX(float, f32)
+// Two tokens, 4 rows per simdgroup, 8 values per lane per row (measured on Qwen3-8B: 16 values
+// per lane or 8 rows per simdgroup are slower; with 4 tokens the registers spill or the per-token
+// FMAs make it no faster than qmvx4).
+#define INST_QMVT(T, TN) \
+  template [[host_name("qmvt4_" #TN)]] kernel void qmvt4<T, 2, 4, 8>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const T*, device const uchar*, device const T*, device const T*, device const T*, device const T*, device const T*, uint2, uint, uint, uint);
+INST_QMVT(half, f16) INST_QMVT(bfloat, bf16) INST_QMVT(float, f32)
 
 #define INST_DENSE(T, TN) \
   template [[host_name("dmm_" #TN "_1")]] kernel void dmm<T, 1>(device const T*, device const float*, device float*, constant MMParams&, uint2, uint, uint); \
@@ -1728,7 +1826,7 @@ INST_ASPLIT(8, 1) INST_ASPLIT(8, 2) INST_ASPLIT(8, 4)
 INST_ASPLIT(16, 1) INST_ASPLIT(16, 2)
 INST_ASPLIT_C(8, 1, true, "_cap") INST_ASPLIT_C(8, 2, true, "_cap") INST_ASPLIT_C(8, 4, true, "_cap")
 #define INST_ACOMB(E) \
-  template [[host_name("attention_combine_" #E)]] kernel void attention_combine<E>(device const float*, device float*, constant AttnParams&, uint, uint);
+  template [[host_name("attention_combine_" #E)]] kernel void attention_combine<E>(device const float*, device float*, constant AttnParams&, uint2, uint);
 INST_ACOMB(2) INST_ACOMB(3) INST_ACOMB(4) INST_ACOMB(8) INST_ACOMB(16)
 #define INST_ATTNP_C(E, QB, CAP, SFX) \
   template [[host_name("attention_prefill_" #E SFX)]] kernel void attention_prefill<E, QB, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint, uint);

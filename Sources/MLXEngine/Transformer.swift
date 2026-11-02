@@ -9,6 +9,7 @@ private let qmvRowsPerThreadgroup = 4 * qmvSimdgroups
 private let qmvThreads = 32 * qmvSimdgroups
 private let qmvxSimdgroups = 4 // QXNSG
 private let qmvxRowsPerThreadgroup = 8 * 2 * qmvxSimdgroups // 8 * QXRF * QXNSG
+private let qmvtRowsPerThreadgroup = 4 * 2 // R * QTNSG (64 threads)
 
 /// A linear layer, either MLX-quantized or dense.
 final class Linear {
@@ -28,7 +29,8 @@ final class Linear {
     private var gemm64PSO: MTLComputePipelineState?    // long prompts: 64 × 64 tiles
     private(set) var qmvPSO: MTLComputePipelineState?  // fused decode kernel (bias folded in)
     private(set) var qmvGatePSO: MTLComputePipelineState?  // decode with y = act(y) · e
-    private(set) var qmvxPSO: MTLComputePipelineState?  // 4-bit, 2...8 tokens (speculative verification, short prompts)
+    private(set) var qmvtPSO: MTLComputePipelineState?  // 4-bit, 2 tokens (speculative verification)
+    private(set) var qmvxPSO: MTLComputePipelineState?  // 4-bit, 3...8 tokens (speculative verification, short prompts)
     private var biasPSO: MTLComputePipelineState?
     let description: String
 
@@ -75,7 +77,10 @@ final class Linear {
                 if bits == 4, [128, 256, 512].contains(inDim % 1024) { tail = "t\(inDim % 1024 / 32)_" }
                 qmvPSO = try gpu.pipeline("qmv_\(tail)\(bits)_\(sfx)")
                 qmvGatePSO = try gpu.pipeline("qmv_gate_\(tail)\(bits)_\(sfx)")
-                if bits == 4 { qmvxPSO = try gpu.pipeline("qmvx4_\(sfx)") }
+                if bits == 4 {
+                    qmvxPSO = try gpu.pipeline("qmvx4_\(sfx)")
+                    qmvtPSO = try gpu.pipeline("qmvt4_\(sfx)")
+                }
             }
             if inDim % 32 == 0 {
                 gemmPSO = try gpu.pipeline("qgemm_\(bits)_\(sfx)")
@@ -121,7 +126,10 @@ final class Linear {
     static func encodeFusedDecode(_ enc: MTLComputeCommandEncoder, _ parts: [Linear], x: MTLBuffer, xOffset: Int = 0,
                                   xStride: Int = 0, y: MTLBuffer, yOffset: Int = 0, yStride: Int = 0, T: Int = 1) {
         let f = parts[0]
-        enc.setComputePipelineState(T == 1 ? f.qmvPSO! : f.qmvxPSO!)
+        // 2 tokens: scalar qmvt4 (per-token FMAs on weights unpacked once); 3...8: qmvx4 (8×8 MMA,
+        // tokens padded to 8), whose cost hardly depends on T. Both are ALU-bound on an M2 Pro.
+        let scalar = T == 2
+        enc.setComputePipelineState(T == 1 ? f.qmvPSO! : scalar ? f.qmvtPSO! : f.qmvxPSO!)
         for slot in 0..<3 {
             let p = parts[min(slot, parts.count - 1)]
             let base = slot == 0 ? 0 : 3 + slot * 3   // 0, 6, 9
@@ -134,12 +142,13 @@ final class Linear {
         enc.set(y, yOffset, 4)
         enc.set(x, xOffset, 15)
         let total = parts.reduce(0) { $0 + $1.outDim }
-        let rowsPerTG = T == 1 ? qmvRowsPerThreadgroup : qmvxRowsPerThreadgroup
+        let rowsPerTG = T == 1 ? qmvRowsPerThreadgroup : scalar ? qmvtRowsPerThreadgroup : qmvxRowsPerThreadgroup
+        let threads = T == 1 || scalar ? qmvThreads : 32 * qmvxSimdgroups
         enc.params(MMParams(K: Int32(f.inDim), O: Int32(total), T: Int32(T), gs: Int32(f.groupSize), xStride: Int32(xStride), yStride: Int32(yStride),
                             o1: Int32(parts[0].outDim), o2: Int32(parts.count > 1 ? parts[1].outDim : 0),
                             hasBias: f.bias != nil ? 1 : 0), 5)
         enc.dispatchThreadgroups(MTLSize(width: (total + rowsPerTG - 1) / rowsPerTG, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: T == 1 ? qmvThreads : 32 * qmvxSimdgroups, height: 1, depth: 1))
+                                 threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
     }
 
     /// Decode-only gated output: y[:outDim] = act(x · Wᵀ + bias) · e[:outDim] in one dispatch.
@@ -412,7 +421,7 @@ extension Transformer {
         let maxD = c.layers.map(\.headDim).max() ?? 0
         var bytes = B * 4 * (3 * H + qkv + attn + 3 * I)                     // h, xn, tmp, qkv, attn, gate|up, mlp
         bytes += (1 + maxVerifyTokens) * max(c.vocabSize, 1) * 4             // logits, logitsAll
-        bytes += c.numHeads * attnSplitVirtualSG * (maxD + 2) * 4           // split-attention partials
+        bytes += maxVerifyTokens * c.numHeads * attnSplitVirtualSG * (maxD + 2) * 4   // split-attention partials
         if c.perLayerInputSize > 0 {
             let LP = c.perLayerInputSize * c.numLayers
             bytes += B * 4 * (2 * LP + c.perLayerInputSize)                   // per-layer inputs: raw, inputs, gate
@@ -647,7 +656,7 @@ public final class Transformer {
             }
             kernels[D] = k
         }
-        attnPartials = partialBytes > 0 ? try buffer(partialBytes) : nil
+        attnPartials = partialBytes > 0 ? try buffer(partialBytes * Self.maxVerifyTokens) : nil   // per query token
         attnKernels = kernels
 
         if c.perLayerInputSize > 0 {
@@ -850,6 +859,10 @@ public final class Transformer {
         if !skipNorm { layers[0].inputNorm.encode(enc, x: h, y: xn, dim: H, rows: T, rowStride: H) }
 
         let decode = T == 1
+        // Up to maxVerifyTokens queries run as T decode steps (decode / split attention per token):
+        // the prefill kernels give one threadgroup per head the whole context, so a verify pass
+        // grew with the context length far faster than a decode step.
+        let smallT = T <= Self.maxVerifyTokens
         for (li, layer) in layers.enumerated() {
             let spec = layer.spec
             let D = spec.headDim, nKV = spec.numKVHeads, qkvCols = layer.qkvCols, I = layer.intermediate
@@ -892,7 +905,7 @@ public final class Transformer {
                                         outStride: Int32(nH * D), T: Int32(T), window: Int32(spec.sliding ? c.slidingWindow : 0),
                                         softcap: c.attnLogitSoftcap)
             if skipAttn {
-            } else if decode, offset + 1 >= attnSplitMinContext, let (split, combine) = kernels.split, let partials = attnPartials {
+            } else if smallT, offset + 1 >= attnSplitMinContext, let (split, combine) = kernels.split, let partials = attnPartials {
                 // Partials are reused by every layer: the serial encoder orders the dispatches.
                 enc.setComputePipelineState(split)
                 enc.set(qkvBuf, 0, 0)
@@ -900,23 +913,23 @@ public final class Transformer {
                 enc.set(kv.vCache!, 0, 2)
                 enc.set(partials, 0, 3)
                 enc.params(attnParams, 4)
-                enc.dispatchThreadgroups(MTLSize(width: nKV, height: Self.attnSplitVirtualSG / Self.attnSplitSG, depth: kernels.splitGroups),
+                enc.dispatchThreadgroups(MTLSize(width: nKV * T, height: Self.attnSplitVirtualSG / Self.attnSplitSG, depth: kernels.splitGroups),
                                          threadsPerThreadgroup: MTLSize(width: Self.attnSplitSG * 32, height: 1, depth: 1))
                 enc.setComputePipelineState(combine)
                 enc.set(partials, 0, 0)
                 enc.set(attnBuf, 0, 1)
                 enc.params(attnParams, 2)
-                enc.dispatchThreadgroups(MTLSize(width: nH, height: 1, depth: 1),
+                enc.dispatchThreadgroups(MTLSize(width: nH, height: T, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             } else {
-                let (attn, attnThreads) = decode ? kernels.decode : kernels.prefill
+                let (attn, attnThreads) = smallT ? kernels.decode : kernels.prefill
                 enc.setComputePipelineState(attn)
                 enc.set(qkvBuf, 0, 0)
                 enc.set(kv.kCache!, 0, 1)
                 enc.set(kv.vCache!, 0, 2)
                 enc.set(attnBuf, 0, 3)
                 enc.params(attnParams, 4)
-                enc.dispatchThreadgroups(MTLSize(width: nH, height: decode ? 1 : (T + kernels.prefillQB - 1) / kernels.prefillQB, depth: 1),
+                enc.dispatchThreadgroups(MTLSize(width: nH, height: smallT ? T : (T + kernels.prefillQB - 1) / kernels.prefillQB, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: attnThreads, height: 1, depth: 1))
             }
 
@@ -1064,8 +1077,10 @@ extension Transformer {
         sweep("o_proj", { [$0.o] }, x: attnBuf)
         sweep("gate_up", { $0.gateUp }, x: xn)
         sweep("down", { [$0.down] }, x: mlpBuf)
-        sweep("gate_up", { $0.gateUp }, x: xn, T: 4)
-        sweep("down", { [$0.down] }, x: mlpBuf, T: 4)
+        for vT in [2, 4, Self.maxVerifyTokens] {
+            sweep("gate_up", { $0.gateUp }, x: xn, T: vT)
+            sweep("down", { [$0.down] }, x: mlpBuf, T: vT)
+        }
         let tLM = time(20) { lmHead.encode($0, x: xn, xStride: H, y: logits, yStride: lmHead.outDim, T: 1) }
         out += String(format: "lm_head matvec: %.3f ms  (%.0f GB/s, cache-warm)\n", tLM * 1000, bytes(lmHead) / tLM / 1e9)
         // Decode step breakdown: the step without each kernel class (its cost includes dispatch gaps).
