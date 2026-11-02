@@ -813,6 +813,33 @@ public final class Transformer {
         return DecodeStep(cb: cb, offset: offset)
     }
 
+    /// Writes a few tokens to positions offset..<offset+count and commits one step over them that
+    /// selects the next token on the GPU, without waiting (draft models: catching up on the tokens
+    /// the target accepted, followed by `beginDecodeStep`s queued back to back). Nothing may be in
+    /// flight. The returned step's `offset` is the last token's position. A few tokens run as single-token
+    /// steps (the earlier ones without logits), which the matvec kernels do faster than one batch.
+    public func beginSteps(_ tokens: [Int32], offset: Int, sample: SampleParams) throws -> DecodeStep {
+        guard !tokens.isEmpty, tokens.count <= maxBatch, offset >= 0, offset + tokens.count < maxSeq else { throw EngineError.contextFull }
+        guard tokens.allSatisfy({ $0 >= 0 && Int($0) < embed.outDim }) else {
+            throw EngineError.invalidFile("token id outside the embedding table (\(embed.outDim) rows)")
+        }
+        prepared = nil
+        let n = tokens.count
+        let single = n <= 4
+        writeHistory(tokens, at: offset)   // read when the buffers execute
+        var cb: MTLCommandBuffer?
+        for i in single ? 0..<n : 0..<1 {
+            let last = !single || i == n - 1
+            let b: MTLCommandBuffer
+            do { b = try encode(T: single ? 1 : n, offset: offset + i, computeLogits: last, allLogits: false, sample: last ? sample : nil) }
+            catch { cb?.waitUntilCompleted(); throw error }
+            b.commit()
+            writtenHigh = max(writtenHigh, offset + i + (single ? 1 : n))
+            cb = b
+        }
+        return DecodeStep(cb: cb!, offset: offset + n - 1)
+    }
+
     /// Waits for the step and returns the token it sampled (hist[offset + 1]).
     public func finish(_ step: DecodeStep) throws -> Int {
         step.cb.waitUntilCompleted()

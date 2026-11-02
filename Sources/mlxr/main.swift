@@ -5,9 +5,9 @@ import MLXEngine
 //   mlxr search <query>
 //   mlxr download <org/repo>
 //   mlxr list
-//   mlxr run <org/repo|path> [-p prompt] [--raw] [--max N] [--temp T] [--no-think] [--ctx N]
+//   mlxr run <org/repo|path> [-p prompt] [--raw] [--max N] [--temp T] [--no-think] [--ctx N] [--draft <model|auto>]
 //   mlxr tokenize <org/repo|path> <text>
-//   mlxr serve <org/repo|path> [--port 1234] [--ctx N] [--lan]
+//   mlxr serve <org/repo|path> [--port 1234] [--ctx N] [--lan] [--draft <model|auto>]
 
 setvbuf(stdout, nil, _IONBF, 0)
 var args = Array(CommandLine.arguments.dropFirst())
@@ -34,6 +34,17 @@ func resolve(_ s: String) -> URL {
     if FileManager.default.fileExists(atPath: s) { return URL(fileURLWithPath: s) }
     if let m = ModelStore.scan().first(where: { $0.repo == s || $0.name == s }) { return m.directory }
     fail("model not found: \(s) (try `mlxr download \(s)`)")
+}
+
+/// `--draft <model|auto>`: the draft model for speculative decoding.
+func draftDirectory(_ s: String?, target: URL) -> URL? {
+    guard let s else { return nil }
+    guard s == "auto" else { return resolve(s) }
+    guard let m = InferenceEngine.autoDraft(for: target) else {
+        print("no installed draft model pairs with \(target.lastPathComponent); running without one")
+        return nil
+    }
+    return m.directory
 }
 
 func formatBytes(_ b: Int) -> String {
@@ -95,10 +106,12 @@ case "run":
     let raw = flag("--raw")
     let noThink = flag("--no-think")
     let showIds = flag("--ids")
+    let draftArg = option("--draft")
     guard let model = args.first else { fail("usage: mlxr run <model> [-p prompt]") }
     let engine = InferenceEngine.shared
-    let info = try await engine.load(directory: resolve(model), contextLength: ctx)
-    print("Loaded \(info.name) [\(info.modelType), \(info.quantization), \(info.layers) layers, \(info.chatFormat)] in \(String(format: "%.2f", info.loadSeconds))s")
+    let dir = resolve(model)
+    let info = try await engine.load(directory: dir, draftDirectory: draftDirectory(draftArg, target: dir), contextLength: ctx)
+    print("Loaded \(info.name) [\(info.modelType), \(info.quantization), \(info.layers) layers, \(info.chatFormat)]\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s")
     var params = SamplingParameters()
     params.temperature = temp
     params.maxTokens = maxTokens
@@ -117,7 +130,8 @@ case "run":
             print(String(format: "[prompt: %d tokens, %.0f tok/s, ttft %.3fs]", s.promptTokens, s.promptTokensPerSecond, s.timeToFirstToken))
         case .text(let t): print(t, terminator: "")
         case .finished(let s):
-            print(String(format: "\n[generated %d tokens at %.1f tok/s, stop: %@, drafts accepted %d/%d]", s.generatedTokens, s.tokensPerSecond, s.stopReason, s.acceptedDraftTokens ?? 0, s.draftTokens ?? 0))
+            let model = s.modelDraftTokens.map { String(format: " (draft model %d/%d)", s.acceptedModelDraftTokens ?? 0, $0) } ?? ""
+            print(String(format: "\n[generated %d tokens at %.1f tok/s, stop: %@, drafts accepted %d/%d%@]", s.generatedTokens, s.tokensPerSecond, s.stopReason, s.acceptedDraftTokens ?? 0, s.draftTokens ?? 0, model))
         }
     }
 
@@ -125,12 +139,14 @@ case "serve":
     let port = UInt16(option("--port") ?? "1234") ?? 1234
     let ctx = Int(option("--ctx") ?? "8192") ?? 8192
     let lan = flag("--lan")
-    guard let model = args.first else { fail("usage: mlxr serve <model> [--port 1234] [--ctx N] [--lan] [--api-key KEY]") }
+    let draftArg = option("--draft")
+    guard let model = args.first else { fail("usage: mlxr serve <model> [--port 1234] [--ctx N] [--lan] [--api-key KEY] [--draft <model|auto>]") }
     // LAN mode always needs a key: use --api-key / MLXR_API_KEY, or generate one.
     var key = option("--api-key") ?? ProcessInfo.processInfo.environment["MLXR_API_KEY"]
     if lan && key == nil { key = OpenAIServer.generateAPIKey() }
-    let info = try await InferenceEngine.shared.load(directory: resolve(model), contextLength: ctx)
-    print("Loaded \(info.name) in \(String(format: "%.2f", info.loadSeconds))s")
+    let dir = resolve(model)
+    let info = try await InferenceEngine.shared.load(directory: dir, draftDirectory: draftDirectory(draftArg, target: dir), contextLength: ctx)
+    print("Loaded \(info.name)\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s")
     let server = OpenAIServer(port: port, allowLAN: lan, apiKey: key)
     server.onLog = { print($0) }
     do { try server.start() } catch { fail("cannot start server: \(error.localizedDescription)") }
