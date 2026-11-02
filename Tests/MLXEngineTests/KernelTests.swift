@@ -145,6 +145,44 @@ struct MatmulKernelTests {
         }
     }
 
+    /// Prefill GEMM tiles on long batches: the 32 × 32 tile (few output rows, or T just past a
+    /// multiple of 64) and the 64 × 64 tile (many rows), with odd O and K % 64 != 0.
+    @Test(arguments: [3, 4, 8])
+    func prefillTilesMatchReference(bits: Int) throws {
+        // (T, O, K, uses the 64 × 64 tile)
+        let shapes = [(64, 41, 1056, false), (128, 41, 544, false), (517, 41, 544, false), (96, 2050, 544, false),
+                      (128, 2050, 544, true), (517, 520, 544, true)]
+        for (T, O, K, big) in shapes {
+            #expect(Linear.useGemm64(T: T, outDim: O) == big, "tile choice T \(T) O \(O)")
+            let fx = try QuantFixture(O: O, K: K, bits: bits, gs: 32, seed: UInt64(T + O))
+            var rng = RNG(s: UInt64(T * 7 + bits))
+            let x = (0..<(T * K)).map { _ in rng.float() }
+            let yb = try GPU.shared.buffer(T * O * 4)
+            runGPU { fx.linear.encode($0, x: makeBuffer(x), xStride: K, y: yb, yStride: O, T: T) }
+            assertClose(readFloats(yb, T * O), fx.reference(x, T: T, K: K), "bits \(bits) T \(T) O \(O) K \(K)")
+        }
+    }
+
+    /// Both prefill tiles (and the short-prompt tiles) compute every output with the same chain of
+    /// operations, so a token's output does not depend on the batch it was computed in.
+    @Test func prefillTilesAgreeBitwise() throws {
+        let O = 2050, K = 1024
+        let fx = try QuantFixture(O: O, K: K, bits: 4, gs: 64, seed: 3)
+        var rng = RNG(s: 11)
+        let x = (0..<(256 * K)).map { _ in rng.float() }
+        let xb = makeBuffer(x)
+        func run(_ T: Int) throws -> [UInt32] {
+            let yb = try GPU.shared.buffer(T * O * 4)
+            runGPU { fx.linear.encode($0, x: xb, xStride: K, y: yb, yStride: O, T: T) }
+            return readFloats(yb, T * O).map(\.bitPattern)
+        }
+        #expect(Linear.useGemm64(T: 256, outDim: O) && !Linear.useGemm64(T: 96, outDim: O))
+        let full = try run(256)
+        for T in [9, 16, 33, 96] {
+            #expect(try run(T) == Array(full[..<(T * O)]), "T \(T) vs T 256")
+        }
+    }
+
     /// K values that are not a multiple of the 4-bit decode kernel's 1024-wide pass: the 128/256/512
     /// remainders are spread over all lanes, others fall back to a partial pass (Gemma, Qwen2.5).
     @Test(arguments: [1152, 1536, 2304, 2560, 896, 1664, 6912])

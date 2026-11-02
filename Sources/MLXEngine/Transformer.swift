@@ -24,6 +24,7 @@ final class Linear {
     private var gemmPSO: MTLComputePipelineState?      // prefill tiles (simdgroup matrices)
     private var gemm8PSO: MTLComputePipelineState?     // 5...8 tokens: qgemm on an 8-token tile
     private var gemm16PSO: MTLComputePipelineState?    // 9...16 tokens: qgemm on a 16-token tile
+    private var gemm64PSO: MTLComputePipelineState?    // long prompts: 64 × 64 tiles
     private(set) var qmvPSO: MTLComputePipelineState?  // fused decode kernel (bias folded in)
     private(set) var qmvGatePSO: MTLComputePipelineState?  // decode with y = act(y) · e
     private(set) var qmvbPSO: MTLComputePipelineState?  // 4-bit, 2...4 tokens (speculative verification)
@@ -75,7 +76,10 @@ final class Linear {
                 qmvGatePSO = try gpu.pipeline("qmv_gate_\(tail)\(bits)_\(sfx)")
                 if bits == 4 { qmvbPSO = try gpu.pipeline("qmvb4_\(sfx)_4") }
             }
-            if inDim % 32 == 0 { gemmPSO = try gpu.pipeline("qgemm_\(bits)_\(sfx)") }
+            if inDim % 32 == 0 {
+                gemmPSO = try gpu.pipeline("qgemm_\(bits)_\(sfx)")
+                gemm64PSO = try gpu.pipeline("qgemm64_\(bits)_\(sfx)")
+            }
             if inDim % 64 == 0 {  // the short-prompt tiles step K by 64
                 gemm8PSO = try gpu.pipeline("qgemms_\(bits)_\(sfx)_8")
                 gemm16PSO = try gpu.pipeline("qgemms_\(bits)_\(sfx)_16")
@@ -154,6 +158,14 @@ final class Linear {
                                  threadsPerThreadgroup: MTLSize(width: qmvThreads, height: 1, depth: 1))
     }
 
+    /// The 64 × 64 GEMM tile runs ~1.2× faster per row than the 32 × 32 one, but pads the batch to a
+    /// multiple of 64 tokens and makes a quarter as many threadgroups: use it when it pads at most
+    /// 1.2× more rows and still yields enough threadgroups to fill the GPU (M2 Pro measurements).
+    static func useGemm64(T: Int, outDim: Int) -> Bool {
+        let rows64 = (T + 63) / 64 * 64, rows32 = (T + 31) / 32 * 32
+        return rows64 * 5 <= rows32 * 6 && (T + 63) / 64 * ((outDim + 63) / 64) >= 64
+    }
+
     /// y[t, :outDim] (row stride yStride, starting at yOffset bytes) = x[t] · Wᵀ (+ bias)
     func encode(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, xOffset: Int = 0, xStride: Int,
                 y: MTLBuffer, yOffset: Int = 0, yStride: Int, T: Int) {
@@ -162,12 +174,14 @@ final class Linear {
             return
         }
         // 5+ tokens: tiled GEMM beats the small-batch kernel. A full tile is 32 tokens; short prompts
-        // use an 8- or 16-token tile instead of paying for 32 (same arithmetic per output element).
-        var gemm: (pso: MTLComputePipelineState, rows: Int)?
+        // use an 8- or 16-token tile instead of paying for 32, long ones a 64 × 64 tile (same
+        // arithmetic per output element in all of them).
+        var gemm: (pso: MTLComputePipelineState, rows: Int, cols: Int)?
         if T > Transformer.maxVerifyTokens {
-            if T <= 8, let p = gemm8PSO { gemm = (p, 8) }
-            else if T <= 16, let p = gemm16PSO { gemm = (p, 16) }
-            else if let p = gemmPSO { gemm = (p, 32) }
+            if T <= 8, let p = gemm8PSO { gemm = (p, 8, 32) }
+            else if T <= 16, let p = gemm16PSO { gemm = (p, 16, 32) }
+            else if Linear.useGemm64(T: T, outDim: outDim), let p = gemm64PSO { gemm = (p, 64, 64) }
+            else if let p = gemmPSO { gemm = (p, 32, 32) }
         }
         let tt = T == 1 ? 1 : prefillTT
         enc.setComputePipelineState(gemm?.pso ?? (T == 1 ? pso1 : psoN))
@@ -181,7 +195,7 @@ final class Linear {
         enc.params(MMParams(K: Int32(inDim), O: Int32(outDim), T: Int32(T), gs: Int32(groupSize),
                             xStride: Int32(xStride), yStride: Int32(yStride)), 5)
         if let gemm {
-            enc.dispatchThreadgroups(MTLSize(width: (outDim + 31) / 32, height: (T + gemm.rows - 1) / gemm.rows, depth: 1),
+            enc.dispatchThreadgroups(MTLSize(width: (outDim + gemm.cols - 1) / gemm.cols, height: (T + gemm.rows - 1) / gemm.rows, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
         } else {
             enc.dispatchThreadgroups(MTLSize(width: (outDim + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
