@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MLX Runner: run MLX models on your Mac, natively and fast</title>
-<meta name="description" content="MLX Runner is a native macOS app to discover, download and chat with MLX models from Hugging Face. 100% Swift with zero third-party dependencies and its own Metal inference engine: 358 tok/s on Qwen2.5 0.5B and 41 tok/s on Mistral 7B on an M2 Pro. OpenAI-compatible local server with tool calling, and the mlxr CLI. Free and open source (MIT).">
+<meta name="description" content="MLX Runner is a native macOS app to discover, download and chat with MLX models from Hugging Face. 100% Swift with zero third-party dependencies and its own Metal inference engine: 343 tok/s on Qwen2.5 0.5B and 41 tok/s on Mistral 7B on an M2 Pro. OpenAI-compatible local server with tool calling, and the mlxr CLI. Free and open source (MIT).">
 <meta name="robots" content="index, follow, max-image-preview:large">
 <meta name="author" content="21no.de">
 <meta name="color-scheme" content="dark light">
@@ -24,13 +24,13 @@
 <meta property="og:image:type" content="image/png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="MLX Runner by 21no.de: LLMs at the speed of unified memory. 358 tok/s on Qwen2.5 0.5B, 41 tok/s on Mistral 7B, M2 Pro.">
+<meta property="og:image:alt" content="MLX Runner by 21no.de: LLMs at the speed of unified memory. 343 tok/s on Qwen2.5 0.5B, 41 tok/s on Mistral 7B, M2 Pro.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:site" content="@TwentyOneNode">
 <meta name="twitter:title" content="MLX Runner: LLMs at the speed of unified memory">
 <meta name="twitter:description" content="A native macOS app for MLX models from Hugging Face. 100% Swift, zero dependencies, its own Metal engine. Free and open source.">
 <meta name="twitter:image" content="https://mlx-runner.21no.de/assets/og.png">
-<meta name="twitter:image:alt" content="MLX Runner by 21no.de: LLMs at the speed of unified memory. 358 tok/s on Qwen2.5 0.5B, 41 tok/s on Mistral 7B, M2 Pro.">
+<meta name="twitter:image:alt" content="MLX Runner by 21no.de: LLMs at the speed of unified memory. 343 tok/s on Qwen2.5 0.5B, 41 tok/s on Mistral 7B, M2 Pro.">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"MLX Runner","alternateName":"mlxr","description":"A native macOS app to discover, download and chat with MLX models from Hugging Face, with its own Metal inference engine written in Swift. Zero third-party dependencies. Includes an OpenAI-compatible local server with tool calling and the mlxr command-line tool.","url":"https://mlx-runner.21no.de/","image":"https://mlx-runner.21no.de/assets/og.png","screenshot":"https://mlx-runner.21no.de/assets/screenshot-chat.jpg","applicationCategory":"DeveloperApplication","applicationSubCategory":"Machine learning","operatingSystem":"macOS 15 or later (Apple silicon)","processorRequirements":"Apple silicon (arm64)","license":"https://opensource.org/licenses/MIT","isAccessibleForFree":true,"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"downloadUrl":"https://github.com/BackendStack21/mlx-runner/releases/latest","codeRepository":"https://github.com/BackendStack21/mlx-runner","programmingLanguage":"Swift","author":{"@type":"Organization","name":"21no.de","url":"https://21no.de"},"publisher":{"@type":"Organization","name":"21no.de","url":"https://21no.de"}}</script>
 <link rel="preload" href="fonts/SpaceGrotesk.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="site.css">
@@ -90,7 +90,7 @@
       </div>
       <div class="gaugebar" aria-hidden="true"><span id="stream-bar"></span></div>
       <dl class="stats">
-        <div><dt>decode</dt><dd><b id="stream-rate">358</b> tok/s</dd></div>
+        <div><dt>decode</dt><dd><b id="stream-rate">343</b> tok/s</dd></div>
         <div><dt>tokens</dt><dd id="stream-count">0</dd></div>
         <div><dt>elapsed</dt><dd id="stream-time">0.00 s</dd></div>
       </dl>
@@ -100,8 +100,8 @@
 
   <section class="facts" aria-label="At a glance">
     <ul>
-      <li><b>358</b><span>tok/s decode, Qwen2.5 0.5B</span></li>
-      <li><b>2,960</b><span>tok/s prefill, Qwen2.5 0.5B</span></li>
+      <li><b>343</b><span>tok/s decode, Qwen2.5 0.5B</span></li>
+      <li><b>4,270</b><span>tok/s prefill, Qwen2.5 0.5B</span></li>
       <li><b>~85%</b><span>of memory bandwidth, Mistral 7B</span></li>
       <li><b>0</b><span>third-party dependencies</span></li>
     </ul>
@@ -116,28 +116,28 @@
         <button class="btn small" type="button" id="race-run">Run the race</button>
       </div>
       <ol class="lanes" id="lanes">
-        <li data-prefill="2960" data-decode="358"><span class="lane-name">Qwen2.5 0.5B <small>278 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">0.89 s</span></li>
-        <li data-prefill="2040" data-decode="289"><span class="lane-name">Qwen3 0.6B <small>336 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">1.14 s</span></li>
-        <li data-prefill="1180" data-decode="203"><span class="lane-name">Llama 3.2 1B <small>695 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">1.69 s</span></li>
-        <li data-prefill="320" data-decode="70"><span class="lane-name">Phi-3.5 mini <small>2.15 GB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">5.26 s</span></li>
-        <li data-prefill="166" data-decode="41"><span class="lane-name">Mistral 7B v0.3 <small>4.08 GB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">9.33 s</span></li>
-        <li data-prefill="1450" data-decode="195"><span class="lane-name">Gemma 3 1B <small>732 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">1.67 s</span></li>
-        <li data-prefill="345" data-decode="67"><span class="lane-name">Gemma 3 4B <small>2.56 GB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">5.30 s</span></li>
+        <li data-prefill="4270" data-decode="343"><span class="lane-name">Qwen2.5 0.5B <small>278 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">0.87 s</span></li>
+        <li data-prefill="3020" data-decode="286"><span class="lane-name">Qwen3 0.6B <small>336 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">1.06 s</span></li>
+        <li data-prefill="1720" data-decode="202"><span class="lane-name">Llama 3.2 1B <small>695 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">1.57 s</span></li>
+        <li data-prefill="466" data-decode="70"><span class="lane-name">Phi-3.5 mini <small>2.15 GB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">4.76 s</span></li>
+        <li data-prefill="247" data-decode="41"><span class="lane-name">Mistral 7B v0.3 <small>4.08 GB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">8.32 s</span></li>
+        <li data-prefill="2070" data-decode="189"><span class="lane-name">Gemma 3 1B <small>732 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">1.60 s</span></li>
+        <li data-prefill="498" data-decode="67"><span class="lane-name">Gemma 3 4B <small>2.56 GB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">4.85 s</span></li>
       </ol>
       <div class="axis" aria-hidden="true"><span>0 s</span><span>2.5 s</span><span>5 s</span><span>7.5 s</span><span>10 s</span></div>
     </div>
     <div class="table-wrap">
       <table class="bench">
-        <caption><code>mlxr bench</code>, MLX Runner 1.2.1, M2 Pro (16 GB), 4-bit models.</caption>
+        <caption><code>mlxr bench</code>, MLX Runner 1.3.0, M2 Pro (16 GB), 4-bit models.</caption>
         <thead><tr><th scope="col">Model</th><th scope="col">Weights</th><th scope="col">Prefill (512 tok)</th><th scope="col">Decode @16</th><th scope="col">Decode @1K ctx</th></tr></thead>
         <tbody>
-          <tr><th scope="row">Qwen2.5 0.5B Instruct</th><td>278 MB</td><td>2,960 tok/s</td><td>358 tok/s</td><td>295 tok/s</td></tr>
-          <tr><th scope="row">Qwen3 0.6B</th><td>336 MB</td><td>2,040 tok/s</td><td>289 tok/s</td><td>239 tok/s</td></tr>
-          <tr><th scope="row">Llama 3.2 1B Instruct</th><td>695 MB</td><td>1,180 tok/s</td><td>203 tok/s</td><td>188 tok/s</td></tr>
-          <tr><th scope="row">Phi-3.5 mini</th><td>2.15 GB</td><td>320 tok/s</td><td>70 tok/s</td><td>61 tok/s</td></tr>
-          <tr><th scope="row">Mistral 7B v0.3</th><td>4.08 GB</td><td>166 tok/s</td><td>41.0 tok/s</td><td>39.5 tok/s</td></tr>
-          <tr><th scope="row">Gemma 3 1B (QAT)</th><td>732 MB</td><td>1,450 tok/s</td><td>195 tok/s</td><td>178 tok/s</td></tr>
-          <tr><th scope="row">Gemma 3 4B</th><td>2.56 GB</td><td>345 tok/s</td><td>67 tok/s</td><td>62 tok/s</td></tr>
+          <tr><th scope="row">Qwen2.5 0.5B Instruct</th><td>278 MB</td><td>4,270 tok/s</td><td>343 tok/s</td><td>278 tok/s</td></tr>
+          <tr><th scope="row">Qwen3 0.6B</th><td>336 MB</td><td>3,020 tok/s</td><td>286 tok/s</td><td>234 tok/s</td></tr>
+          <tr><th scope="row">Llama 3.2 1B Instruct</th><td>695 MB</td><td>1,720 tok/s</td><td>202 tok/s</td><td>185 tok/s</td></tr>
+          <tr><th scope="row">Phi-3.5 mini</th><td>2.15 GB</td><td>466 tok/s</td><td>70 tok/s</td><td>61 tok/s</td></tr>
+          <tr><th scope="row">Mistral 7B v0.3</th><td>4.08 GB</td><td>247 tok/s</td><td>41.0 tok/s</td><td>39.3 tok/s</td></tr>
+          <tr><th scope="row">Gemma 3 1B (QAT)</th><td>732 MB</td><td>2,070 tok/s</td><td>189 tok/s</td><td>173 tok/s</td></tr>
+          <tr><th scope="row">Gemma 3 4B</th><td>2.56 GB</td><td>498 tok/s</td><td>67 tok/s</td><td>62 tok/s</td></tr>
         </tbody>
       </table>
     </div>
@@ -148,7 +148,7 @@
       <p class="kicker">The 7B ceiling</p>
       <h2>Every token reads every weight. <span class="grad">Once.</span></h2>
       <p>Decoding one token streams the whole model through the GPU, so memory bandwidth sets the limit, not compute. This M2 Pro reads <b>197 GB/s</b>, which caps a 4.08 GB model at about <b>48 tok/s</b>.</p>
-      <p>MLX Runner decodes Mistral 7B at <b>41.0 tok/s</b>, about 85% of that cap. Faster means more bandwidth (an M-series Max: about 400 GB/s), fewer bits, or speculative decoding (<code>mlxr run --spec</code>).</p>
+      <p>MLX Runner decodes Mistral 7B at <b>41.0 tok/s</b>, about 85% of that cap. Faster means more bandwidth (an M-series Max: about 400 GB/s), fewer bits, or speculative decoding (exact, but on this GPU it still costs more than it saves).</p>
     </div>
     <figure class="gauge glass">
       <svg viewBox="0 0 240 140" role="img" aria-labelledby="gauge-t">

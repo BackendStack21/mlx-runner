@@ -39,9 +39,9 @@
 
   // ── 1. hero: stream an answer at each model's measured decode speed ──
   const MODELS = [
-    { name: "Qwen2.5 0.5B Instruct · 4-bit", rate: 358 },
-    { name: "Qwen3 0.6B · 4-bit", rate: 289 },
-    { name: "Llama 3.2 1B Instruct · 4-bit", rate: 203 },
+    { name: "Qwen2.5 0.5B Instruct · 4-bit", rate: 343 },
+    { name: "Qwen3 0.6B · 4-bit", rate: 286 },
+    { name: "Llama 3.2 1B Instruct · 4-bit", rate: 202 },
     { name: "Phi-3.5 mini · 4-bit", rate: 70 },
     { name: "Mistral 7B v0.3 · 4-bit", rate: 41.0 },
   ];
