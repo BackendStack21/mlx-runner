@@ -104,7 +104,7 @@ Each checkpoint above passes end-to-end generation and the prefill-versus-decode
 - **Gemma:** no tool calling and no Gemma 4 thinking mode (Gemma 4 runs with thinking off, its template's default). Sliding-window layers keep a ring of window + 512 K/V rows, so a chat whose shared prefix with the previous request ends more than 512 tokens before that request's end is processed from the start instead of reusing the cache.
 - **Chat templates:** the prompt format is detected (ChatML, Llama 3, Mistral, Phi-3, Gemma, Gemma 4) rather than executed as Jinja, so a model with an unusual template may get a near-match format.
 - **Prefill speed:** about 165 tok/s on a 7B model on an M2 Pro, because the prefill GEMM reaches about 35% of fp32 peak.
-- **Speculative decoding is opt-in.** Prompt-lookup drafting with exact verification is implemented and tested (greedy output is identical), but checking 4 drafted tokens on a 7B model still costs about 3 decode steps. So it only helps when most drafts are accepted (copying or editing text), and it is off by default (`SamplingParameters.speculative`, or `mlxr run --spec`).
+- **Speculative decoding is opt-in.** Prompt-lookup drafting with exact verification is implemented and tested (greedy output is identical), but checking 4 drafted tokens on a 7B model still costs about 3 decode steps. So it only helps when most drafts are accepted (copying or editing text), and it is off by default (`SamplingParameters.speculative`, or `mlxr run --spec`). A draft model of the same family (`--draft mlx-community/Qwen3-0.6B-4bit`, `--draft auto`, or "Draft model" in the inspector) drafts when prompt lookup has nothing; with Qwen3-8B it gets about half of its drafts accepted, which does not pay off until verifying costs much less than today.
 - **Glass effects:** set `MLXRUNNER_NO_GLASS=1` to use plain materials instead of Liquid Glass.
 
 ## Performance
@@ -148,6 +148,7 @@ mlxr download mlx-community/Qwen3-4B-4bit   # download into the app's library
 mlxr list                                   # installed models
 mlxr run mlx-community/Qwen3-4B-4bit -p "Explain RoPE" --max 300 [--temp 0.7] [--no-think]
 mlxr serve mlx-community/Qwen3-4B-4bit --port 1234     # OpenAI-compatible server (--lan prints an API key)
+mlxr run mlx-community/Qwen3-8B-4bit --draft mlx-community/Qwen3-0.6B-4bit   # speculative decoding (or --draft auto)
 mlxr bench mlx-community/Qwen3-4B-4bit      # prefill/decode throughput + kernel micro-benchmarks
 mlxr tokenize <model> "some text"
 ```
