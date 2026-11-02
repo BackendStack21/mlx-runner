@@ -55,6 +55,30 @@ struct ModelTests {
         #expect(maxDiff < 0.1, "max logit difference \(maxDiff)")
     }
 
+    /// A prompt longer than one prefill batch (512 tokens): the 64 × 64 GEMM tiles and flash
+    /// attention over many key blocks, then a second batch at offset 512, against token-by-token decode.
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, "mlx-community/Qwen3-8B-4bit"])
+    func longPrefillMatchesIncrementalDecode(repo: String) throws {
+        guard let dir = installedModel(repo) else { return }
+        let model = try Transformer(directory: dir, contextLength: 1024)
+        let tok = try Tokenizer(directory: dir)
+        let text = (0..<40).map { "Item \($0): the \(["red", "green", "blue", "amber"][$0 % 4]) fox jumps over \($0 * 7) lazy dogs." }.joined(separator: " ")
+        let ids = Array(tok.encode(text).map { Int32($0) }.prefix(600))
+        #expect(ids.count > ModelConfig.maxBatch + 32)
+        let V = model.vocabSize
+        let pre = Array(UnsafeBufferPointer(start: try model.forward(ids, offset: 0), count: V))
+        var inc: [Float] = []
+        for (i, t) in ids.enumerated() {
+            let l = try model.forward([t], offset: i)
+            if i == ids.count - 1 { inc = Array(UnsafeBufferPointer(start: l, count: V)) }
+        }
+        let argPre = pre.indices.max { pre[$0] < pre[$1] }!
+        let argInc = inc.indices.max { inc[$0] < inc[$1] }!
+        #expect(argPre == argInc)
+        let maxDiff = zip(pre, inc).map { abs($0 - $1) }.max()!
+        #expect(maxDiff < 0.1, "max logit difference \(maxDiff)")
+    }
+
     /// The long-context split decode attention (attention_split + attention_combine) must give
     /// bit-identical logits to the single-kernel decode attention, at long and short contexts.
     @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral])
@@ -74,6 +98,40 @@ struct ModelTests {
             let split = Array(UnsafeBufferPointer(start: try model.forward([ids[offset]], offset: offset), count: V))
             #expect(ref == split, "split decode attention differs at offset \(offset)")
         }
+        model.attnSplitMinContext = Transformer.defaultSplitMinContext
+    }
+
+    /// A speculative verification batch (T = 2...8: qmvt4 / qmvx4 and per-token decode or split
+    /// attention) gives every row the next-token distribution of decoding the tokens one at a time.
+    @Test(.enabled(if: installedModel(qwen3) != nil),
+          arguments: [qwen3, llama, phi, mistral, "mlx-community/Qwen3-8B-4bit", GemmaModelTests.gemma3, GemmaModelTests.gemma4])
+    func verifyBatchMatchesIncrementalDecode(repo: String) throws {
+        guard let dir = installedModel(repo) else { return }
+        let model = try Transformer(directory: dir, contextLength: 1024)
+        let tok = try Tokenizer(directory: dir)
+        let ids = tok.encode(String(repeating: "The quick brown fox jumps over the lazy dog, then it ran into the forest. ", count: 4)).map { Int32($0) }
+        let V = model.vocabSize, o = 24
+        #expect(ids.count >= o + 8)
+        var worst: Float = 0
+        for split in [false, true] {
+            model.attnSplitMinContext = split ? 1 : Int.max
+            for T in [2, 3, 5, 8] {
+                _ = try model.forward(Array(ids.prefix(o)), offset: 0)
+                let batch = Array(ids[o..<(o + T)])
+                let all = Array(UnsafeBufferPointer(start: try model.forward(batch, offset: o, allLogits: true), count: T * V))
+                for (i, t) in batch.enumerated() {
+                    let inc = Array(UnsafeBufferPointer(start: try model.forward([t], offset: o + i), count: V))
+                    let row = all[(i * V)..<((i + 1) * V)]
+                    let argRow = row.indices.max { row[$0] < row[$1] }! - i * V
+                    let argInc = inc.indices.max { inc[$0] < inc[$1] }!
+                    #expect(argRow == argInc, "\(repo) split \(split) T \(T) row \(i)")
+                    let d = zip(row, inc).map { abs($0 - $1) }.max()!
+                    worst = max(worst, d)
+                    #expect(d < 0.1, "\(repo) split \(split) T \(T) row \(i): max logit difference \(d)")
+                }
+            }
+        }
+        print("verifyBatchMatchesIncrementalDecode \(repo): max logit difference \(worst)")
         model.attnSplitMinContext = Transformer.defaultSplitMinContext
     }
 

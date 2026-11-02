@@ -103,8 +103,8 @@ Each checkpoint above passes end-to-end generation and the prefill-versus-decode
 - **Unsupported model types:** mixture-of-experts (Mixtral, Qwen3-MoE, Gemma 4 26B-A4B), Gemma 3n, and the vision and audio parts of multimodal models (Gemma 3 and Gemma 4 exports run as text-only). Discover marks unsupported types as not runnable.
 - **Gemma:** no tool calling and no Gemma 4 thinking mode (Gemma 4 runs with thinking off, its template's default). Sliding-window layers keep a ring of window + 512 K/V rows, so a chat whose shared prefix with the previous request ends more than 512 tokens before that request's end is processed from the start instead of reusing the cache.
 - **Chat templates:** the prompt format is detected (ChatML, Llama 3, Mistral, Phi-3, Gemma, Gemma 4) rather than executed as Jinja, so a model with an unusual template may get a near-match format.
-- **Prefill speed:** about 165 tok/s on a 7B model on an M2 Pro, because the prefill GEMM reaches about 35% of fp32 peak.
-- **Speculative decoding is opt-in.** Prompt-lookup drafting with exact verification is implemented and tested (greedy output is identical), but checking 4 drafted tokens on a 7B model still costs about 3 decode steps. So it only helps when most drafts are accepted (copying or editing text), and it is off by default (`SamplingParameters.speculative`, or `mlxr run --spec`).
+- **Prefill speed:** about 247 tok/s on a 7B model on an M2 Pro, against about 305 for mlx-lm on the same files. The 64×64 GEMM tile measures about 3.5 TFLOPS. Prompts shorter than about 128 tokens use the 32×32 tile and are further behind mlx-lm.
+- **Speculative decoding is opt-in and, for now, slower.** Prompt lookup (`mlxr run --spec`) and a draft model (`mlxr run --draft <model|auto>`, or the app's "Draft model" setting) both verify exactly, so greedy output is identical to a plain run. But verifying 3–8 drafted tokens costs about three decode steps on this GPU (the batched kernel is ALU-bound, see CHANGELOG 1.3.0), verifying 2 costs about 1.5, and Qwen3 0.6B's drafts for Qwen3 8B are accepted about 45% of the time on chat text: Qwen3 8B generates at 28 tok/s with the draft instead of 38. Both stay off by default until the verify kernel pays for them.
 - **Glass effects:** set `MLXRUNNER_NO_GLASS=1` to use plain materials instead of Liquid Glass.
 
 ## Performance
@@ -113,13 +113,29 @@ Measured with `mlxr bench` on an **M2 Pro (16 GB)**. Decode is measured with gre
 
 | Model (4-bit) | Weights | Prefill (512 tok) | Decode @16 | Decode @1K ctx |
 |---|---|---|---|---|
-| Qwen2.5 0.5B Instruct | 278 MB | 2,960 tok/s | 358 tok/s | 295 tok/s |
-| Qwen3 0.6B | 336 MB | 2,040 tok/s | 289 tok/s | 239 tok/s |
-| Llama 3.2 1B Instruct | 695 MB | 1,180 tok/s | 203 tok/s | 188 tok/s |
-| Phi-3.5 mini | 2.15 GB | 320 tok/s | 70 tok/s | 61 tok/s |
-| Mistral 7B v0.3 | 4.08 GB | 166 tok/s | 41.0 tok/s | 39.5 tok/s |
-| Gemma 3 1B (QAT) | 732 MB | 1,450 tok/s | 195 tok/s | 178 tok/s |
-| Gemma 3 4B | 2.56 GB | 345 tok/s | 67 tok/s | 62 tok/s |
+| Qwen2.5 0.5B Instruct | 278 MB | 4,270 tok/s | 343 tok/s | 278 tok/s |
+| Qwen3 0.6B | 336 MB | 3,020 tok/s | 286 tok/s | 234 tok/s |
+| Llama 3.2 1B Instruct | 695 MB | 1,720 tok/s | 202 tok/s | 185 tok/s |
+| Phi-3.5 mini | 2.15 GB | 466 tok/s | 70 tok/s | 61 tok/s |
+| Mistral 7B v0.3 | 4.08 GB | 247 tok/s | 41.0 tok/s | 39.3 tok/s |
+| Gemma 3 1B (QAT) | 732 MB | 2,070 tok/s | 189 tok/s | 173 tok/s |
+| Gemma 3 4B | 2.56 GB | 498 tok/s | 67 tok/s | 62 tok/s |
+
+**Compared with mlx-lm.** Same weight files on the same M2 Pro, mlx-lm 0.32.2 (mlx 0.32.4), one run each. Decode is 128 tokens at a short context for MLX Runner and `stream_generate` for mlx-lm, with greedy sampling. Prefill is a timed raw forward of 512 tokens from an empty cache.
+
+| Model (4-bit) | Decode: MLX Runner | mlx-lm | Prefill 512: MLX Runner | mlx-lm |
+|---|---|---|---|---|
+| Qwen3 0.6B | 286 tok/s | 260 | 3,020 tok/s | 2,340 |
+| Qwen2.5 0.5B | 343 | 296 | 4,270 | 4,030 |
+| Llama 3.2 1B | 202 | 205 | 1,720 | 1,720 |
+| Gemma 3 1B | 189 | 181 | 2,070 | 2,010 |
+| Gemma 2 2B | 94 | 113 | 782 | 791 |
+| Gemma 1.1 2B | 78 | 81 | 763 | 868 |
+| Gemma 4 E2B | 73 | 76 | 770 | 639 |
+| Phi-3.5 mini | 70 | 66 | 466 | 572 |
+| Mistral 7B | 41.0 | 41.2 | 247 | 305 |
+
+MLX Runner decodes faster on the smallest Qwen models and Phi-3.5, is close on most others, and is well behind on Gemma 2. It prefills 512 tokens faster on Qwen3 and Gemma 4 and is behind on Gemma 1.1, Phi-3.5 and Mistral 7B. At 128 tokens, where the 32×32 tile runs, mlx-lm prefills 4–36% faster on every model except Gemma 4, which is level.
 
 **The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 41.0 tok/s, about 85% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a 3-bit model (which would raise the ceiling to about 60 tok/s, but only 4-bit has an optimized decode kernel so far), or speculative decoding (see Limitations).
 
@@ -148,7 +164,8 @@ mlxr download mlx-community/Qwen3-4B-4bit   # download into the app's library
 mlxr list                                   # installed models
 mlxr run mlx-community/Qwen3-4B-4bit -p "Explain RoPE" --max 300 [--temp 0.7] [--no-think]
 mlxr serve mlx-community/Qwen3-4B-4bit --port 1234     # OpenAI-compatible server (--lan prints an API key)
-mlxr bench mlx-community/Qwen3-4B-4bit      # prefill/decode throughput + kernel micro-benchmarks
+mlxr run mlx-community/Qwen3-8B-4bit --draft mlx-community/Qwen3-0.6B-4bit   # speculative decoding (or --draft auto)
+mlxr bench mlx-community/Qwen3-4B-4bit      # prefill/decode throughput, verification cost at short and 1,900-token contexts, kernel profile (MLXR_BENCH_NOPROFILE=1 skips it)
 mlxr tokenize <model> "some text"
 ```
 

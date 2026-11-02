@@ -145,6 +145,44 @@ struct MatmulKernelTests {
         }
     }
 
+    /// Prefill GEMM tiles on long batches: the 32 × 32 tile (few output rows, or T just past a
+    /// multiple of 64) and the 64 × 64 tile (many rows), with odd O and K % 64 != 0.
+    @Test(arguments: [3, 4, 8])
+    func prefillTilesMatchReference(bits: Int) throws {
+        // (T, O, K, uses the 64 × 64 tile)
+        let shapes = [(64, 41, 1056, false), (128, 41, 544, false), (517, 41, 544, false), (96, 2050, 544, false),
+                      (128, 2050, 544, true), (517, 520, 544, true)]
+        for (T, O, K, big) in shapes {
+            #expect(Linear.useGemm64(T: T, outDim: O) == big, "tile choice T \(T) O \(O)")
+            let fx = try QuantFixture(O: O, K: K, bits: bits, gs: 32, seed: UInt64(T + O))
+            var rng = RNG(s: UInt64(T * 7 + bits))
+            let x = (0..<(T * K)).map { _ in rng.float() }
+            let yb = try GPU.shared.buffer(T * O * 4)
+            runGPU { fx.linear.encode($0, x: makeBuffer(x), xStride: K, y: yb, yStride: O, T: T) }
+            assertClose(readFloats(yb, T * O), fx.reference(x, T: T, K: K), "bits \(bits) T \(T) O \(O) K \(K)")
+        }
+    }
+
+    /// Both prefill tiles (and the short-prompt tiles) compute every output with the same chain of
+    /// operations, so a token's output does not depend on the batch it was computed in.
+    @Test func prefillTilesAgreeBitwise() throws {
+        let O = 2050, K = 1024
+        let fx = try QuantFixture(O: O, K: K, bits: 4, gs: 64, seed: 3)
+        var rng = RNG(s: 11)
+        let x = (0..<(256 * K)).map { _ in rng.float() }
+        let xb = makeBuffer(x)
+        func run(_ T: Int) throws -> [UInt32] {
+            let yb = try GPU.shared.buffer(T * O * 4)
+            runGPU { fx.linear.encode($0, x: xb, xStride: K, y: yb, yStride: O, T: T) }
+            return readFloats(yb, T * O).map(\.bitPattern)
+        }
+        #expect(Linear.useGemm64(T: 256, outDim: O) && !Linear.useGemm64(T: 96, outDim: O))
+        let full = try run(256)
+        for T in [9, 16, 33, 96] {
+            #expect(try run(T) == Array(full[..<(T * O)]), "T \(T) vs T 256")
+        }
+    }
+
     /// K values that are not a multiple of the 4-bit decode kernel's 1024-wide pass: the 128/256/512
     /// remainders are spread over all lanes, others fall back to a partial pass (Gemma, Qwen2.5).
     @Test(arguments: [1152, 1536, 2304, 2560, 896, 1664, 6912])
@@ -186,6 +224,48 @@ struct MatmulKernelTests {
         runGPU { Linear.encodeFusedDecode($0, parts.map(\.linear), x: xb, y: yb) }
         let ref = parts.flatMap { $0.reference(x, T: 1, K: K) }
         assertClose(readFloats(yb, 96), ref, "fused q/k/v")
+    }
+
+    /// The small-batch 4-bit kernel (qmvx4, T = 2..8 on simdgroup matrices): K with and without a
+    /// partial 128-wide block (544, 1056) or 512-wide staging chunk (1152), rows that fill a
+    /// threadgroup only partly (40) or end inside a simdgroup (44), strided x / y.
+    @Test(arguments: [512, 1152, 544, 1056])
+    func smallBatchFourBitMatchesReference(K: Int) throws {
+        for (O, gs) in [(40, 64), (44, 32), (40, 128)] where K % gs == 0 {
+            for scaleType in [DType.f16, .bf16] {
+                let fx = try QuantFixture(O: O, K: K, bits: 4, gs: gs, scaleType: scaleType, seed: UInt64(K + O))
+                for T in [2, 3, 4, 5, 8] {
+                    #expect(Linear.canFuse([fx.linear], T: T))
+                    var rng = RNG(s: UInt64(T * 131 + K))
+                    let xStride = K + 4, yStride = O + 3
+                    var xs = [Float](repeating: .nan, count: T * xStride)   // padding must not be read
+                    var x: [Float] = []
+                    for t in 0..<T { for k in 0..<K { let v = rng.float(); xs[t * xStride + k] = v; x.append(v) } }
+                    let yb = try GPU.shared.buffer(T * yStride * 4)
+                    runGPU { fx.linear.encode($0, x: makeBuffer(xs), xStride: xStride, y: yb, yStride: yStride, T: T) }
+                    let y = readFloats(yb, T * yStride)
+                    let got = (0..<T).flatMap { t in y[(t * yStride)..<(t * yStride + O)] }
+                    assertClose(got, fx.reference(x, T: T, K: K), "K \(K) O \(O) gs \(gs) \(scaleType) T \(T)")
+                }
+            }
+        }
+    }
+
+    /// qmvx4 over a fused [A | B | C] layout with per-row bias, as the q/k/v projection uses it.
+    @Test func smallBatchFusedWithBiasMatchesSeparate() throws {
+        let K = 1152
+        let parts = try [(64, 1), (16, 2), (16, 3)].map {
+            try QuantFixture(O: $0.0, K: K, bits: 4, gs: 64, withBias: true, seed: UInt64($0.1))
+        }
+        for T in [2, 7, 8] {
+            var rng = RNG(s: UInt64(T))
+            let x = (0..<(T * K)).map { _ in rng.float() }
+            let yb = try GPU.shared.buffer(T * 96 * 4)
+            runGPU { Linear.encodeFusedDecode($0, parts.map(\.linear), x: makeBuffer(x), xStride: K, y: yb, yStride: 96, T: T) }
+            let refs = parts.map { $0.reference(x, T: T, K: K) }
+            let ref = (0..<T).flatMap { t in refs.flatMap { r in r[(t * r.count / T)..<((t + 1) * r.count / T)] } }
+            assertClose(readFloats(yb, T * 96), ref, "fused q/k/v T \(T)")
+        }
     }
 
     @Test func denseHalfMatchesReference() throws {

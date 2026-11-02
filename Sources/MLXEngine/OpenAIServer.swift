@@ -1258,18 +1258,29 @@ public final class OpenAIServer: @unchecked Sendable {
 
     static func chatUsage(_ o: Outcome) -> [String: Any] {
         let s = o.stats
-        return ["prompt_tokens": s.promptTokens, "completion_tokens": s.generatedTokens,
+        let u: [String: Any] = ["prompt_tokens": s.promptTokens, "completion_tokens": s.generatedTokens,
                 "total_tokens": s.promptTokens + s.generatedTokens,
                 "prompt_tokens_details": ["cached_tokens": s.cachedPromptTokens, "audio_tokens": 0],
                 "completion_tokens_details": ["reasoning_tokens": reasoningTokens(o), "audio_tokens": 0,
                                               "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0]]
+        return withDraftUsage(u, s)
     }
 
     static func responsesUsage(_ o: Outcome) -> [String: Any] {
         let s = o.stats
-        return ["input_tokens": s.promptTokens, "input_tokens_details": ["cached_tokens": s.cachedPromptTokens],
+        let u: [String: Any] = ["input_tokens": s.promptTokens, "input_tokens_details": ["cached_tokens": s.cachedPromptTokens],
                 "output_tokens": s.generatedTokens, "output_tokens_details": ["reasoning_tokens": reasoningTokens(o)],
                 "total_tokens": s.promptTokens + s.generatedTokens]
+        return withDraftUsage(u, s)
+    }
+
+    /// Speculative decoding (extension fields): drafted tokens and how many the model accepted.
+    static func withDraftUsage(_ u: [String: Any], _ s: GenerationStats) -> [String: Any] {
+        guard let d = s.draftTokens else { return u }
+        var u = u
+        u["draft_tokens"] = d
+        u["accepted_draft_tokens"] = s.acceptedDraftTokens ?? 0
+        return u
     }
 
     /// Stable per-model fingerprint (FNV-1a of name + quantization + context length).

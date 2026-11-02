@@ -26,6 +26,13 @@ public struct GenerationStats: Sendable, Hashable, Codable {
     /// Speculative decoding: drafted tokens and how many the model accepted.
     public var draftTokens: Int? = nil
     public var acceptedDraftTokens: Int? = nil
+    /// The part of the drafts above that came from the draft model (the rest is prompt lookup).
+    public var modelDraftTokens: Int? = nil
+    public var acceptedModelDraftTokens: Int? = nil
+    /// Draft-model cycles in this request, and the time they spent drafting and verifying.
+    public var draftCycles: Int? = nil
+    public var draftSeconds: Double? = nil
+    public var verifySeconds: Double? = nil
     public init() {}
 }
 
@@ -49,6 +56,8 @@ public struct LoadedModelInfo: Sendable, Hashable {
     public let loadSeconds: Double
     /// The chat template defines native tool calling.
     public var supportsTools: Bool = false
+    /// The draft model used for speculative decoding (nil = none).
+    public var draftName: String? = nil
 }
 
 /// Minimal xorshift RNG so sampling is seedable.
@@ -148,6 +157,24 @@ struct Sampler {
         guard total > 0 else { return (true, draft) }
         return (false, draw(rest.map { ($0.id, $0.p / total) }))
     }
+
+    /// Verifies a deterministic draft against one batched pass. `dist(i)` is the target's processed
+    /// distribution for row i (the token after draft[i-1], row 0 after the pending token); it is
+    /// called only once every earlier token has been emitted, so repetition penalties see them.
+    /// Drafts are accepted in order (`verify`); the first rejection emits its correction, and when
+    /// every draft is accepted the last row yields a bonus token. `emit(token, acceptedDraft)`
+    /// returns false to stop. Returns the accepted draft count and whether generation continues.
+    mutating func verifyDraft(_ draft: [Int], dist: (Int) throws -> [(id: Int, p: Float)],
+                              emit: (Int, Bool) -> Bool) rethrows -> (accepted: Int, running: Bool) {
+        var accepted = 0
+        for (i, d) in draft.enumerated() {
+            let (ok, t) = verify(try dist(i), draft: d)
+            if ok { accepted += 1 }
+            guard emit(t, ok) else { return (accepted, false) }
+            if !ok { return (accepted, true) }
+        }
+        return (accepted, emit(draw(try dist(draft.count)), false))
+    }
 }
 
 /// Prompt-lookup drafting: if the last few generated tokens already occurred in the
@@ -186,6 +213,10 @@ public final class InferenceEngine: @unchecked Sendable {
     private var template: ChatTemplate?
     private var stopIds: Set<Int> = []
     private var cachedTokens: [Int] = []
+    /// Speculative decoding with a small model of the same family: its own KV cache, and the
+    /// token ids by position whose K/V rows that cache holds.
+    private var draftModel: Transformer?
+    private var draftCached: [Int] = []
     private let cancelLock = NSLock()
     private var currentToken: CancelToken?
     /// Sticky trim cut per conversation (key: caller-supplied id, else the first turn).
@@ -205,20 +236,43 @@ public final class InferenceEngine: @unchecked Sendable {
 
     public var isLoaded: Bool { queue.sync { model != nil } }
 
-    public func load(directory: URL, contextLength: Int = 8192) async throws -> LoadedModelInfo {
+    /// Loads a model. `draftDirectory`: a small model with the same tokenizer that drafts tokens for
+    /// speculative decoding (see `checkDraftCompatible`); the output is unchanged.
+    public func load(directory: URL, draftDirectory: URL? = nil, contextLength: Int = 8192) async throws -> LoadedModelInfo {
         try await withCheckedThrowingContinuation { cont in
             queue.async {
                 do {
                     let start = Date()
                     self.model = nil
+                    self.draftModel = nil
                     self.tokenizer = nil
                     self.info = nil
                     self.cachedTokens = []
+                    self.draftCached = []
                     self.trimState = [:]
                     self.tokenTexts = nil
                     let tok = try Tokenizer(directory: directory)
-                    try Self.checkMemory(directory: directory, contextLength: contextLength)
+                    if let draftDirectory {
+                        try Self.checkDraftCompatible(target: directory, targetTokenizer: tok, draft: draftDirectory)
+                    }
+                    if draftDirectory != nil, let bits = try ModelConfig(directory: directory).bits, bits != 4 {
+                        throw EngineError.unsupported("\(directory.lastPathComponent) is \(bits)-bit: batched verification needs 4-bit weights, so a draft model cannot help")
+                    }
+                    try Self.checkMemory(directories: [directory] + (draftDirectory.map { [$0] } ?? []), contextLength: contextLength)
                     let model = try Transformer(directory: directory, contextLength: contextLength)
+                    var draft: Transformer?
+                    if let draftDirectory {
+                        guard model.supportsBatchedVerify else {
+                            throw EngineError.unsupported("\(directory.lastPathComponent) has no batched verify kernels (4-bit weights are required), so a draft model cannot help")
+                        }
+                        let d = try Transformer(directory: draftDirectory, contextLength: model.maxSeq)
+                        guard d.vocabSize >= min(model.vocabSize, tok.vocabularySize) else {
+                            throw EngineError.unsupported("draft model \(draftDirectory.lastPathComponent) has a smaller vocabulary than \(directory.lastPathComponent)")
+                        }
+                        d.seedSampler(1)
+                        _ = try d.forward([Int32(tok.tokenId(tok.bosToken ?? "") ?? 0)], offset: 0)
+                        draft = d
+                    }
                     let tpl = ChatTemplate(template: tok.chatTemplate, modelType: model.config.modelType, bosToken: tok.bosToken,
                                            toolTemplate: tok.toolUseTemplate)
                     var stops = Set(model.config.eosTokenIds)
@@ -227,6 +281,7 @@ public final class InferenceEngine: @unchecked Sendable {
                     // Warm-up pass compiles pipelines and faults in weights.
                     _ = try model.forward([Int32(tok.tokenId(tok.bosToken ?? "") ?? 0)], offset: 0)
                     self.model = model
+                    self.draftModel = draft
                     self.tokenizer = tok
                     self.template = tpl
                     self.stopIds = stops
@@ -236,7 +291,7 @@ public final class InferenceEngine: @unchecked Sendable {
                         parameterBytes: model.weightBytes, contextLength: model.maxSeq,
                         layers: model.config.numLayers, hiddenSize: model.config.hiddenSize,
                         chatFormat: tpl.format.rawValue, supportsThinking: tpl.supportsThinkingToggle,
-                        loadSeconds: Date().timeIntervalSince(start), supportsTools: tpl.supportsTools)
+                        loadSeconds: Date().timeIntervalSince(start), supportsTools: tpl.supportsTools, draftName: draftDirectory?.lastPathComponent)
                     self.info = info
                     cont.resume(returning: info)
                 } catch {
@@ -250,10 +305,12 @@ public final class InferenceEngine: @unchecked Sendable {
         cancel()
         queue.async {
             self.model = nil
+            self.draftModel = nil
             self.tokenizer = nil
             self.template = nil
             self.info = nil
             self.cachedTokens = []
+            self.draftCached = []
             self.trimState = [:]
         }
     }
@@ -409,15 +466,30 @@ public final class InferenceEngine: @unchecked Sendable {
         var nameText = ""
         var nameOpen = !(nameChoices ?? []).isEmpty
         let texts = nameOpen ? tokenTextIndex(tok) : nil
-        // Speculative decoding (prompt lookup): verifying k drafted tokens costs one batched
-        // pass, so every accepted draft is a token generated without its own weight read.
-        let speculative = (parameters.speculative ?? false) && model.supportsBatchedVerify && !nameOpen
+        // Speculative decoding: verifying k drafted tokens costs one batched pass, so every
+        // accepted draft is a token generated without its own weight read. Drafts come from prompt
+        // lookup (free) and, when one is loaded, from a small draft model of the same family
+        // (on unless `speculative` is explicitly false).
+        let canVerify = model.supportsBatchedVerify && !nameOpen
+        let draftModel = canVerify && parameters.speculative != false ? self.draftModel : nil
+        let promptLookup = canVerify && ((parameters.speculative ?? false) || draftModel != nil)
+        let speculative = promptLookup || draftModel != nil
         // Plain decoding selects tokens on the GPU, so each step is queued before the previous one
         // is read back and the GPU never waits for sampling or detokenisation.
         let gpuSampling = !speculative && !nameOpen
         let gpuParams = SampleParams(parameters, vocab: count)
 
         cachedTokens = Array(tokens[0..<common])
+        // The draft model reuses its own cache the same way.
+        var draftOK = draftModel != nil
+        if let draftModel {
+            var dc = 0
+            let dl = min(draftCached.count, tokens.count - 1)
+            while dc < dl && draftCached[dc] == tokens[dc] { dc += 1 }
+            dc = draftModel.reusablePrefix(dc, previousLength: draftCached.count)
+            if dc == 0 { draftModel.resetWriteTracking() }
+            draftCached = Array(tokens[0..<dc])
+        }
         let t0 = Date()
         var logits: UnsafeMutablePointer<Float>?   // CPU sampling only
         var firstToken: Int?
@@ -429,6 +501,8 @@ public final class InferenceEngine: @unchecked Sendable {
             } else {
                 logits = try model.forward(prompt, offset: common, isCancelled: { token.isCancelled })
             }
+            // The draft model catches up on the prompt lazily (`proposeFromModel`, after the first
+            // token is out), so the time to first token stays the target's own.
         } catch EngineError.cancelled {
             stats.stopReason = "cancelled"
             emit(.finished(stats))
@@ -442,6 +516,7 @@ public final class InferenceEngine: @unchecked Sendable {
         emit(.promptProcessed(stats))
 
         var sampler = Sampler(params: parameters, rng: XorShift(seed: seed))
+        var shaper = sampler   // builds distributions (no randomness), so verifyDraft can call it
         var decoder = StreamingDecoder()
         let tGen = Date()
         stats.stopReason = "length"
@@ -449,6 +524,60 @@ public final class InferenceEngine: @unchecked Sendable {
         var atStart = true
         var drafted = 0, acceptedDrafts = 0
         var draftLen = 4
+        // Draft model state: greedy proposals (deterministic, so `Sampler.verify` stays exact) under
+        // the same repetition penalty; draftCached[..<draftChecked] is known to equal history.
+        let draftParams: SampleParams = { var g = parameters; g.temperature = 0; return SampleParams(g, vocab: count) }()
+        var draftChecked = draftCached.count
+        var modelDraftLen = 4
+        var modelDrafted = 0, modelAccepted = 0, modelCycles = 0
+        var draftTime = 0.0, verifyTime = 0.0
+
+        /// Up to `k` greedy tokens from the draft model following the pending token. The draft first
+        /// catches up on the history its cache lacks (the pending token; after a fully accepted cycle
+        /// also the last draft; after prompt-lookup cycles, everything since), then runs k - 1 decode
+        /// steps queued back to back. Only the k sampled ids are read back.
+        func proposeFromModel(_ k: Int) -> [Int] {
+            guard let d = draftModel, draftOK else { return [] }
+            let P = history.count - 1
+            // Rollback: rows of rejected drafts are stale; keep the prefix that matches the history.
+            var keep = min(draftChecked, draftCached.count)
+            let lim = min(draftCached.count, P)
+            while keep < lim && draftCached[keep] == history[keep] { keep += 1 }
+            draftCached.removeSubrange(keep...)
+            let k = min(k, d.maxSeq - 1 - P)
+            guard k > 0 else { return [] }
+            let start = Date()
+            do {
+                let catchUp = history[keep...].map { Int32($0) }
+                var out: [Int] = []
+                var inflight: Transformer.DecodeStep?
+                if catchUp.count > 16 {   // after long prompt-lookup runs only
+                    out.append(try d.prefill(catchUp, offset: keep, sample: draftParams))
+                    inflight = k > 1 ? try d.beginDecodeStep(offset: P + 1, sample: draftParams) : nil
+                } else {
+                    inflight = try d.beginSteps(catchUp, offset: keep, sample: draftParams)
+                }
+                draftCached = history
+                draftChecked = P + 1
+                while let cur = inflight {
+                    inflight = nil
+                    if cur.offset + 1 < P + k {
+                        do { inflight = try d.beginDecodeStep(offset: cur.offset + 1, sample: draftParams) }
+                        catch { _ = try? d.finish(cur); throw error }
+                    }
+                    do { out.append(try d.finish(cur)) } catch { if let f = inflight { _ = try? d.finish(f) }; throw error }
+                }
+                // The cache now holds rows up to d[k-2]; the last draft was never processed.
+                draftCached += out.dropLast()
+                draftTime += Date().timeIntervalSince(start)
+                return out
+            } catch {
+                draftCached = Array(history[0..<keep])
+                draftChecked = keep
+                draftOK = false
+                return []
+            }
+        }
 
         /// Emits a sampled token. Returns false when generation must stop.
         func accept(_ t: Int) -> Bool {
@@ -476,7 +605,7 @@ public final class InferenceEngine: @unchecked Sendable {
                     for (i, v) in keep { row[i] = v }
                 }
             }
-            guard let d = sampler.distribution(row, count: count, recent: history.suffix(parameters.repetitionWindow)) else {
+            guard let d = shaper.distribution(row, count: count, recent: history.suffix(parameters.repetitionWindow)) else {
                 throw EngineError.invalidOutput("non-finite logits")
             }
             return d
@@ -515,35 +644,46 @@ public final class InferenceEngine: @unchecked Sendable {
             if token.isCancelled { stats.stopReason = "cancelled"; break }
             let pending = history[history.count - 1]
             let room = min(maxNew - stats.generatedTokens, model.maxSeq - history.count) - 1
-            let draft = speculative ? NGramDraft.propose(history, maxTokens: min(draftLen, room, Transformer.maxVerifyTokens - 1)) : []
+            let cap = speculative ? min(room, Transformer.maxVerifyTokens - 1) : 0
+            var draft = promptLookup ? NGramDraft.propose(history, maxTokens: min(draftLen, cap)) : []
+            let fromModel = draft.isEmpty && cap > 0 && draftOK
+            if fromModel { draft = proposeFromModel(min(modelDraftLen, cap)) }
             if draft.isEmpty {
                 let row = try model.forward([Int32(pending)], offset: history.count - 1)
                 cachedTokens = history
                 running = accept(sampler.draw(try dist(row)))
                 continue
             }
+            let tVerify = Date()
             let rows = try model.forward(([pending] + draft).map { Int32($0) }, offset: history.count - 1, allLogits: true)
             cachedTokens = history
             drafted += draft.count
-            var accepted = 0
-            var corrected = false
-            for (i, d) in draft.enumerated() {
-                let (ok, t) = sampler.verify(try dist(rows + i * vocab), draft: d)
-                running = accept(t)
-                if ok { accepted += 1; if running { cachedTokens = history } }
-                else { corrected = true }
-                if !ok || !running { break }
+            // Bonus token: when every draft matches, the last row predicts one more for free.
+            let (accepted, cont) = try sampler.verifyDraft(draft, dist: { try dist(rows + $0 * vocab) }) { t, ok in
+                let r = accept(t)
+                if ok && r { cachedTokens = history }
+                return r
             }
+            running = cont
             acceptedDrafts += accepted
-            // Bonus token: every draft matched, so the last row predicts one more for free.
-            if running && !corrected { running = accept(sampler.draw(try dist(rows + draft.count * vocab))) }
-            draftLen = accepted == draft.count ? min(draftLen + 1, Transformer.maxVerifyTokens - 1) : max(1, accepted)
+            if fromModel {
+                verifyTime += Date().timeIntervalSince(tVerify)
+                modelCycles += 1
+                modelDrafted += draft.count
+                modelAccepted += accepted
+                modelDraftLen = accepted == draft.count ? min(modelDraftLen + 1, Transformer.maxVerifyTokens - 1)
+                    : accepted == 0 ? max(1, modelDraftLen - 1) : modelDraftLen
+            } else {
+                draftLen = accepted == draft.count ? min(draftLen + 1, Transformer.maxVerifyTokens - 1) : max(1, accepted)
+            }
         }
         let rest = decoder.flush()
         if !rest.isEmpty { emit(.text(rest)) }
         let dt = Date().timeIntervalSince(tGen)
         stats.tokensPerSecond = Double(stats.generatedTokens) / max(dt, 1e-6)
         if drafted > 0 { stats.draftTokens = drafted; stats.acceptedDraftTokens = acceptedDrafts }
+        if draftModel != nil { stats.modelDraftTokens = modelDrafted; stats.acceptedModelDraftTokens = modelAccepted }
+        if modelCycles > 0 { stats.draftCycles = modelCycles; stats.draftSeconds = draftTime; stats.verifySeconds = verifyTime }
         emit(.finished(stats))
     }
 }
@@ -583,8 +723,8 @@ extension InferenceEngine {
         return allowed
     }
 
-    /// Refuses to load a model whose weights plus KV cache would not fit in GPU-addressable memory.
-    static func checkMemory(directory: URL, contextLength: Int) throws {
+    /// Weights + KV cache + scratch of one model at a context length (and the context it gets).
+    static func memoryNeed(directory: URL, contextLength: Int) throws -> (bytes: Int, context: Int) {
         let fm = FileManager.default
         var weights = 0
         for f in (try? WeightStore.shardFiles(in: directory)) ?? [] {
@@ -593,14 +733,68 @@ extension InferenceEngine {
         }
         let cfg = try ModelConfig(directory: directory)
         let ctx = min(contextLength, max(cfg.maxPositionEmbeddings, 256))
-        let kv = cfg.kvCacheBytes(context: ctx)
-        let scratch = Transformer.scratchBytes(config: cfg)
-        let need = UInt64(weights + kv + scratch)
-        let budget = GPU.shared.device.recommendedMaxWorkingSetSize
+        return (weights + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg), ctx)
+    }
+
+    /// Refuses to load models (a target and its draft) whose weights plus KV caches would not fit
+    /// in GPU-addressable memory together.
+    static func checkMemory(directories: [URL], contextLength: Int, budget: UInt64 = GPU.shared.device.recommendedMaxWorkingSetSize) throws {
+        var need: UInt64 = 0
+        var ctx = contextLength
+        for (i, d) in directories.enumerated() {
+            let n = try memoryNeed(directory: d, contextLength: contextLength)
+            need += UInt64(n.bytes)
+            if i == 0 { ctx = n.context }
+        }
         guard need < budget else {
             let f = ByteCountFormatter()
-            throw EngineError.unsupported("needs \(f.string(fromByteCount: Int64(need))) (weights + \(ctx)-token KV cache) but the GPU can use about \(f.string(fromByteCount: Int64(budget))). Try a smaller quantization or a shorter context length.")
+            let what = directories.count > 1 ? "weights of both models + their \(ctx)-token KV caches" : "weights + \(ctx)-token KV cache"
+            throw EngineError.unsupported("needs \(f.string(fromByteCount: Int64(need))) (\(what)) but the GPU can use about \(f.string(fromByteCount: Int64(budget))). Try \(directories.count > 1 ? "no draft model, " : "")a smaller quantization or a shorter context length.")
         }
+    }
+
+    // MARK: Draft models
+
+    /// SHA-256 of a model's tokenizer.json (nil when unreadable).
+    public static func tokenizerFingerprint(_ directory: URL) -> String? {
+        let url = directory.appendingPathComponent("tokenizer.json").resolvingSymlinksInPath()
+        return try? FileHasher.sha256(of: url)
+    }
+
+    /// A draft model must tokenize exactly like the target: the same tokenizer.json, or else the same
+    /// vocabulary (every id decodes to the same bytes) and the same special tokens.
+    static func checkDraftCompatible(target: URL, targetTokenizer tok: Tokenizer, draft: URL) throws {
+        let a = tokenizerFingerprint(target), b = tokenizerFingerprint(draft)
+        if let a, a == b { return }
+        let name = draft.lastPathComponent
+        let other: Tokenizer
+        do { other = try Tokenizer(directory: draft) } catch {
+            throw EngineError.unsupported("draft model \(name): \(error.localizedDescription)")
+        }
+        var same = other.vocabularySize == tok.vocabularySize && other.bosToken == tok.bosToken && other.eosToken == tok.eosToken
+        if same {
+            for id in 0..<tok.vocabularySize where tok.bytes(for: id, includeSpecial: true) != other.bytes(for: id, includeSpecial: true) {
+                same = false
+                break
+            }
+        }
+        guard same else {
+            throw EngineError.unsupported("draft model \(name) uses a different tokenizer than \(target.lastPathComponent); pick a smaller model of the same family")
+        }
+    }
+
+    /// The draft model to pair with `target` automatically: an installed, supported model of the same
+    /// family (model type) and tokenizer with at most a quarter of its weight bytes; the smallest wins.
+    public static func autoDraft(for target: URL, among models: [LocalModel] = ModelStore.scan()) -> LocalModel? {
+        let t = target.standardizedFileURL
+        guard let me = models.first(where: { $0.directory.standardizedFileURL == t })
+                ?? ModelStore.describe(target, repo: target.lastPathComponent, source: .library),
+              me.sizeBytes > 0, let type = me.modelType, let fp = tokenizerFingerprint(target) else { return nil }
+        return models
+            .filter { $0.isSupported && $0.modelType == type && $0.sizeBytes > 0 && $0.sizeBytes * 4 <= me.sizeBytes
+                && $0.directory.standardizedFileURL != t }
+            .sorted { $0.sizeBytes < $1.sizeBytes }
+            .first { tokenizerFingerprint($0.directory) == fp }
     }
 }
 

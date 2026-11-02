@@ -253,6 +253,9 @@ struct MessageRow: View {
     let conversationID: UUID
     let isLast: Bool
     @State private var hovering = false
+    /// The action buttons also track the pointer themselves, so they stay visible while it is on
+    /// them even if the row reports that its hover ended.
+    @State private var hoveringButtons = false
     @State private var editing = false
     @State private var editText = ""
 
@@ -291,7 +294,10 @@ struct MessageRow: View {
                             IconButton("pencil", "Edit") { editText = message.content; editing = true }
                             IconButton("doc.on.doc", "Copy") { copy(message.content) }
                         }
-                        .opacity(hovering ? 1 : 0)
+                        .onHover { hoveringButtons = $0 }
+            .onDisappear { hoveringButtons = false }
+                        .onDisappear { hoveringButtons = false }
+                        .opacity(hovering || hoveringButtons ? 1 : 0)
                     }
                 }
             }
@@ -364,7 +370,8 @@ struct MessageRow: View {
                 IconButton("doc.on.doc", "Copy") { copy(message.content) }
                 if isLast { IconButton("arrow.clockwise", "Regenerate") { state.regenerate(in: conversationID) } }
             }
-            .opacity(hovering ? 1 : 0)
+            .onHover { hoveringButtons = $0 }
+            .opacity(hovering || hoveringButtons ? 1 : 0)
         }
     }
 
@@ -604,7 +611,12 @@ struct InspectorView: View {
                 Picker("Context length", selection: $state.contextLength) {
                     ForEach([2048, 4096, 8192, 16384, 32768, 65536], id: \.self) { Text("\($0)").tag($0) }
                 }
-                Text("Context length applies the next time a model is loaded.")
+                Picker("Draft model", selection: $state.draftModel) {
+                    Text("Off").tag("")
+                    Text("Auto").tag("auto")
+                    ForEach(draftCandidates) { Text($0.name).tag($0.directory.path) }
+                }
+                Text("Context length and draft model apply the next time a model is loaded. A small model of the same family drafts tokens for the loaded one to verify: the output is unchanged.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let info = state.loadedInfo {
@@ -614,12 +626,24 @@ struct InspectorView: View {
                     LabeledContent("Layers", value: "\(info.layers)")
                     LabeledContent("Hidden size", value: "\(info.hiddenSize)")
                     LabeledContent("Context", value: "\(info.contextLength)")
+                    if let d = info.draftName { LabeledContent("Draft model", value: d) }
                     LabeledContent("Prompt format", value: info.chatFormat)
                     LabeledContent("Load time", value: String(format: "%.2fs", info.loadSeconds))
                 }
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// Installed models that can draft for the loaded one (same family, at most a quarter of its size).
+    private var draftCandidates: [LocalModel] {
+        let loaded = state.localModels.first { $0.directory == state.loadedInfo?.directory }
+        return state.localModels.filter { m in
+            guard m.isSupported else { return false }
+            if m.directory.path == state.draftModel { return true }
+            guard let loaded else { return false }
+            return m.modelType == loaded.modelType && m.sizeBytes * 4 <= loaded.sizeBytes
+        }
     }
 }
 

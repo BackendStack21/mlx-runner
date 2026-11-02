@@ -127,6 +127,8 @@ final class AppState {
     var sampling = SamplingParameters() { didSet { saveSettings() } }
     var systemPrompt: String = "" { didSet { saveSettings() } }
     var contextLength: Int = 8192 { didSet { saveSettings() } }
+    /// Speculative decoding draft model: "" off, "auto", or a model directory path.
+    var draftModel: String = "" { didSet { saveSettings() } }
     var enableThinking: Bool = true { didSet { saveSettings() } }
     var lastModelPath: String? { didSet { saveSettings() } }
 
@@ -176,7 +178,11 @@ final class AppState {
     func refreshModels() {
         Task.detached(priority: .userInitiated) {
             let models = ModelStore.scan()
-            await MainActor.run { self.localModels = models }
+            await MainActor.run {
+                self.localModels = models
+                // A draft pick whose model was removed falls back to none (the picker has no such row).
+                if !["", "auto"].contains(self.draftModel), !models.contains(where: { $0.directory.path == self.draftModel }) { self.draftModel = "" }
+            }
         }
     }
 
@@ -188,9 +194,25 @@ final class AppState {
         stopGeneration()
         loadState = .loading(model.name)
         let ctx = contextLength
+        let draftSetting = draftModel
+        let models = localModels
         Task {
             do {
-                let info = try await engine.load(directory: model.directory, contextLength: ctx)
+                // Resolved off the main actor (tokenizer hashing). A saved pick that no longer fits the
+                // model being loaded (another family, or removed) is dropped rather than failing the load.
+                let draft: URL? = await Task.detached(priority: .userInitiated) {
+                    switch draftSetting {
+                    case "": return nil
+                    case "auto": return InferenceEngine.autoDraft(for: model.directory, among: models)?.directory
+                    default:
+                        guard let d = models.first(where: { $0.directory.path == draftSetting }), d.isSupported, d.directory != model.directory,
+                              d.modelType == model.modelType,
+                              let fp = InferenceEngine.tokenizerFingerprint(model.directory), InferenceEngine.tokenizerFingerprint(d.directory) == fp
+                        else { return nil }
+                        return d.directory
+                    }
+                }.value
+                let info = try await engine.load(directory: model.directory, draftDirectory: draft, contextLength: ctx)
                 loadState = .loaded(info)
                 lastModelPath = model.directory.path
             } catch {
@@ -494,6 +516,7 @@ final class AppState {
         if let data = d.data(forKey: "sampling"), let s = try? JSONDecoder().decode(SamplingParameters.self, from: data) { sampling = s }
         systemPrompt = d.string(forKey: "systemPrompt") ?? ""
         contextLength = d.object(forKey: "contextLength") as? Int ?? 8192
+        draftModel = d.string(forKey: "draftModel") ?? ""
         enableThinking = d.object(forKey: "enableThinking") as? Bool ?? true
         lastModelPath = d.string(forKey: "lastModelPath")
     }
@@ -504,6 +527,7 @@ final class AppState {
         if let data = try? JSONEncoder().encode(sampling) { d.set(data, forKey: "sampling") }
         d.set(systemPrompt, forKey: "systemPrompt")
         d.set(contextLength, forKey: "contextLength")
+        d.set(draftModel, forKey: "draftModel")
         d.set(enableThinking, forKey: "enableThinking")
         d.set(lastModelPath, forKey: "lastModelPath")
     }
