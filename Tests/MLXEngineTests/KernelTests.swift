@@ -226,6 +226,48 @@ struct MatmulKernelTests {
         assertClose(readFloats(yb, 96), ref, "fused q/k/v")
     }
 
+    /// The small-batch 4-bit kernel (qmvx4, T = 2..8 on simdgroup matrices): K with and without a
+    /// partial 128-wide block (544, 1056) or 512-wide staging chunk (1152), rows that fill a
+    /// threadgroup only partly (40) or end inside a simdgroup (44), strided x / y.
+    @Test(arguments: [512, 1152, 544, 1056])
+    func smallBatchFourBitMatchesReference(K: Int) throws {
+        for (O, gs) in [(40, 64), (44, 32), (40, 128)] where K % gs == 0 {
+            for scaleType in [DType.f16, .bf16] {
+                let fx = try QuantFixture(O: O, K: K, bits: 4, gs: gs, scaleType: scaleType, seed: UInt64(K + O))
+                for T in [2, 3, 4, 5, 8] {
+                    #expect(Linear.canFuse([fx.linear], T: T))
+                    var rng = RNG(s: UInt64(T * 131 + K))
+                    let xStride = K + 4, yStride = O + 3
+                    var xs = [Float](repeating: .nan, count: T * xStride)   // padding must not be read
+                    var x: [Float] = []
+                    for t in 0..<T { for k in 0..<K { let v = rng.float(); xs[t * xStride + k] = v; x.append(v) } }
+                    let yb = try GPU.shared.buffer(T * yStride * 4)
+                    runGPU { fx.linear.encode($0, x: makeBuffer(xs), xStride: xStride, y: yb, yStride: yStride, T: T) }
+                    let y = readFloats(yb, T * yStride)
+                    let got = (0..<T).flatMap { t in y[(t * yStride)..<(t * yStride + O)] }
+                    assertClose(got, fx.reference(x, T: T, K: K), "K \(K) O \(O) gs \(gs) \(scaleType) T \(T)")
+                }
+            }
+        }
+    }
+
+    /// qmvx4 over a fused [A | B | C] layout with per-row bias, as the q/k/v projection uses it.
+    @Test func smallBatchFusedWithBiasMatchesSeparate() throws {
+        let K = 1152
+        let parts = try [(64, 1), (16, 2), (16, 3)].map {
+            try QuantFixture(O: $0.0, K: K, bits: 4, gs: 64, withBias: true, seed: UInt64($0.1))
+        }
+        for T in [2, 7, 8] {
+            var rng = RNG(s: UInt64(T))
+            let x = (0..<(T * K)).map { _ in rng.float() }
+            let yb = try GPU.shared.buffer(T * 96 * 4)
+            runGPU { Linear.encodeFusedDecode($0, parts.map(\.linear), x: makeBuffer(x), xStride: K, y: yb, yStride: 96, T: T) }
+            let refs = parts.map { $0.reference(x, T: T, K: K) }
+            let ref = (0..<T).flatMap { t in refs.flatMap { r in r[(t * r.count / T)..<((t + 1) * r.count / T)] } }
+            assertClose(readFloats(yb, T * 96), ref, "fused q/k/v T \(T)")
+        }
+    }
+
     @Test func denseHalfMatchesReference() throws {
         let K = 128, O = 24
         var rng = RNG(s: 5)

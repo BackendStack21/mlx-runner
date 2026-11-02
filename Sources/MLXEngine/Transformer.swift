@@ -7,7 +7,8 @@ private let rowsPerThreadgroup = 8 // QROWS * QNSG
 private let qmvSimdgroups = 2 // QVNSG
 private let qmvRowsPerThreadgroup = 4 * qmvSimdgroups
 private let qmvThreads = 32 * qmvSimdgroups
-private let qmvbRowsPerSimdgroup = 4 // QVBR
+private let qmvxSimdgroups = 4 // QXNSG
+private let qmvxRowsPerThreadgroup = 8 * 2 * qmvxSimdgroups // 8 * QXRF * QXNSG
 
 /// A linear layer, either MLX-quantized or dense.
 final class Linear {
@@ -27,7 +28,7 @@ final class Linear {
     private var gemm64PSO: MTLComputePipelineState?    // long prompts: 64 × 64 tiles
     private(set) var qmvPSO: MTLComputePipelineState?  // fused decode kernel (bias folded in)
     private(set) var qmvGatePSO: MTLComputePipelineState?  // decode with y = act(y) · e
-    private(set) var qmvbPSO: MTLComputePipelineState?  // 4-bit, 2...4 tokens (speculative verification)
+    private(set) var qmvxPSO: MTLComputePipelineState?  // 4-bit, 2...8 tokens (speculative verification, short prompts)
     private var biasPSO: MTLComputePipelineState?
     let description: String
 
@@ -74,7 +75,7 @@ final class Linear {
                 if bits == 4, [128, 256, 512].contains(inDim % 1024) { tail = "t\(inDim % 1024 / 32)_" }
                 qmvPSO = try gpu.pipeline("qmv_\(tail)\(bits)_\(sfx)")
                 qmvGatePSO = try gpu.pipeline("qmv_gate_\(tail)\(bits)_\(sfx)")
-                if bits == 4 { qmvbPSO = try gpu.pipeline("qmvb4_\(sfx)_4") }
+                if bits == 4 { qmvxPSO = try gpu.pipeline("qmvx4_\(sfx)") }
             }
             if inDim % 32 == 0 {
                 gemmPSO = try gpu.pipeline("qgemm_\(bits)_\(sfx)")
@@ -113,14 +114,14 @@ final class Linear {
 
     /// The fused matvec kernels handle T tokens (1, or up to 8 for 4-bit weights).
     static func canFuse(_ parts: [Linear], T: Int) -> Bool {
-        T == 1 ? parts.allSatisfy { $0.qmvPSO != nil } : (T <= Transformer.maxVerifyTokens && parts.allSatisfy { $0.qmvbPSO != nil })
+        T == 1 ? parts.allSatisfy { $0.qmvPSO != nil } : (T <= Transformer.maxVerifyTokens && parts.allSatisfy { $0.qmvxPSO != nil })
     }
 
     /// One dispatch computing [A | B | C] rows for T tokens (T == 1, or up to maxVerifyTokens with 4-bit weights).
     static func encodeFusedDecode(_ enc: MTLComputeCommandEncoder, _ parts: [Linear], x: MTLBuffer, xOffset: Int = 0,
                                   xStride: Int = 0, y: MTLBuffer, yOffset: Int = 0, yStride: Int = 0, T: Int = 1) {
         let f = parts[0]
-        enc.setComputePipelineState(T == 1 ? f.qmvPSO! : f.qmvbPSO!)
+        enc.setComputePipelineState(T == 1 ? f.qmvPSO! : f.qmvxPSO!)
         for slot in 0..<3 {
             let p = parts[min(slot, parts.count - 1)]
             let base = slot == 0 ? 0 : 3 + slot * 3   // 0, 6, 9
@@ -133,12 +134,12 @@ final class Linear {
         enc.set(y, yOffset, 4)
         enc.set(x, xOffset, 15)
         let total = parts.reduce(0) { $0 + $1.outDim }
-        let rowsPerTG = T == 1 ? qmvRowsPerThreadgroup : qmvbRowsPerSimdgroup * qmvSimdgroups
+        let rowsPerTG = T == 1 ? qmvRowsPerThreadgroup : qmvxRowsPerThreadgroup
         enc.params(MMParams(K: Int32(f.inDim), O: Int32(total), T: Int32(T), gs: Int32(f.groupSize), xStride: Int32(xStride), yStride: Int32(yStride),
                             o1: Int32(parts[0].outDim), o2: Int32(parts.count > 1 ? parts[1].outDim : 0),
                             hasBias: f.bias != nil ? 1 : 0), 5)
         enc.dispatchThreadgroups(MTLSize(width: (total + rowsPerTG - 1) / rowsPerTG, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: qmvThreads, height: 1, depth: 1))
+                                 threadsPerThreadgroup: MTLSize(width: T == 1 ? qmvThreads : 32 * qmvxSimdgroups, height: 1, depth: 1))
     }
 
     /// Decode-only gated output: y[:outDim] = act(x · Wᵀ + bias) · e[:outDim] in one dispatch.
@@ -173,11 +174,11 @@ final class Linear {
             Linear.encodeFusedDecode(enc, [self], x: x, xOffset: xOffset, xStride: xStride, y: y, yOffset: yOffset, yStride: yStride, T: T)
             return
         }
-        // 5+ tokens: tiled GEMM beats the small-batch kernel. A full tile is 32 tokens; short prompts
-        // use an 8- or 16-token tile instead of paying for 32, long ones a 64 × 64 tile (same
-        // arithmetic per output element in all of them).
+        // 5+ tokens (not handled by qmvx4 above): tiled GEMM beats the small-batch kernel. A full
+        // tile is 32 tokens; short prompts use an 8- or 16-token tile instead of paying for 32,
+        // long ones a 64 × 64 tile (same arithmetic per output element in all of them).
         var gemm: (pso: MTLComputePipelineState, rows: Int, cols: Int)?
-        if T > Transformer.maxVerifyTokens {
+        if T > 4 {
             if T <= 8, let p = gemm8PSO { gemm = (p, 8, 32) }
             else if T <= 16, let p = gemm16PSO { gemm = (p, 16, 32) }
             else if Linear.useGemm64(T: T, outDim: outDim), let p = gemm64PSO { gemm = (p, 64, 64) }
@@ -474,7 +475,7 @@ public final class Transformer {
     let logits: MTLBuffer
     /// Logits for every row of a small batch (speculative verification).
     let logitsAll: MTLBuffer
-    public static let maxVerifyTokens = 4
+    public static let maxVerifyTokens = 8
     /// Inverse RoPE frequencies per layer (layers with the same RoPE share a buffer).
     private let ropeFreqs: [MTLBuffer]
 
@@ -1085,6 +1086,15 @@ extension Transformer {
             out += String(format: " %@ -%.3f", cls as NSString, (full - stepTime([cls])) * 1000)
         }
         out += String(format: "; matvecs only %.3f ms\n", stepTime(["post", "attn", "norm", "silu"]) * 1000)
+        // Small-batch step (speculative verification, qmvx4) at T = 4 and 8.
+        for vT in [4, Self.maxVerifyTokens] {
+            let fullV = stepTime([], T: vT)
+            out += String(format: "verify step T=%d: %.3f ms; without", vT, fullV * 1000)
+            for cls in ["qkv", "o", "gateup", "down", "lmhead", "post", "attn", "norm", "silu"] {
+                out += String(format: " %@ -%.3f", cls as NSString, (fullV - stepTime([cls], T: vT)) * 1000)
+            }
+            out += "\n"
+        }
         // Prefill step breakdown at 512 tokens (GEMMs, attention and the elementwise kernels).
         let fullP = stepTime([], T: 512)
         out += String(format: "prefill step @512: %.1f ms; without", fullP * 1000)

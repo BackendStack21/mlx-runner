@@ -317,11 +317,25 @@ kernel void qmv(device const uchar* wA [[buffer(0)]],
     }
 }
 
-// Small-batch 4-bit matvec for speculative verification (2..TT tokens): each
-// weight chunk is loaded once and applied to every token, so verifying a few
-// draft tokens costs little more than decoding one. Same fused [A|B|C] layout.
-template <typename T, int TT, int R>
-kernel void qmvb4(device const uchar* wA [[buffer(0)]],
+// Small-batch 4-bit matmul (T = 2..8 tokens: speculative verification, short prompts) on
+// simdgroup matrices. Each weight is loaded and dequantized once, independent of T; the
+// per-token work is one 8×8×8 multiply-accumulate per 64 weights, the tokens padded to 8.
+// A simdgroup owns 8 output rows: C[row][token] += W[row][k] · X[token][k], fp32 throughout.
+// No threadgroup strip for the weights: every lane dequantizes exactly the two elements of
+// the W fragment it holds (thread_elements: lane → row fm, columns fn, fn + 1). The sum
+// over k is order-free, so fragment column c of step kk in a 128-wide block stands for
+// k = 32 (c / 2) + 2 kk + c % 2: a lane's 16 steps then read one contiguous 16-byte load
+// (row fm, bytes 16 (fn / 2) ..+16 of the block). x is staged once per threadgroup in that
+// order, 8 tokens × QXK values, so a lane's X fragment elements are one float2 per step.
+// Same fused [A|B|C] layout and arguments as `qmv`; K % 32 == 0 and gs % 32 == 0
+// (a 32-value lane run stays in one group), K need not be a multiple of 128.
+#define QXNSG 4     // simdgroups per threadgroup
+#define QXRF 2      // 8-row fragments per simdgroup
+#define QXK 256     // x values staged per chunk
+#define QXACC 2     // independent accumulator chains per fragment
+
+template <typename T>
+kernel void qmvx4(device const uchar* wA [[buffer(0)]],
                   device const T*     sA [[buffer(1)]],
                   device const T*     bA [[buffer(2)]],
                   device const float* x  [[buffer(3)]],
@@ -337,55 +351,91 @@ kernel void qmvb4(device const uchar* wA [[buffer(0)]],
                   device const T*     biasB [[buffer(13)]],
                   device const T*     biasC [[buffer(14)]],
                   uint2 tgid [[threadgroup_position_in_grid]],
+                  uint  tid  [[thread_index_in_threadgroup]],
                   uint  sgid [[simdgroup_index_in_threadgroup]],
                   uint  lane [[thread_index_in_simdgroup]]) {
-    const int gRow = (int(tgid.x) * QVNSG + int(sgid)) * R;
-    if (gRow >= p.O) return;
-    device const uchar* w; device const T* sc; device const T* bi; device const T* rb;
-    int rowBase;
-    if (gRow < p.o1) { w = wA; sc = sA; bi = bA; rb = biasA; rowBase = gRow; }
-    else if (gRow < p.o1 + p.o2) { w = wB; sc = sB; bi = bB; rb = biasB; rowBase = gRow - p.o1; }
-    else { w = wC; sc = sC; bi = bC; rb = biasC; rowBase = gRow - p.o1 - p.o2; }
-    const int nr = min(R, p.O - gRow);
-    const int nt = min(TT, p.T);
+    constexpr int NB = QXK / 128;               // 128-wide blocks per staged chunk
+    threadgroup float Xs[QXK * 8];              // [block][step kk][fragment row c][token]
+    const int sgRow = (int(tgid.x) * QXNSG + int(sgid)) * (8 * QXRF);
+    const int nt = min(8, p.T);
+    const uint qid = lane / 4;
+    const int fm = int((qid & 4) + ((lane / 2) % 4));     // fragment row: weight row / k slot of X
+    const int fn = int((qid & 2) * 2 + (lane % 2) * 2);   // fragment columns fn, fn + 1
     const ulong rowBytes = ulong(p.K) / 2;
     const int gpr = p.K / p.gs;
-    float acc[R][TT];
-    for (int r = 0; r < R; r++) for (int t = 0; t < TT; t++) acc[r][t] = 0.0f;
-    device const uchar* wb = w + ulong(rowBase) * rowBytes;
-    device const T* sb = sc + rowBase * gpr;
-    device const T* bb = bi + rowBase * gpr;
-    const float4 sLo = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
-    const float4 sHi = sLo * (1.0f / 65536.0f);
-    const uint4 mLo = uint4(0xFu, 0xF0u, 0xF00u, 0xF000u);
-    const uint4 mHi = mLo << 16;
-    // 8 weights (one packed uint) per lane per step: the activations of every token
-    // fit in registers, and each weight is dequantised once and reused by all tokens.
-    for (int k = int(lane) * 8; k < p.K; k += 256) {
-        float4 xl[TT], xh[TT];
-        float xs[TT];
-        for (int t = 0; t < TT; t++) {
-            device const float4* xp = (device const float4*)(x + min(t, nt - 1) * p.xStride + k);
-            const float4 a = xp[0], b = xp[1];
-            xs[t] = dot(a + b, float4(1.0f));
-            xl[t] = a * sLo; xh[t] = b * sHi;
+    const int jOff = (fn / 2) * 32;                       // this lane's 32-value run in a block
+    // Per fragment: the slot ([A|B|C]; o1, o2 are multiples of 8) and this lane's row in it.
+    // Fragments past the last row compute nothing, but every thread stages x and reaches the barriers.
+    device const uchar* wrow[QXRF]; device const T* srow[QXRF]; device const T* brow[QXRF];
+    float bias[QXRF];
+    bool live[QXRF];
+    int nf = 0;                                 // live fragments (a prefix)
+    for (int r = 0; r < QXRF; r++) {
+        const int g = sgRow + 8 * r;
+        live[r] = g < p.O;
+        nf += live[r] ? 1 : 0;
+        device const uchar* w; device const T* sc; device const T* bi; device const T* rb;
+        int rowBase;
+        if (g < p.o1) { w = wA; sc = sA; bi = bA; rb = biasA; rowBase = g; }
+        else if (g < p.o1 + p.o2) { w = wB; sc = sB; bi = bB; rb = biasB; rowBase = g - p.o1; }
+        else { w = wC; sc = sC; bi = bC; rb = biasC; rowBase = g - p.o1 - p.o2; }
+        const int row = live[r] ? rowBase + min(fm, p.O - g - 1) : 0;
+        wrow[r] = w + ulong(row) * rowBytes;
+        srow[r] = sc + row * gpr;
+        brow[r] = bi + row * gpr;
+        bias[r] = live[r] && p.hasBias ? float(rb[row]) : 0.0f;
+    }
+    simdgroup_matrix<float, 8, 8> C[QXRF][QXACC];
+    for (int r = 0; r < QXRF; r++) for (int a = 0; a < QXACC; a++) C[r][a] = simdgroup_matrix<float, 8, 8>(0);
+    for (int k0 = 0; k0 < p.K; k0 += QXK) {
+        // This chunk's weights first: the loads do not wait for the x staging.
+        uint4 wq[NB][QXRF];
+        float s[NB][QXRF], b[NB][QXRF];
+        for (int i = 0; i < NB; i++) {
+            const int k = k0 + i * 128 + jOff;
+            for (int r = 0; r < QXRF; r++) {
+                if (live[r] && k < p.K) {
+                    wq[i][r] = *(device const uint4*)(wrow[r] + (ulong(k) >> 1));
+                    s[i][r] = float(srow[r][k / p.gs]); b[i][r] = float(brow[r][k / p.gs]);
+                } else { wq[i][r] = uint4(0); s[i][r] = 0.0f; b[i][r] = 0.0f; }
+            }
         }
-        const int g = k / p.gs;
-        const ulong off = ulong(k) >> 1;
-        for (int r = 0; r < R; r++) {
-            const int rr = min(r, nr - 1);
-            const uint wv = *(device const uint*)(wb + ulong(rr) * rowBytes + off);
-            const float4 ql = float4(uint4(wv) & mLo), qh = float4(uint4(wv) & mHi);
-            const float s = float(sb[rr * gpr + g]), b = float(bb[rr * gpr + g]);
-            for (int t = 0; t < TT; t++)
-                acc[r][t] += s * (dot(ql, xl[t]) + dot(qh, xh[t])) + b * xs[t];
+        threadgroup_barrier(mem_flags::mem_threadgroup);  // the previous chunk's reads are done
+        for (int idx = int(tid); idx < 8 * QXK / 4; idx += QXNSG * 32) {
+            const int t = idx / (QXK / 4), kl = (idx % (QXK / 4)) * 4;
+            float4 v = float4(0);
+            if (t < nt && k0 + kl < p.K) v = *(device const float4*)(x + t * p.xStride + k0 + kl);
+            const int blk = kl / 128, c = ((kl % 128) / 32) * 2, kk = (kl % 32) / 2;
+            threadgroup float* d = Xs + ((blk * 16 + kk) * 8 + c) * 8 + t;
+            d[0] = v.x; d[8] = v.y; d[64] = v.z; d[72] = v.w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (nf == 0) continue;
+        for (int i = 0; i < NB; i++) {
+            if (k0 + i * 128 >= p.K) break;
+            threadgroup const float* xb = Xs + i * 1024 + fm * 8 + fn;
+            for (int kk = 0; kk < 16; kk++) {
+                simdgroup_matrix<float, 8, 8> B;
+                const float2 xv = *(threadgroup const float2*)(xb + kk * 64);
+                B.thread_elements()[0] = xv.x;
+                B.thread_elements()[1] = xv.y;
+                for (int r = 0; r < QXRF; r++) {
+                    const uint u = wq[i][r][kk / 4] >> (8 * (kk % 4));
+                    simdgroup_matrix<float, 8, 8> A;
+                    A.thread_elements()[0] = float(u & 0xFu) * s[i][r] + b[i][r];
+                    A.thread_elements()[1] = float((u >> 4) & 0xFu) * s[i][r] + b[i][r];
+                    simdgroup_multiply_accumulate(C[r][kk % QXACC], A, B, C[r][kk % QXACC]);
+                }
+            }
         }
     }
-    for (int r = 0; r < R; r++) {
-        for (int t = 0; t < TT; t++) {
-            const float v = simd_sum(acc[r][t]);
-            if (lane == 0 && r < nr && t < nt)
-                y[t * p.yStride + gRow + r] = v + (p.hasBias ? float(rb[rowBase + r]) : 0.0f);
+    for (int r = 0; r < QXRF; r++) {
+        const int g = sgRow + 8 * r;
+        if (!live[r] || fm >= p.O - g) continue;
+        for (int i = 0; i < 2; i++) {
+            float v = bias[r];
+            for (int a = 0; a < QXACC; a++) v += C[r][a].thread_elements()[i];
+            if (fn + i < nt) y[(fn + i) * p.yStride + g + fm] = v;
         }
     }
 }
@@ -1631,10 +1681,9 @@ INST_QMM_ALL(5)
 INST_QMM_ALL(6)
 INST_QMM_ALL(8)
 
-#define QVBR 4
-#define INST_QMVB(T, TN, TT) \
-  template [[host_name("qmvb4_" #TN "_" #TT)]] kernel void qmvb4<T, TT, QVBR>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const T*, device const uchar*, device const T*, device const T*, device const T*, device const T*, device const T*, uint2, uint, uint);
-INST_QMVB(half, f16, 4) INST_QMVB(bfloat, bf16, 4) INST_QMVB(float, f32, 4)
+#define INST_QMVX(T, TN) \
+  template [[host_name("qmvx4_" #TN)]] kernel void qmvx4<T>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const T*, device const uchar*, device const T*, device const T*, device const T*, device const T*, device const T*, uint2, uint, uint, uint);
+INST_QMVX(half, f16) INST_QMVX(bfloat, bf16) INST_QMVX(float, f32)
 
 #define INST_DENSE(T, TN) \
   template [[host_name("dmm_" #TN "_1")]] kernel void dmm<T, 1>(device const T*, device const float*, device float*, constant MMParams&, uint2, uint, uint); \
