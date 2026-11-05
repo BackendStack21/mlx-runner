@@ -75,20 +75,103 @@ prints how many greedy tokens match dense decode, and the teacher-forced next-to
 64 positions. Use a context below the model's maximum (Mistral 7B: 32,768). Without
 `MLXR_BENCH_TEXT` the prompt is pseudo-random tokens: fine for speed, meaningless for agreement.
 
-## Checklist on the Mac
+## Continuing on a Mac: instructions for a local agent
 
-1. `swift build -c release`: fix compile errors (Swift and the runtime-compiled Metal source;
-   `GPU.shared` reports Metal errors at the first pipeline lookup).
-2. `swift test --filter "Sparse attention"`: plan, index, scores, selection (ties, odd thread counts),
-   attention over a list (bitwise vs `attention_split`, a subset vs a CPU reference, clamping).
-3. `swift test --filter sparseDecode` with models installed: full-budget sparse decode is
-   bit-identical to split decode on Qwen3 0.6B, Llama 3.2 1B, Phi-3.5 and Mistral 7B; below the
-   minimum context nothing sparse runs.
-4. `swift test`: the existing gates (greedy token identity, prefill vs incremental decode) with
-   `MLXR_SPARSE_ATTN` unset.
-5. Check that kernel compile time at startup did not grow noticeably (25 new `attention_sparse`
-   instantiations).
-6. Bench as above: dense first, to confirm the cost model, then sparse.
+You are picking this branch up on an Apple Silicon Mac, where it can finally be compiled, tested and
+measured. Read `AGENTS.md` first; its rules apply throughout. In particular: Swift only, no
+dependencies, every performance claim needs `mlxr bench` numbers taken with nothing else on the
+GPU, and the default code path must keep greedy output token-identical.
+
+**Setup**
+
+```bash
+git fetch origin && git checkout feat/sparse-decode-attention
+make cli                                  # builds .build/release/mlxr
+M=.build/release/mlxr
+$M download mlx-community/Qwen3-0.6B-4bit # the model tests skip models that are not installed
+$M download mlx-community/Llama-3.2-1B-Instruct-4bit
+$M download mlx-community/Mistral-7B-Instruct-v0.3-4bit
+$M download mlx-community/Phi-3.5-mini-instruct-4bit   # optional, but the full-budget test covers it
+```
+
+**Step 1: make it compile.** `swift build -c release` checks only the Swift. The Metal source in
+`Kernels.swift` compiles at runtime when `GPU.shared` is first used. One Metal error fails every
+kernel, so run `swift test --filter "Sparse attention"` early: a `kernelCompile` error there prints
+the Metal compiler's message. Fix what is wrong and keep each fix minimal. Do not redesign while
+fixing compile errors.
+
+**Step 2: unit tests.** `swift test --filter "Sparse attention"` must pass completely. It covers:
+- the plan;
+- the index (mean of 4 keys);
+- the scores (sum over heads);
+- the selection (ties, negative scores, 64 and 96 threads, p = N);
+- attention over a list: bitwise against `attention_split`, a subset against a CPU reference, and
+  clamping.
+
+If a selection case fails, the algorithm itself was checked in a CPU simulation before the
+handoff. Suspect the MSL translation (barriers, `simd_prefix_exclusive_sum`, atomics), not the
+method.
+
+**Step 3: end-to-end exactness.** `swift test --filter sparseDecode`:
+- `sparseDecodeWithFullBudgetIsBitIdentical` must give identical logits to split decode on every
+  installed model. If logits differ but are close, the list order or the query-head grouping differs
+  from `attention_split`; find it rather than loosening the test.
+- `sparseDecodeStaysDenseBelowItsMinimumContext` must show that no sparse dispatch happened.
+
+**Step 4: nothing else changed.** With `MLXR_SPARSE_ATTN` unset, run `swift test` in full and fix
+any regression. Also check that start-up did not get noticeably slower: the Metal source
+compiles at every launch, and this branch adds 25 `attention_sparse` instantiations. Time a
+one-token run (`time $M run <model> -p hi --max 1`, twice, keep the second) on `main` and on this
+branch.
+
+**Step 5: measure.** Close other GPU users. Get a long real text, for example a public-domain book
+saved as `~/book.txt`. For each model (start with Qwen3 0.6B and Mistral 7B), run:
+
+```bash
+# dense baseline: does decode slow down with context as the "Why" table estimates?
+MLXR_BENCH_DECODE=1 MLXR_BENCH_CTX=8192,16384,30000 $M bench <model>
+# dense vs sparse, with agreement on real text
+MLXR_SPARSE_ATTN=1 MLXR_BENCH_TEXT=~/book.txt MLXR_BENCH_DECODE=1 MLXR_BENCH_CTX=8192,16384,30000 $M bench <model>
+```
+
+Run each at least twice and keep the better run, as the README's numbers do. Contexts must be
+below the model's maximum (Mistral 7B: 32,768; Qwen3 0.6B: 40,960). Record for each context: dense
+tok/s, sparse tok/s, the greedy-prefix match and the teacher-forced agreement. If the 16 GB memory
+check refuses a context, lower it and note that.
+
+**Step 6: decide, then tune or stop.** Propose a verdict to the user with the numbers. Do not
+decide alone. A reasonable bar:
+- sparse at least 1.3× dense at about 30K on Mistral 7B;
+- not slower than dense at 8K;
+- teacher-forced agreement of at least 95% on real text.
+
+If speed falls short, find out which step costs the time before changing anything:
+1. Compare GPU time per token (`gpu … ms` in the bench line) with the dense line.
+2. Rerun with `MLXR_SPARSE_ATTN=2048` against smaller budgets such as `512` to separate the
+   attention cost from the fixed index and selection costs.
+3. Try `MLXR_SPARSE_WINDOW=128`.
+
+Then apply the matching item from "Known gaps" below, one change at a time, keeping a change only if
+the bench shows a win. If agreement falls short, try a larger `topK` and window before anything
+else.
+
+**Step 7: record and hand back.**
+- Commit fixes and measurements to this branch with clear messages.
+- Put the measured numbers into this document. Replace the "Why" estimates, keeping the estimates
+  labelled as such if you leave them.
+- Do not merge, tag, bump `Version.swift` or edit the README's performance tables. Do not open a
+  pull request unless the user asks.
+- Report to the user: what failed to compile and how it was fixed, the test results, the
+  measurement table, and your recommendation.
+
+**Things that must stay true**
+- `MLXR_SPARSE_ATTN` unset means no sparse buffers, no sparse dispatches, and outputs bit-identical
+  to `main`.
+- Every GPU index derives from host-checked values. Positions in the list are clamped in
+  `attention_sparse`, and the plan guarantees `count <= L <= maxSeq`. Keep both if you change the
+  selection.
+- The index must be rebuilt for any block whose positions are rewritten (new turn, rejected draft):
+  see the comment above the `sparse_index` dispatch in `Transformer.encode`.
 
 ## Keep or drop
 
