@@ -51,6 +51,86 @@ func formatBytes(_ b: Int) -> String {
     ByteCountFormatter.string(fromByteCount: Int64(b), countStyle: .file)
 }
 
+/// `mlxr bench` with MLXR_BENCH_CTX: greedy decode after long prompts with dense attention and,
+/// for a model loaded with MLXR_SPARSE_ATTN, with sparse attention; then how often sparse decode
+/// picks dense decode's next token when fed dense decode's tokens (teacher-forced). The prompt is
+/// MLXR_BENCH_TEXT (a text file, tokenized and repeated to length) or pseudo-random tokens, on
+/// which agreement says little about real text.
+func benchLongContext(_ t: Transformer, dir: URL, contexts: [Int]) throws {
+    var greedy = SamplingParameters()
+    greedy.temperature = 0
+    greedy.repetitionPenalty = 1
+    let sp = SampleParams(greedy, vocab: t.vocabSize)
+    var text: [Int32] = []
+    if let path = ProcessInfo.processInfo.environment["MLXR_BENCH_TEXT"] {
+        guard let s = try? String(contentsOfFile: path, encoding: .utf8) else { fail("cannot read MLXR_BENCH_TEXT \(path)") }
+        text = try Tokenizer(directory: dir).encode(s).map { Int32($0) }.filter { $0 >= 0 && Int($0) < t.vocabSize }
+        print("long-context prompt: \(path), \(text.count) tokens (repeated to length)")
+    } else {
+        print("long-context prompt: pseudo-random tokens (MLXR_BENCH_TEXT=<file.txt> for real text)")
+    }
+    let original = t.sparse
+    defer { t.sparse = original }
+    let sparse = t.sparseAvailable ? original : nil
+    let steps = 64
+    for ctx in contexts {
+        guard ctx + steps + 2 < t.maxSeq else { print("decode @\(ctx): skipped (the model's context is \(t.maxSeq))"); continue }
+        var rng: UInt64 = 0x9E3779B97F4A7C15
+        let lo = min(1000, t.vocabSize / 2), span = UInt64(max(1, min(t.vocabSize, 30000) - lo))
+        let prompt: [Int32] = (0..<ctx).map { i in
+            if !text.isEmpty { return text[i % text.count] }
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17
+            return Int32(lo + Int(rng % span))
+        }
+        t.sparse = nil
+        t.seedSampler(1)
+        let s0 = Date()
+        let first = try t.prefill(prompt, offset: 0, sample: sp)
+        let prefillTime = Date().timeIntervalSince(s0)
+        print(String(format: "prefill @%d: %.1f s (%.0f tok/s)", ctx, prefillTime, Double(ctx) / prefillTime))
+        // Each run decodes from the same prompt (positions from ctx on are rewritten, the index with them).
+        var dense: [Int] = []
+        var modes: [(String, SparseAttention?)] = [("dense", nil)]
+        if let sparse { modes.append(("sparse", sparse)) }
+        for (label, mode) in modes {
+            t.sparse = mode
+            t.seedSampler(1)
+            var tokens: [Int] = []
+            var gpu = 0.0
+            let s = Date()
+            var cur = try t.beginDecodeStep(offset: ctx, sample: sp)
+            for i in 0..<steps {
+                let next = i + 1 < steps ? try t.beginDecodeStep(offset: ctx + i + 1, sample: sp) : nil
+                tokens.append(try t.finish(cur))
+                gpu += t.lastGPUTime
+                if let next { cur = next }
+            }
+            let dt = Date().timeIntervalSince(s)
+            print(String(format: "%@ @%d: %6.1f tok/s  (wall %.2f ms, gpu %.2f ms per token)", label as NSString, ctx,
+                         Double(steps) / dt, dt / Double(steps) * 1000, gpu / Double(steps) * 1000))
+            if mode == nil {
+                dense = tokens
+            } else {
+                let same = zip(tokens, dense).prefix { pair in pair.0 == pair.1 }.count
+                print("  sparse greedy: the first \(same) of \(steps) tokens equal dense decode's")
+            }
+        }
+        if let sparse {
+            t.sparse = sparse
+            var match = 0
+            var input = Int32(first)
+            for i in 0..<steps {
+                let logits = try t.forward([input], offset: ctx + i)
+                var best = 0
+                for v in 1..<t.vocabSize where logits[v] > logits[best] { best = v }
+                if best == dense[i] { match += 1 }
+                input = Int32(dense[i])
+            }
+            print("  sparse teacher-forced: the next-token argmax equals dense decode's at \(match) of \(steps) positions")
+        }
+    }
+}
+
 guard let cmd = args.first else {
     print("usage: mlxr <search|download|list|run|tokenize|serve> ...")
     exit(0)
@@ -161,8 +241,16 @@ case "serve":
 case "bench":
     guard let model = args.first else { fail("usage: mlxr bench <model>") }
     let dir = resolve(model)
-    let t = try Transformer(directory: dir, contextLength: 4096)
+    // Long-context decode (opt-in): MLXR_BENCH_CTX=8192,32768 adds a section at the end.
+    let longContexts = (ProcessInfo.processInfo.environment["MLXR_BENCH_CTX"] ?? "")
+        .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }.filter { $0 > 0 }
+    let t = try Transformer(directory: dir, contextLength: max(4096, (longContexts.max() ?? 0) + 256))
     print("weights: \(formatBytes(t.weightBytes))")
+    if let sp = t.sparse {
+        print(t.sparseAvailable
+              ? "sparse decode attention: top-k \(sp.topK), window \(sp.window), sink \(sp.sink), from \(sp.minContext) tokens"
+              : "sparse decode attention: requested, but no layer of this model supports it")
+    }
     let quick = ProcessInfo.processInfo.environment["MLXR_BENCH_DECODE"] != nil
     let noProfile = quick || ProcessInfo.processInfo.environment["MLXR_BENCH_NOPROFILE"] != nil
     if !noProfile { print(try t.profile()) }
@@ -226,6 +314,7 @@ case "bench":
         for i in 0..<8 { _ = try t.forward((0..<T).map { Int32(600 + $0 + i) }, offset: 64) }
         print(String(format: "prefill T=%d: %6.2f ms", T, Date().timeIntervalSince(s) / 8 * 1000))
     }
+    if !longContexts.isEmpty { try benchLongContext(t, dir: dir, contexts: longContexts) }
 
 default:
     fail("unknown command \(cmd)")

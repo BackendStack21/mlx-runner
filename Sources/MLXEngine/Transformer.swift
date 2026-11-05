@@ -499,6 +499,9 @@ public final class Transformer {
         var split: (split: MTLComputePipelineState, combine: MTLComputePipelineState)?
         /// Query-head sub-groups per KV head of the split kernel (grid depth).
         var splitGroups = 1
+        /// Sparse decode attention (`attention_sparse`, split's shape; combined by `split.combine`).
+        /// Only looked up for a model loaded with sparse attention.
+        var sparse: MTLComputePipelineState?
     }
     /// By head size (Gemma 4 mixes 256 and 512).
     private let attnKernels: [Int: AttnKernels]
@@ -540,6 +543,27 @@ public final class Transformer {
     /// Developer profiling only (`profile`): kernel classes left out of `encode`.
     var profileSkip: Set<String> = []
 
+    /// Sparse decode attention (experimental, changes outputs; see `SparseAttention`): its budget,
+    /// or nil for dense decode. It takes effect only when the model was loaded with sparse attention
+    /// (`init(directory:contextLength:sparse:)`), which allocates and maintains the index; it can
+    /// then be changed or turned off between steps.
+    public var sparse: SparseAttention? { didSet { prepared = nil } }
+    /// Has `init` allocated the sparse index (so `sparse` can take effect)?
+    public var sparseAvailable: Bool { sparseScores != nil && sparseIndex.contains { $0 != nil } }
+    /// Per layer: pooled index keys [cacheLen / pool][nKV][D] (f16), for a full-attention layer with
+    /// its own cache and a sparse kernel for its head size. KV-shared layers use their source's.
+    private let sparseIndex: [MTLBuffer?]
+    /// Block scores of the current layer ([cacheLen / pool + 1] floats) and its attended positions
+    /// ([maxSeq] ints); every layer reuses them (the serial encoder orders the dispatches).
+    private let sparseScores: MTLBuffer?
+    private let sparseList: MTLBuffer?
+    private let sparseIndexPSO: MTLComputePipelineState?
+    private let sparseScorePSO: MTLComputePipelineState?
+    private let sparseSelectPSO: MTLComputePipelineState?
+    private let sparseSelectThreads: Int
+    /// Tests: layer attentions encoded with the sparse kernels so far.
+    private(set) var sparseLayerSteps = 0
+
     public private(set) var lastGPUTime: Double = 0
     public var vocabSize: Int { lmHead.outDim }
     public var weightBytes: Int { store.totalBytes }
@@ -550,7 +574,9 @@ public final class Transformer {
         }
     }
 
-    public init(directory: URL, contextLength: Int) throws {
+    /// `sparse` (by default from `MLXR_SPARSE_ATTN`, normally unset) loads the model with sparse
+    /// decode attention: see `SparseAttention`.
+    public init(directory: URL, contextLength: Int, sparse: SparseAttention? = SparseAttention.fromEnvironment) throws {
         let gpu = GPU.shared
         let c = try ModelConfig(directory: directory)
         config = c
@@ -653,11 +679,48 @@ public final class Transformer {
                 k.split = (split, combine)
                 k.splitGroups = G / gSub
                 partialBytes = max(partialBytes, bytes)
+                if sparse != nil { k.sparse = try? gpu.pipeline("attention_sparse_\(e)_\(gSub)\(cap)") }
             }
             kernels[D] = k
         }
         attnPartials = partialBytes > 0 ? try buffer(partialBytes * Self.maxVerifyTokens) : nil   // per query token
         attnKernels = kernels
+
+        // Sparse decode attention: an index for every eligible layer, block scores and the position
+        // list (not scratch: `sparseBytes` accounts for them).
+        var sparseLayers: [Bool] = []
+        for l in layers {
+            sparseLayers.append(Transformer.sparseEligible(l.spec, cacheLen: l.cacheLen, context: seq) && kernels[l.spec.headDim]?.sparse != nil)
+        }
+        if sparse != nil, attnPartials != nil, sparseLayers.contains(true) {
+            let pool = SparseAttention.pool
+            var index: [MTLBuffer?] = []
+            for (l, on) in zip(layers, sparseLayers) {
+                if on { index.append(try gpu.buffer(seq / pool * l.spec.numKVHeads * l.spec.headDim * 2)) } else { index.append(nil) }
+            }
+            sparseIndex = index
+            sparseScores = try gpu.buffer((seq / pool + 1) * 4)
+            sparseList = try gpu.buffer(seq * 4)
+            let indexPSO = try gpu.pipeline("sparse_index"), score = try gpu.pipeline("sparse_score"), select = try gpu.pipeline("sparse_select")
+            sparseIndexPSO = indexPSO
+            sparseScorePSO = score
+            sparseSelectPSO = select
+            sparseSelectThreads = min(1024, select.maxTotalThreadsPerThreadgroup) / 32 * 32
+            let maxD = layers.map(\.spec.headDim).max() ?? 0
+            guard sparseSelectThreads >= 32, score.maxTotalThreadsPerThreadgroup >= Self.sparseScoreThreads,
+                  indexPSO.maxTotalThreadsPerThreadgroup >= maxD else {
+                throw EngineError.unsupported("sparse attention: kernel thread limits")
+            }
+        } else {
+            sparseIndex = [MTLBuffer?](repeating: nil, count: layers.count)
+            sparseScores = nil
+            sparseList = nil
+            sparseIndexPSO = nil
+            sparseScorePSO = nil
+            sparseSelectPSO = nil
+            sparseSelectThreads = 0
+        }
+        self.sparse = sparse
 
         if c.perLayerInputSize > 0 {
             let P = c.perLayerInputSize, LP = P * c.numLayers
@@ -891,6 +954,9 @@ public final class Transformer {
         // the prefill kernels give one threadgroup per head the whole context, so a verify pass
         // grew with the context length far faster than a decode step.
         let smallT = T <= Self.maxVerifyTokens
+        // Sparse decode attention: one plan per step (the blocks every eligible layer scores).
+        var sparsePlan: SparsePlan?
+        if decode, sparseScores != nil, let sp = sparse { sparsePlan = sp.plan(position: offset) }
         for (li, layer) in layers.enumerated() {
             let spec = layer.spec
             let D = spec.headDim, nKV = spec.numKVHeads, qkvCols = layer.qkvCols, I = layer.intermediate
@@ -927,12 +993,62 @@ public final class Transformer {
             enc.dispatchThreadgroups(MTLSize(width: spec.hasOwnKV ? nH + 2 * nKV : nH, height: T, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: D, height: 1, depth: 1))
             }
+            // Sparse index: (re)build the blocks completed by the positions this step wrote. Earlier
+            // positions are valid, so a rewritten position (a new turn, a rejected draft) rebuilds its block.
+            if !skipPost, let index = sparseIndex[li], let pso = sparseIndexPSO {
+                let pool = SparseAttention.pool, b0 = offset / pool, b1 = (offset + T) / pool
+                if b1 > b0 {
+                    enc.setComputePipelineState(pso)
+                    enc.set(layer.kCache!, 0, 0)
+                    enc.set(index, 0, 1)
+                    enc.params(SparseParams(pool: Int32(pool), nKV: Int32(nKV), D: Int32(D), maxSeq: Int32(layer.cacheLen),
+                                            b0: Int32(b0), nb: Int32(b1 - b0)), 2)
+                    enc.dispatchThreadgroups(MTLSize(width: b1 - b0, height: nKV, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: D, height: 1, depth: 1))
+                }
+            }
 
             let attnParams = AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(qkvCols),
                                         maxSeq: Int32(kv.cacheLen), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor * c.queryScale,
                                         outStride: Int32(nH * D), T: Int32(T), window: Int32(spec.sliding ? c.slidingWindow : 0),
                                         softcap: c.attnLogitSoftcap)
             if skipAttn {
+            } else if let plan = sparsePlan, !spec.sliding, let index = sparseIndex[spec.hasOwnKV ? li : spec.kvSource],
+                      let attnSparse = kernels.sparse, let combine = kernels.split?.combine, let partials = attnPartials,
+                      let scores = sparseScores, let list = sparseList, let scorePSO = sparseScorePSO, let selectPSO = sparseSelectPSO {
+                // Sparse decode: score the index blocks, select the attended positions, attend over them.
+                var sp = plan.params
+                sp.nKV = Int32(nKV); sp.D = Int32(D); sp.maxSeq = Int32(kv.cacheLen); sp.nH = Int32(nH)
+                enc.setComputePipelineState(scorePSO)
+                enc.set(qkvBuf, 0, 0)
+                enc.set(index, 0, 1)
+                enc.set(scores, 0, 2)
+                enc.params(sp, 3)
+                enc.dispatchThreadgroups(MTLSize(width: (Int(sp.nb) + Self.sparseScoreBlocks - 1) / Self.sparseScoreBlocks, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: Self.sparseScoreThreads, height: 1, depth: 1))
+                enc.setComputePipelineState(selectPSO)
+                enc.set(scores, 0, 0)
+                enc.set(list, 0, 1)
+                enc.params(sp, 2)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: sparseSelectThreads, height: 1, depth: 1))
+                enc.setComputePipelineState(attnSparse)
+                enc.set(qkvBuf, 0, 0)
+                enc.set(kv.kCache!, 0, 1)
+                enc.set(kv.vCache!, 0, 2)
+                enc.set(partials, 0, 3)
+                enc.params(attnParams, 4)
+                enc.set(list, 0, 5)
+                enc.params(Int32(plan.count), 6)
+                enc.dispatchThreadgroups(MTLSize(width: nKV, height: Self.attnSplitVirtualSG / Self.attnSplitSG, depth: kernels.splitGroups),
+                                         threadsPerThreadgroup: MTLSize(width: Self.attnSplitSG * 32, height: 1, depth: 1))
+                enc.setComputePipelineState(combine)
+                enc.set(partials, 0, 0)
+                enc.set(attnBuf, 0, 1)
+                enc.params(attnParams, 2)
+                enc.dispatchThreadgroups(MTLSize(width: nH, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                sparseLayerSteps += 1
             } else if smallT, offset + 1 >= attnSplitMinContext, let (split, combine) = kernels.split, let partials = attnPartials {
                 // Partials are reused by every layer: the serial encoder orders the dispatches.
                 enc.setComputePipelineState(split)

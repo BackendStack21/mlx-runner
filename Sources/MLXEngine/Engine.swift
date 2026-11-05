@@ -733,7 +733,9 @@ extension InferenceEngine {
         }
         let cfg = try ModelConfig(directory: directory)
         let ctx = min(contextLength, max(cfg.maxPositionEmbeddings, 256))
-        return (weights + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg), ctx)
+        // Sparse decode attention (MLXR_SPARSE_ATTN, which `Transformer.init` reads too) adds its index.
+        let sparse = SparseAttention.fromEnvironment != nil ? Transformer.sparseBytes(config: cfg, context: ctx) : 0
+        return (weights + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg) + sparse, ctx)
     }
 
     /// Refuses to load models (a target and its draft) whose weights plus KV caches would not fit
