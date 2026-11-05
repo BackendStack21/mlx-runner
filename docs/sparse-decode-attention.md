@@ -2,6 +2,10 @@
 
 Branch `feat/sparse-decode-attention`. Status: **written without a Swift toolchain or a Metal GPU.
 None of it has been compiled, run or benchmarked yet.** Expect compile fixes before the first test run.
+Done so far without a compiler:
+- a line-by-line review of the diff by a second reader (no defects found; its four hardening notes are applied);
+- a CPU simulation of `sparse_select`'s exact algorithm against a reference on 400 random cases
+  (ties, ±0, negative scores, p = N, 32–1024 threads), all matching.
 
 ## Why
 
@@ -194,7 +198,8 @@ own accuracy checks. That decision is open.
 - **Memory.** The index adds 1/8 of each eligible layer's KV cache, which lowers the largest context
   that fits on a 16 GB Mac by about 11%. A projected index would make this negligible.
 - **Coverage.** Gemma's sliding-window layers are bounded already and stay dense. Gemma 4's KV-shared
-  layers use their source layer's index (untested). Head sizes without a split kernel stay dense.
+  layers use their source layer's index when the shapes match (untested). Head sizes without a split
+  kernel stay dense. A draft model for speculative decoding always loads dense.
 - **Wiring.** No app setting, CLI flag or server option yet: add them only once the numbers justify it.
 - **Prefill.** Still O(T²) attention: at 32K it is roughly a third of prefill FLOPs on a 7B model.
   Sparse prefill would need the selection per query block; it is out of scope until decode proves out.

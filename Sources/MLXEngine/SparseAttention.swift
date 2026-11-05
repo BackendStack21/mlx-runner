@@ -18,7 +18,8 @@ import Foundation
 /// Only decode steps (one token) of layers that attend over a full-context cache use it (sliding-window
 /// layers are bounded already); prefill and speculative verification stay dense. Below `minContext`
 /// decode stays dense too. With a budget that covers the whole context, the result is bit-identical
-/// to dense decode (`ModelTests.sparseDecodeWithFullBudgetIsBitIdentical`).
+/// to split decode (`attention_split`; `ModelTests.sparseDecodeWithFullBudgetIsBitIdentical`), which
+/// itself equals the single-threadgroup decode kernel for head sizes up to 128.
 ///
 /// Enable it with `MLXR_SPARSE_ATTN=1` (or the number of long-range keys), `MLXR_SPARSE_WINDOW`,
 /// `MLXR_SPARSE_MIN`; see docs/sparse-decode-attention.md.

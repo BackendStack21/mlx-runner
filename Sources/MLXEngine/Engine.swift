@@ -265,7 +265,7 @@ public final class InferenceEngine: @unchecked Sendable {
                         guard model.supportsBatchedVerify else {
                             throw EngineError.unsupported("\(directory.lastPathComponent) has no batched verify kernels (4-bit weights are required), so a draft model cannot help")
                         }
-                        let d = try Transformer(directory: draftDirectory, contextLength: model.maxSeq)
+                        let d = try Transformer(directory: draftDirectory, contextLength: model.maxSeq, sparse: nil)   // drafts stay dense
                         guard d.vocabSize >= min(model.vocabSize, tok.vocabularySize) else {
                             throw EngineError.unsupported("draft model \(draftDirectory.lastPathComponent) has a smaller vocabulary than \(directory.lastPathComponent)")
                         }
@@ -724,7 +724,7 @@ extension InferenceEngine {
     }
 
     /// Weights + KV cache + scratch of one model at a context length (and the context it gets).
-    static func memoryNeed(directory: URL, contextLength: Int) throws -> (bytes: Int, context: Int) {
+    static func memoryNeed(directory: URL, contextLength: Int, sparse: Bool = SparseAttention.fromEnvironment != nil) throws -> (bytes: Int, context: Int) {
         let fm = FileManager.default
         var weights = 0
         for f in (try? WeightStore.shardFiles(in: directory)) ?? [] {
@@ -734,8 +734,8 @@ extension InferenceEngine {
         let cfg = try ModelConfig(directory: directory)
         let ctx = min(contextLength, max(cfg.maxPositionEmbeddings, 256))
         // Sparse decode attention (MLXR_SPARSE_ATTN, which `Transformer.init` reads too) adds its index.
-        let sparse = SparseAttention.fromEnvironment != nil ? Transformer.sparseBytes(config: cfg, context: ctx) : 0
-        return (weights + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg) + sparse, ctx)
+        let index = sparse ? Transformer.sparseBytes(config: cfg, context: ctx) : 0
+        return (weights + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg) + index, ctx)
     }
 
     /// Refuses to load models (a target and its draft) whose weights plus KV caches would not fit
@@ -744,7 +744,8 @@ extension InferenceEngine {
         var need: UInt64 = 0
         var ctx = contextLength
         for (i, d) in directories.enumerated() {
-            let n = try memoryNeed(directory: d, contextLength: contextLength)
+            // Only the target loads with sparse attention (the draft is created with `sparse: nil`).
+            let n = try memoryNeed(directory: d, contextLength: contextLength, sparse: i == 0 && SparseAttention.fromEnvironment != nil)
             need += UInt64(n.bytes)
             if i == 0 { ctx = n.context }
         }

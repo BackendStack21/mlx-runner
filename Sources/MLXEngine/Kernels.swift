@@ -1316,9 +1316,10 @@ kernel void sparse_select(device const float* scores [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);   // pick is rewritten by the next round
     }
     // `prefix` is now the p-th largest key: every block above it is kept, and of the blocks equal
-    // to it the first `want`. Each thread compacts a contiguous run of blocks.
+    // to it the first `want`. Each thread compacts a contiguous run of blocks, in (simdgroup, lane)
+    // order: the order of the prefix sums below.
     const int chunk = (N + NT - 1) / NT;
-    const int n0 = min(N, int(tid) * chunk), n1 = min(N, n0 + chunk);
+    const int n0 = min(N, (int(sg) * 32 + int(lane)) * chunk), n1 = min(N, n0 + chunk);
     uint gt = 0, eq = 0;
     for (int n = n0; n < n1; n++) {
         const uint k = sparse_key(scores[n]);

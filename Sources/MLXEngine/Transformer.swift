@@ -1013,7 +1013,8 @@ public final class Transformer {
                                         outStride: Int32(nH * D), T: Int32(T), window: Int32(spec.sliding ? c.slidingWindow : 0),
                                         softcap: c.attnLogitSoftcap)
             if skipAttn {
-            } else if let plan = sparsePlan, !spec.sliding, let index = sparseIndex[spec.hasOwnKV ? li : spec.kvSource],
+            } else if let plan = sparsePlan, !spec.sliding, kv.spec.numKVHeads == nKV, kv.spec.headDim == D,   // a KV-shared layer reads its source's index
+                      let index = sparseIndex[spec.hasOwnKV ? li : spec.kvSource],
                       let attnSparse = kernels.sparse, let combine = kernels.split?.combine, let partials = attnPartials,
                       let scores = sparseScores, let list = sparseList, let scorePSO = sparseScorePSO, let selectPSO = sparseSelectPSO {
                 // Sparse decode: score the index blocks, select the attended positions, attend over them.
