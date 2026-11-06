@@ -664,7 +664,7 @@ public final class Transformer {
             // has 16 / 8 simdgroups, so the split result is not bit-identical there.
             let Gs = Set(c.layers.filter { $0.headDim == D }.map { c.numHeads / $0.numKVHeads })
             let V = Self.attnSplitVirtualSG
-            let maxG = e == 2 ? 8 : e <= 4 ? 4 : 2
+            let maxG = e == 2 || e == 4 ? 8 : e <= 4 ? 4 : 2   // E = 4 has G = 1...5 and 8 (a missing G stays unsplit)
             let gSub = Gs.first.map { e <= 4 ? $0 : min($0, maxG) } ?? 0
             if (decodeSG == V && (2...4).contains(e)) || e >= 8, Gs.count == 1, let G = Gs.first, (1...maxG).contains(gSub), G % gSub == 0,
                let split = try? gpu.pipeline("attention_split_\(e)_\(gSub)\(cap)"),

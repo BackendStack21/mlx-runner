@@ -14,6 +14,8 @@ struct ModelTests {
     static let llama = "mlx-community/Llama-3.2-1B-Instruct-4bit"
     static let phi = "mlx-community/Phi-3.5-mini-instruct-4bit"
     static let mistral = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
+    /// 5 query heads per KV head (the split and sparse kernels with G = 5).
+    static let qwen3_14b = "lmstudio-community/Qwen3-14B-MLX-4bit"
 
     @Test(.enabled(if: installedModel(qwen3) != nil))
     func qwenTokenizerKnownIdsAndRoundTrip() throws {
@@ -34,7 +36,7 @@ struct ModelTests {
 
     /// Prefill (GEMM + flash attention) and token-by-token decode (matvec + decode attention)
     /// must produce the same next-token distribution.
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral])
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, qwen3_14b])
     func prefillMatchesIncrementalDecode(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let model = try Transformer(directory: dir, contextLength: 1024)
@@ -81,7 +83,7 @@ struct ModelTests {
 
     /// The long-context split decode attention (attention_split + attention_combine) must give
     /// bit-identical logits to the single-kernel decode attention, at long and short contexts.
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral])
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, qwen3_14b])
     func splitDecodeAttentionIsBitIdentical(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let model = try Transformer(directory: dir, contextLength: 1024)
@@ -105,7 +107,7 @@ struct ModelTests {
     /// so it must reproduce split decode bit for bit: the index, the scores, the selection and the
     /// sparse kernel end to end. (A real budget changes outputs; `mlxr bench` with MLXR_BENCH_CTX
     /// measures by how much.)
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral])
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, qwen3_14b])
     func sparseDecodeWithFullBudgetIsBitIdentical(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let full = SparseAttention(topK: 1 << 20, window: 16, sink: 4, minContext: 1)
