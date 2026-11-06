@@ -29,14 +29,17 @@ struct SparseTimingTests {
         guard let plan = SparseAttention().plan(position: context - 1) else { return }
         var sp = plan.params
         sp.nKV = Int32(nKV); sp.D = Int32(D); sp.maxSeq = Int32(context); sp.nH = Int32(nH)
+        // MLXR_SPARSE_SHARED=1 times the shared selection, otherwise one per KV head.
+        let rows = ProcessInfo.processInfo.environment["MLXR_SPARSE_SHARED"] == "1" ? 1 : nKV
+        sp.rows = Int32(rows); sp.listStride = rows == 1 ? 0 : Int32(context)
         let nb = Int(sp.nb)
         var rng = RNG(s: 5)
         // Index rows and a query with a common direction, so block scores share magnitudes (and top
         // key bits) as real ones do.
         let idx = makeBuffer((0..<((context / pool + 1) * nKV * D)).map { i in Float16(0.5 + 0.3 * rng.float() + (i % 7 == 0 ? 0.2 : 0)) })
         let qkv = makeBuffer((0..<(nH * D + 2 * nKV * D)).map { _ in 0.5 + 0.2 * rng.float() })
-        let scores = makeBuffer([Float](repeating: 0, count: nb + 64))
-        let list = makeBuffer([Int32](repeating: 0, count: context + 64))
+        let scores = makeBuffer([Float](repeating: 0, count: rows * nb + 64))
+        let list = makeBuffer([Int32](repeating: 0, count: rows * context + 64))
         let scorePSO = try GPU.shared.pipeline("sparse_score"), selectPSO = try GPU.shared.pipeline("sparse_select")
         let threads = min(1024, selectPSO.maxTotalThreadsPerThreadgroup) / 32 * 32
         func score(_ enc: MTLComputeCommandEncoder) {
@@ -48,7 +51,7 @@ struct SparseTimingTests {
         func select(_ e: MTLComputeCommandEncoder) {
             e.setComputePipelineState(selectPSO)
             e.set(scores, 0, 0); e.set(list, 0, 1); e.params(sp, 2)
-            e.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
+            e.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
         }
         let tScore = try time(reps: 200) { score($0) }
         let tSelect = try time(reps: 200) { select($0) }
@@ -68,6 +71,9 @@ struct SparseTimingTests {
         guard let plan = SparseAttention().plan(position: context - 1) else { return }
         var sp = plan.params
         sp.nKV = Int32(nKV); sp.D = Int32(D); sp.maxSeq = Int32(context); sp.nH = Int32(nH)
+        // MLXR_SPARSE_SHARED=1 times the shared selection, otherwise one per KV head.
+        let rows = ProcessInfo.processInfo.environment["MLXR_SPARSE_SHARED"] == "1" ? 1 : nKV
+        sp.rows = Int32(rows); sp.listStride = rows == 1 ? 0 : Int32(context)
         let nb = Int(sp.nb)
         let gpu = GPU.shared
         var rng = RNG(s: 9)
@@ -75,8 +81,8 @@ struct SparseTimingTests {
         let kc = (0..<layers).map { _ in makeBuffer(rowHalves) }, vc = (0..<layers).map { _ in makeBuffer(rowHalves) }
         let idx = (0..<layers).map { _ in makeBuffer([Float16](rowHalves.prefix((context / pool + 1) * nKV * D))) }
         let qkv = makeBuffer((0..<(nH * D + 2 * nKV * D)).map { _ in 0.5 + 0.2 * rng.float() })
-        let scores = makeBuffer([Float](repeating: 0, count: nb + 64))
-        let list = makeBuffer([Int32](repeating: 0, count: context + 64))
+        let scores = makeBuffer([Float](repeating: 0, count: rows * nb + 64))
+        let list = makeBuffer([Int32](repeating: 0, count: rows * context + 64))
         let part = makeBuffer([Float](repeating: 0, count: nH * V * (D + 2)))
         let out = makeBuffer([Float](repeating: 0, count: nH * D))
         let scorePSO = try gpu.pipeline("sparse_score"), selectPSO = try gpu.pipeline("sparse_select")
@@ -102,11 +108,11 @@ struct SparseTimingTests {
             if select {
                 enc.setComputePipelineState(selectPSO)
                 enc.set(scores, 0, 0); enc.set(list, 0, 1); enc.params(sp, 2)
-                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
+                enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
             }
             enc.setComputePipelineState(sparsePSO)
             enc.set(qkv, 0, 0); enc.set(kc[l], 0, 1); enc.set(vc[l], 0, 2); enc.set(part, 0, 3); enc.params(ap, 4)
-            enc.set(list, 0, 5); enc.params(Int32(count), 6)
+            enc.set(list, 0, 5); enc.params(SIMD2<Int32>(Int32(count), sp.listStride), 6)
             enc.dispatchThreadgroups(attnGrid, threadsPerThreadgroup: attnThreads)
             combine(enc)
         }

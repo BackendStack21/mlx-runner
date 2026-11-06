@@ -124,11 +124,15 @@ struct ModelTests {
         for offset in [ids.count - 1, 300, 64] {
             model.sparse = nil
             let dense = Array(UnsafeBufferPointer(start: try model.forward([ids[offset]], offset: offset), count: V))
-            model.sparse = full
-            let before = model.sparseLayerSteps
-            let sparse = Array(UnsafeBufferPointer(start: try model.forward([ids[offset]], offset: offset), count: V))
-            #expect(model.sparseLayerSteps > before, "sparse attention did not run at offset \(offset)")
-            #expect(dense == sparse, "sparse decode with a full budget differs at offset \(offset)")
+            for perHead in [true, false] {   // one selection per KV head, or one shared
+                var mode = full
+                mode.perHead = perHead
+                model.sparse = mode
+                let before = model.sparseLayerSteps
+                let sparse = Array(UnsafeBufferPointer(start: try model.forward([ids[offset]], offset: offset), count: V))
+                #expect(model.sparseLayerSteps > before, "sparse attention did not run at offset \(offset)")
+                #expect(dense == sparse, "sparse decode (perHead \(perHead)) with a full budget differs at offset \(offset)")
+            }
         }
     }
 

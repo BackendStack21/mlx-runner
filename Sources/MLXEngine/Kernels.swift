@@ -1198,15 +1198,15 @@ kernel void attention_combine(device const float* part [[buffer(0)]],
 // Sparse decode attention (experimental, opt-in: see `SparseAttention`). After the training-free
 // variant of Latent Sparse Attention (arXiv 2610.42147), without its clustering and tree search:
 // every `pool` consecutive keys of a full-attention layer get one index key (their mean, f16);
-// a decode query scores the index blocks between the sink and the recent window with the sum
-// of its heads' dot products (one selection shared by every head), keeps the best `p` blocks
+// a decode query scores the index blocks between the sink and the recent window, per KV head with
+// the sum of its query heads' dot products (or summed over every head: one shared selection), keeps the best `p` blocks
 // and attends to the sink, those blocks' keys and the window. It changes outputs.
 //   index:  sparse_index (whenever positions are written) → idx[block][kvh][D]
-//   decode: sparse_score → scores[n] for blocks b0 + n, n < nb
-//           sparse_select → list of attended positions, ascending
-//           attention_sparse (+ attention_combine) over the list
+//   decode: sparse_score → scores[row][n] for blocks b0 + n, n < nb (rows: nKV, or 1 shared)
+//           sparse_select → a list of attended positions per row, ascending
+//           attention_sparse (+ attention_combine) over its KV head's list
 // ---------------------------------------------------------------------------
-struct SparseParams { int pool; int nKV; int D; int maxSeq; int b0; int nb; int nH; int p; int sinkEnd; int winStart; int L; int pad; };
+struct SparseParams { int pool; int nKV; int D; int maxSeq; int b0; int nb; int nH; int p; int sinkEnd; int winStart; int L; int listStride; int rows; };
 
 // Index keys of blocks b0 ..< b0 + nb: idx[b][kvh][d] = mean over the block's `pool` cached keys.
 // Grid (nb, nKV), D threads (one per element).
@@ -1223,6 +1223,7 @@ kernel void sparse_index(device const half* kc  [[buffer(0)]],
 }
 
 // Block scores of the decode query (row 0 of the q|k|v buffer, RoPE applied):
+// per KV head (p.rows == nKV) scores[kvh][n] = qsum_kvh · idx[b0 + n][kvh]; shared (p.rows == 1)
 // scores[n] = sum over query heads h of q_h · idx[b0 + n][kvh(h)] = sum over kvh of qsum_kvh · idx[b0 + n][kvh],
 // where qsum_kvh adds the queries of the KV head's group. Each threadgroup sums the queries into
 // threadgroup memory; simdgroup s of threadgroup g scores blocks (g · SSC_NSG + s) · SSC_BPS + i.
@@ -1248,16 +1249,33 @@ kernel void sparse_score(device const float* qkv    [[buffer(0)]],
         qf[i] = s;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int W4 = W / 4;
+    const int W4 = W / 4, D4 = p.D / 4;
     const int first = (int(tg) * SSC_NSG + int(sg)) * SSC_BPS;
     for (int i = 0; i < SSC_BPS; i++) {
         const int n = first + i;
         if (n >= p.nb) break;   // uniform per simdgroup
         device const half4* row = (device const half4*)(idx + ulong(p.b0 + n) * ulong(W));
-        float s = 0.0f;
-        for (int e = int(lane); e < W4; e += 32) s += dot(qs[e], float4(row[e]));
-        s = simd_sum(s);
-        if (lane == 0) scores[n] = s;
+        if (p.rows == 1) {
+            float s = 0.0f;
+            for (int e = int(lane); e < W4; e += 32) s += dot(qs[e], float4(row[e]));
+            s = simd_sum(s);
+            if (lane == 0) scores[n] = s;
+        } else if (32 % p.nKV == 0 && D4 % (32 / p.nKV) == 0) {
+            // One score per KV head: scores[kvh · nb + n]. The lanes split into nKV groups of `lph`
+            // (a power of two), one group per KV head.
+            const int lph = 32 / p.nKV, h = int(lane) / lph, sub = int(lane) % lph;
+            float s = 0.0f;
+            for (int e = h * D4 + sub; e < (h + 1) * D4; e += lph) s += dot(qs[e], float4(row[e]));
+            for (int o = lph / 2; o > 0; o /= 2) s += simd_shuffle_xor(s, ushort(o));
+            if (sub == 0) scores[h * p.nb + n] = s;
+        } else {
+            for (int h = 0; h < p.nKV; h++) {
+                float s = 0.0f;
+                for (int e = h * D4 + int(lane); e < (h + 1) * D4; e += 32) s += dot(qs[e], float4(row[e]));
+                s = simd_sum(s);
+                if (lane == 0) scores[h * p.nb + n] = s;
+            }
+        }
     }
 }
 
@@ -1271,11 +1289,14 @@ inline uint sparse_key(float f) {
 // the attended positions in ascending order: [0, sinkEnd), the kept blocks' keys, [winStart, L).
 // That is sinkEnd + p · pool + (L - winStart) entries (the host computes the count too). The host
 // guarantees 1 <= p <= nb, sinkEnd == b0 · pool and winStart == (b0 + nb) · pool.
-// One threadgroup (a multiple of 32 threads, at most 1024): a radix select of the p-th largest key,
+// One threadgroup per selection row (a multiple of 32 threads, at most 1024): row r reads scores
+// r · nb ..< (r + 1) · nb and writes its list at r · listStride (p.rows rows: 1, or one per KV head;
+// the host sizes both buffers). A radix select of the p-th largest key,
 // 8 bits per round, then a stable compaction with prefix sums.
-kernel void sparse_select(device const float* scores [[buffer(0)]],
-                          device int*         list   [[buffer(1)]],
+kernel void sparse_select(device const float* allScores [[buffer(0)]],
+                          device int*         allLists  [[buffer(1)]],
                           constant SparseParams& p   [[buffer(2)]],
+                          uint row  [[threadgroup_position_in_grid]],
                           uint tid  [[thread_index_in_threadgroup]],
                           uint ntg  [[threads_per_threadgroup]],
                           uint sg   [[simdgroup_index_in_threadgroup]],
@@ -1285,6 +1306,8 @@ kernel void sparse_select(device const float* scores [[buffer(0)]],
     threadgroup uint pick[2];
     threadgroup uint sumGt[32], sumEq[32];
     const int N = p.nb, NT = int(ntg);
+    device const float* scores = allScores + ulong(row) * ulong(N);
+    device int* list = allLists + ulong(row) * ulong(p.listStride);
     // `want`: how many keys are still to be kept among those matching `prefix` in the bits decided so far.
     uint prefix = 0, mask = 0, want = uint(p.p);
     for (int shift = 24; shift >= 0; shift -= 8) {
@@ -1354,7 +1377,7 @@ kernel void sparse_select(device const float* scores [[buffer(0)]],
     for (int i = int(tid); i < p.L - p.winStart; i += NT) list[w0 + i] = p.winStart + i;
 }
 
-// Decode attention over the `count` positions in `list`: attention_split's work (same grid,
+// Decode attention over the `count` positions in its KV head's list: attention_split's work (same grid,
 // partials and attention_combine) with key n of the list in place of position n. With the list
 // 0, 1, ..., L - 1 it is bit-identical to attention_split. Positions are clamped to the context,
 // so any list content reads inside the cache.
@@ -1364,12 +1387,13 @@ kernel void attention_sparse(device const float* qkv   [[buffer(0)]],
                              device const half*  vc    [[buffer(2)]],
                              device float*       part  [[buffer(3)]],
                              constant AttnParams& p    [[buffer(4)]],
-                             device const int*   list  [[buffer(5)]],
-                             constant int&       count [[buffer(6)]],
+                             device const int*   lists [[buffer(5)]],
+                             constant int2&      cl    [[buffer(6)]],   // entries per list, entries between KV heads' lists (0: shared)
                              uint3 tg   [[threadgroup_position_in_grid]],
                              uint  sg   [[simdgroup_index_in_threadgroup]],
                              uint  lane [[thread_index_in_simdgroup]]) {
-    const int kvh = int(tg.x);
+    const int kvh = int(tg.x), count = cl.x;
+    device const int* list = lists + ulong(kvh) * ulong(max(cl.y, 0));
     const int v = int(tg.y) * ASPLIT_NSG + int(sg);
     const int h0 = kvh * (p.nH / p.nKV) + int(tg.z) * G;
     float qr[G][E], acc[G][E], m[G], l[G];
@@ -2039,7 +2063,7 @@ INST_ASPLIT_C(8, 1, true, "_cap") INST_ASPLIT_C(8, 2, true, "_cap") INST_ASPLIT_
 INST_ACOMB(2) INST_ACOMB(3) INST_ACOMB(4) INST_ACOMB(8) INST_ACOMB(16)
 // Sparse decode attention: the same shapes as attention_split.
 #define INST_ASPARSE_C(E, G, CAP, SFX) \
-  template [[host_name("attention_sparse_" #E "_" #G SFX)]] kernel void attention_sparse<E, G, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, device const int*, constant int&, uint3, uint, uint);
+  template [[host_name("attention_sparse_" #E "_" #G SFX)]] kernel void attention_sparse<E, G, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, device const int*, constant int2&, uint3, uint, uint);
 #define INST_ASPARSE(E, G) INST_ASPARSE_C(E, G, false, "")
 INST_ASPARSE(2, 1) INST_ASPARSE(2, 2) INST_ASPARSE(2, 3) INST_ASPARSE(2, 4)
 INST_ASPARSE(2, 5) INST_ASPARSE(2, 6) INST_ASPARSE(2, 7) INST_ASPARSE(2, 8)

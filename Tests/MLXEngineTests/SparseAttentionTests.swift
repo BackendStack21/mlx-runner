@@ -71,31 +71,39 @@ struct SparseAttentionTests {
         }
     }
 
-    @Test(arguments: [(8, 2, 128), (16, 8, 128), (32, 8, 64), (4, 1, 256)])
+    // (32, 32, 96): one lane per KV head (Phi-3.5); (12, 6, 64): 6 KV heads, the generic per-head loop.
+    @Test(arguments: [(8, 2, 128), (16, 8, 128), (32, 8, 64), (4, 1, 256), (32, 32, 96), (12, 6, 64)])
     func scoresSumTheHeadsDotProducts(nH: Int, nKV: Int, D: Int) throws {
         let W = nKV * D, G = nH / nKV, b0 = 2, nb = 150   // three threadgroups, the last one partial
         var rng = RNG(s: UInt64(nH * 1000 + D))
         let q = (0..<(nH * D)).map { _ in rng.float() }
         let idx = (0..<((b0 + nb) * W)).map { _ in Float16(rng.float()) }
-        let scores = try GPU.shared.buffer((nb + 1) * 4)
+        for perHead in [false, true] {
+        let rows = perHead ? nKV : 1
+        let scores = try GPU.shared.buffer((rows * nb + 1) * 4)
         try runGPU { enc in
             enc.setComputePipelineState(try GPU.shared.pipeline("sparse_score"))
             enc.set(makeBuffer(q), 0, 0); enc.set(makeBuffer(idx), 0, 1); enc.set(scores, 0, 2)
-            enc.params(SparseParams(pool: Int32(Self.pool), nKV: Int32(nKV), D: Int32(D), b0: Int32(b0), nb: Int32(nb), nH: Int32(nH)), 3)
+            enc.params(SparseParams(pool: Int32(Self.pool), nKV: Int32(nKV), D: Int32(D), b0: Int32(b0), nb: Int32(nb), nH: Int32(nH), rows: Int32(rows)), 3)
             enc.dispatchThreadgroups(MTLSize(width: (nb + Transformer.sparseScoreBlocks - 1) / Transformer.sparseScoreBlocks, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: Transformer.sparseScoreThreads, height: 1, depth: 1))
         }
-        let got = readFloats(scores, nb)
+        let got = readFloats(scores, rows * nb)
         for n in 0..<nb {
-            var s: Float = 0
+            var perKV = [Float](repeating: 0, count: nKV)
             for h in 0..<nKV {
                 for d in 0..<D {
                     var qs: Float = 0
                     for g in 0..<G { qs += q[(h * G + g) * D + d] }
-                    s += qs * Float(idx[(b0 + n) * W + h * D + d])
+                    perKV[h] += qs * Float(idx[(b0 + n) * W + h * D + d])
                 }
             }
-            #expect(abs(got[n] - s) <= 1e-3 * max(1, abs(s)), "block \(n): \(got[n]) vs \(s)")
+            // Per KV head: scores[kvh · nb + n]; shared: scores[n], the sum over the KV heads.
+            let expected = perHead ? perKV : [perKV.reduce(0, +)]
+            for (r, s) in expected.enumerated() {
+                #expect(abs(got[r * nb + n] - s) <= 1e-3 * max(1, abs(s)), "perHead \(perHead) row \(r) block \(n): \(got[r * nb + n]) vs \(s)")
+            }
+        }
         }
     }
 
@@ -141,7 +149,7 @@ struct SparseAttentionTests {
         let pso = try GPU.shared.pipeline("sparse_select")
         let threads = min(c.threads, pso.maxTotalThreadsPerThreadgroup) / 32 * 32
         let list = makeBuffer([Int32](repeating: -1, count: L + 8))
-        try runGPU { enc in
+        runGPU { enc in
             enc.setComputePipelineState(pso)
             enc.set(makeBuffer(scores), 0, 0); enc.set(list, 0, 1)
             enc.params(SparseParams(pool: Int32(pool), b0: Int32(b0), nb: Int32(c.N), p: Int32(c.p),
@@ -151,6 +159,40 @@ struct SparseAttentionTests {
         let got = Array(UnsafeBufferPointer(start: list.contents().bindMemory(to: Int32.self, capacity: L + 8), count: L + 8))
         #expect(Array(got.prefix(expected.count)) == expected)
         #expect(got[expected.count...].allSatisfy { $0 == -1 }, "wrote past the list")
+    }
+
+    /// One selection per row (KV head): row r reads its own scores and writes its own list,
+    /// `listStride` entries apart, each equal to selecting that row alone.
+    @Test func selectRowsAreIndependent() throws {
+        let pool = Self.pool, sinkEnd = 4, b0 = sinkEnd / pool, N = 700, p = 64, rows = 3
+        let winStart = (b0 + N) * pool, L = winStart + 21, stride = L + 50
+        var rng = RNG(s: 77)
+        let scores: [Float] = (0..<(rows * N)).map { _ in rng.float(-10, 10) }
+        let pso = try GPU.shared.pipeline("sparse_select")
+        let lists = makeBuffer([Int32](repeating: -1, count: rows * stride))
+        runGPU { enc in
+            enc.setComputePipelineState(pso)
+            enc.set(makeBuffer(scores), 0, 0); enc.set(lists, 0, 1)
+            enc.params(SparseParams(pool: Int32(pool), b0: Int32(b0), nb: Int32(N), p: Int32(p), sinkEnd: Int32(sinkEnd),
+                                    winStart: Int32(winStart), L: Int32(L), listStride: Int32(stride), rows: Int32(rows)), 2)
+            enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: min(1024, pso.maxTotalThreadsPerThreadgroup) / 32 * 32, height: 1, depth: 1))
+        }
+        let got = Array(UnsafeBufferPointer(start: lists.contents().bindMemory(to: Int32.self, capacity: rows * stride), count: rows * stride))
+        let count = sinkEnd + p * pool + (L - winStart)
+        for r in 0..<rows {
+            let s = Array(scores[(r * N)..<((r + 1) * N)])
+            let kept = (0..<N).sorted { a, b in
+                let ka = Self.key(s[a]), kb = Self.key(s[b])
+                return ka != kb ? ka > kb : a < b
+            }.prefix(p).sorted()
+            var expected = (0..<sinkEnd).map { Int32($0) }
+            for n in kept { for i in 0..<pool { expected.append(Int32((b0 + n) * pool + i)) } }
+            expected += (winStart..<L).map { Int32($0) }
+            #expect(expected.count == count)
+            #expect(Array(got[(r * stride)..<(r * stride + count)]) == expected, "row \(r)")
+            #expect(got[(r * stride + count)..<((r + 1) * stride)].allSatisfy { $0 == -1 }, "row \(r) wrote past its list")
+        }
     }
 
     /// attention_sparse over the list 0 ..< L reproduces attention_split bit for bit; over a subset
@@ -168,13 +210,16 @@ struct SparseAttentionTests {
         let scale = 3 / Float(D).squareRoot()
         let p = AttnParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), qStride: Int32(nH * D), maxSeq: Int32(maxSeq),
                            offset: Int32(offset), scale: scale, outStride: Int32(nH * D), T: 1, window: 0, softcap: 0)
-        func run(sparseList: [Int32]?) throws -> [Float] {
+        /// One list shared by every KV head, or one per KV head (equal lengths).
+        func run(lists: [[Int32]]?) throws -> [Float] {
             let part = try GPU.shared.buffer(nH * V * (D + 2) * 4), out = try GPU.shared.buffer(nH * D * 4)
             try runGPU { enc in
-                if let l = sparseList {
+                if let lists {
                     enc.setComputePipelineState(try GPU.shared.pipeline("attention_sparse_\(e)_\(gSub)"))
                     enc.set(makeBuffer(q), 0, 0); enc.set(kBuf, 0, 1); enc.set(vBuf, 0, 2); enc.set(part, 0, 3); enc.params(p, 4)
-                    enc.set(makeBuffer(l), 0, 5); enc.params(Int32(l.count), 6)
+                    let count = lists[0].count
+                    enc.set(makeBuffer(lists.flatMap { $0 }), 0, 5)
+                    enc.params(SIMD2<Int32>(Int32(count), lists.count == 1 ? 0 : Int32(count)), 6)
                 } else {
                     enc.setComputePipelineState(try GPU.shared.pipeline("attention_split_\(e)_\(gSub)"))
                     enc.set(makeBuffer(q), 0, 0); enc.set(kBuf, 0, 1); enc.set(vBuf, 0, 2); enc.set(part, 0, 3); enc.params(p, 4)
@@ -186,35 +231,54 @@ struct SparseAttentionTests {
             }
             return readFloats(out, nH * D)
         }
-        let split = try run(sparseList: nil)
+        func run(sparseList: [Int32]) throws -> [Float] { try run(lists: [sparseList]) }
+        /// Attention of every query head over its KV head's positions, on the CPU.
+        func reference(_ positions: (Int) -> [Int32]) -> [Float] {
+            var ref = [Float](repeating: 0, count: nH * D)
+            for h in 0..<nH {
+                let kvh = h / (nH / nKV)
+                let list = positions(kvh)
+                let s: [Float] = list.map { j in
+                    var d: Float = 0
+                    for x in 0..<D { d += q[h * D + x] * scale * Float(kh[(kvh * maxSeq + Int(j)) * D + x]) }
+                    return d
+                }
+                let m = s.max()!
+                let w = s.map { exp($0 - m) }
+                let z = w.reduce(0, +)
+                for x in 0..<D {
+                    var acc: Float = 0
+                    for (i, j) in list.enumerated() { acc += w[i] * Float(vh[(kvh * maxSeq + Int(j)) * D + x]) }
+                    ref[h * D + x] = acc / z
+                }
+            }
+            return ref
+        }
+        let split = try run(lists: nil)
         let all = try run(sparseList: (0..<L).map { Int32($0) })
         #expect(all.map(\.bitPattern) == split.map(\.bitPattern), "full list vs attention_split")
 
         // A subset: the sink, scattered blocks and the window; and entries out of range, which clamp to L - 1.
         var subset: [Int32] = [0, 1, 2, 3, 20, 21, 22, 23, 52, 53, 54, 55]
         subset += (90..<L).map { Int32($0) }
-        let got = try run(sparseList: subset)
-        var ref = [Float](repeating: 0, count: nH * D)
-        for h in 0..<nH {
-            let kvh = h / (nH / nKV)
-            let s: [Float] = subset.map { j in
-                var d: Float = 0
-                for x in 0..<D { d += q[h * D + x] * scale * Float(kh[(kvh * maxSeq + Int(j)) * D + x]) }
-                return d
-            }
-            let m = s.max()!
-            let w = s.map { exp($0 - m) }
-            let z = w.reduce(0, +)
-            for x in 0..<D {
-                var acc: Float = 0
-                for (i, j) in subset.enumerated() { acc += w[i] * Float(vh[(kvh * maxSeq + Int(j)) * D + x]) }
-                ref[h * D + x] = acc / z
-            }
-        }
-        assertClose(got, ref, "sparse attention over a subset D=\(D)")
+        assertClose(try run(sparseList: subset), reference { _ in subset }, "sparse attention over a subset D=\(D)")
         let clamped = try run(sparseList: subset + [Int32(L + 5), -3])
         var refClamped = subset + [Int32(L - 1), 0]
         refClamped.sort()
         assertClose(clamped, try run(sparseList: refClamped), tol: 1e-5, "out-of-range entries clamp")
+
+        // One list per KV head: each head attends to its own blocks.
+        func headList(_ kvh: Int) -> [Int32] {
+            var list: [Int32] = [0, 1, 2, 3]
+            for b in 0..<3 {
+                let start = 8 + 4 * (kvh + 5 * b)
+                for i in 0..<4 { list.append(Int32(start + i)) }
+            }
+            for j in 90..<L { list.append(Int32(j)) }
+            return list
+        }
+        let perHead = try run(lists: (0..<nKV).map(headList))
+        assertClose(perHead, reference(headList), "sparse attention over per-head lists D=\(D)")
+        if nKV > 1 { #expect(perHead != (try run(sparseList: headList(0))), "the heads' lists were not used") }
     }
 }

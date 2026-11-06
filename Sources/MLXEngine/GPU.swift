@@ -42,7 +42,9 @@ struct EWParams { var n: Int32; var stride: Int32; var cols: Int32; var pad: Int
 struct SparseParams {
     var pool: Int32; var nKV: Int32 = 0; var D: Int32 = 0; var maxSeq: Int32 = 0
     var b0: Int32 = 0; var nb: Int32 = 0; var nH: Int32 = 0; var p: Int32 = 0
-    var sinkEnd: Int32 = 0; var winStart: Int32 = 0; var L: Int32 = 0; var pad: Int32 = 0
+    var sinkEnd: Int32 = 0; var winStart: Int32 = 0; var L: Int32 = 0
+    /// Selections: 1 (one list shared by every KV head) or nKV (one per KV head, `listStride` entries apart).
+    var listStride: Int32 = 0; var rows: Int32 = 1
 }
 /// GPU token selection (`sample_token`); `V` is the number of logits considered, `pos` the
 /// position of the token whose logits these are (the result goes to hist[pos + 1]).

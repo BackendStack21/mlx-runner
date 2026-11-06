@@ -10,8 +10,10 @@ import Foundation
 ///
 /// - Every `pool` (4) consecutive keys get one index key, their mean (f16), maintained whenever
 ///   positions are written. It costs a quarter of the K cache of each such layer.
-/// - The query scores the index blocks between the sink and the window with the sum over its heads
-///   of their dot products, so one selection serves every head (as in the paper).
+/// - The query scores the index blocks between the sink and the window, per KV head with the sum
+///   over that head's query heads of their dot products, so each KV head keeps its own blocks
+///   (`perHead`, the default; the same bytes as a shared list). With `perHead` false the sum runs
+///   over every head and one selection serves them all, as in the paper.
 /// - The best `topK / pool` blocks are kept (`sparse_select`, exact top-k, ties to the earlier block)
 ///   and attention runs over the sink, the kept keys and the window, in position order.
 ///
@@ -22,7 +24,8 @@ import Foundation
 /// itself equals the single-threadgroup decode kernel for head sizes up to 128.
 ///
 /// Enable it with `MLXR_SPARSE_ATTN=1` (or the number of long-range keys), `MLXR_SPARSE_WINDOW`,
-/// `MLXR_SPARSE_MIN`; see docs/sparse-decode-attention.md.
+/// `MLXR_SPARSE_MIN`, `MLXR_SPARSE_SHARED=1` (one selection for every head); see
+/// docs/sparse-decode-attention.md.
 public struct SparseAttention: Equatable, Sendable {
     /// Keys per index block.
     public static let pool = 4
@@ -34,25 +37,30 @@ public struct SparseAttention: Equatable, Sendable {
     public var sink: Int
     /// Decode switches to sparse attention from this context length (position + 1) on.
     public var minContext: Int
+    /// One selection per KV head (true) or one shared by every head (false).
+    public var perHead: Bool
 
     /// Values are clamped into range; `minContext` defaults to twice the attended keys.
-    public init(topK: Int = 2048, window: Int = 512, sink: Int = 4, minContext: Int? = nil) {
+    public init(topK: Int = 2048, window: Int = 512, sink: Int = 4, minContext: Int? = nil, perHead: Bool = true) {
         let p = Self.pool
         self.topK = max(p, min(topK, 1 << 22)) / p * p
         self.window = max(p, min(window, 1 << 22))
         self.sink = max(0, min(sink, 1 << 16))
         self.minContext = max(1, min(minContext ?? 2 * (self.sink + self.topK + self.window), 1 << 30))
+        self.perHead = perHead
     }
 
     /// From the environment: `MLXR_SPARSE_ATTN` = 1 (default budget) or the number of long-range
-    /// keys; `MLXR_SPARSE_WINDOW` and `MLXR_SPARSE_MIN` set the window and the minimum context.
+    /// keys; `MLXR_SPARSE_WINDOW` and `MLXR_SPARSE_MIN` set the window and the minimum context;
+    /// `MLXR_SPARSE_SHARED=1` shares one selection between the heads.
     /// nil (dense decode) when unset or 0.
     public static let fromEnvironment: SparseAttention? = {
         let env = ProcessInfo.processInfo.environment
         guard let s = env["MLXR_SPARSE_ATTN"], let v = Int(s), v > 0 else { return nil }
         return SparseAttention(topK: v == 1 ? 2048 : v,
                                window: env["MLXR_SPARSE_WINDOW"].flatMap { Int($0) } ?? 512,
-                               minContext: env["MLXR_SPARSE_MIN"].flatMap { Int($0) })
+                               minContext: env["MLXR_SPARSE_MIN"].flatMap { Int($0) },
+                               perHead: env["MLXR_SPARSE_SHARED"] != "1")
     }()
 
     /// The decode step whose query sits at `position`: nil when it stays dense.
@@ -94,11 +102,13 @@ extension Transformer {
 
     /// Upper bound on the bytes `init` allocates for sparse decode attention at a context (the
     /// load-time memory check adds it when `MLXR_SPARSE_ATTN` is set): the index of every eligible
-    /// layer, the block scores and the position list.
+    /// layer, and the block scores and position lists of one row per KV head.
     public static func sparseBytes(config c: ModelConfig, context: Int) -> Int {
         let seq = max(256, context), pool = SparseAttention.pool
-        var bytes = (seq / pool + 1) * 4 + seq * 4
-        for l in c.layers where sparseEligible(l, cacheLen: c.cacheRows(l, context: seq), context: seq) {
+        let eligible = c.layers.filter { sparseEligible($0, cacheLen: c.cacheRows($0, context: seq), context: seq) }
+        let rows = max(1, eligible.map(\.numKVHeads).max() ?? 1)
+        var bytes = rows * ((seq / pool + 1) * 4 + seq * 4)
+        for l in eligible {
             bytes += seq / pool * l.numKVHeads * l.headDim * 2
         }
         return bytes

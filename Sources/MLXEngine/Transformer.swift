@@ -557,6 +557,8 @@ public final class Transformer {
     /// ([maxSeq] ints); every layer reuses them (the serial encoder orders the dispatches).
     private let sparseScores: MTLBuffer?
     private let sparseList: MTLBuffer?
+    /// Entries between two KV heads' position lists in `sparseList` (the context length).
+    private let sparseListStride: Int
     private let sparseIndexPSO: MTLComputePipelineState?
     private let sparseScorePSO: MTLComputePipelineState?
     private let sparseSelectPSO: MTLComputePipelineState?
@@ -699,8 +701,11 @@ public final class Transformer {
                 if on { index.append(try gpu.buffer(seq / pool * l.spec.numKVHeads * l.spec.headDim * 2)) } else { index.append(nil) }
             }
             sparseIndex = index
-            sparseScores = try gpu.buffer((seq / pool + 1) * 4)
-            sparseList = try gpu.buffer(seq * 4)
+            // One score row and one list per KV head (a shared selection uses row 0).
+            let rows = max(1, zip(layers, sparseLayers).filter { $0.1 }.map { $0.0.spec.numKVHeads }.max() ?? 1)
+            sparseScores = try gpu.buffer(rows * (seq / pool + 1) * 4)
+            sparseList = try gpu.buffer(rows * seq * 4)
+            sparseListStride = seq
             let indexPSO = try gpu.pipeline("sparse_index"), score = try gpu.pipeline("sparse_score"), select = try gpu.pipeline("sparse_select")
             sparseIndexPSO = indexPSO
             sparseScorePSO = score
@@ -715,6 +720,7 @@ public final class Transformer {
             sparseIndex = [MTLBuffer?](repeating: nil, count: layers.count)
             sparseScores = nil
             sparseList = nil
+            sparseListStride = 0
             sparseIndexPSO = nil
             sparseScorePSO = nil
             sparseSelectPSO = nil
@@ -1020,6 +1026,8 @@ public final class Transformer {
                 // Sparse decode: score the index blocks, select the attended positions, attend over them.
                 var sp = plan.params
                 sp.nKV = Int32(nKV); sp.D = Int32(D); sp.maxSeq = Int32(kv.cacheLen); sp.nH = Int32(nH)
+                let perHead = sparse?.perHead ?? true   // rows <= the buffers' rows: nKV is an eligible layer's
+                sp.rows = Int32(perHead ? nKV : 1); sp.listStride = Int32(perHead ? sparseListStride : 0)
                 enc.setComputePipelineState(scorePSO)
                 enc.set(qkvBuf, 0, 0)
                 enc.set(index, 0, 1)
@@ -1031,7 +1039,7 @@ public final class Transformer {
                 enc.set(scores, 0, 0)
                 enc.set(list, 0, 1)
                 enc.params(sp, 2)
-                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                enc.dispatchThreadgroups(MTLSize(width: Int(sp.rows), height: 1, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: sparseSelectThreads, height: 1, depth: 1))
                 enc.setComputePipelineState(attnSparse)
                 enc.set(qkvBuf, 0, 0)
@@ -1040,7 +1048,7 @@ public final class Transformer {
                 enc.set(partials, 0, 3)
                 enc.params(attnParams, 4)
                 enc.set(list, 0, 5)
-                enc.params(Int32(plan.count), 6)
+                enc.params(SIMD2<Int32>(Int32(plan.count), sp.listStride), 6)
                 enc.dispatchThreadgroups(MTLSize(width: nKV, height: Self.attnSplitVirtualSG / Self.attnSplitSG, depth: kernels.splitGroups),
                                          threadsPerThreadgroup: MTLSize(width: Self.attnSplitSG * 32, height: 1, depth: 1))
                 enc.setComputePipelineState(combine)
