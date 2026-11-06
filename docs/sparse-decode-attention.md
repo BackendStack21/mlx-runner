@@ -69,6 +69,105 @@ reflects that region of the book than the context length.
 Agreement over 64 positions of one text is a coarse signal. A larger evaluation (several texts, more
 positions, needle retrieval) should come before any decision to ship.
 
+Qwen3 8B, default budget, one run. Dense is the in-process line; it was within 0.5% of a separate
+process on the other models.
+
+| Context | Dense tok/s | Sparse tok/s | Speed-up | Greedy prefix | Teacher-forced |
+|---|---|---|---|---|---|
+| 8,192 | 29.1 | 32.5 | 1.12× | 18/64 | 62/64 (97%) |
+| 16,384 | 23.2 | 31.4 | 1.35× | 14/64 | 57/64 (89%) |
+| 30,000 | 17.8 | 29.2 | 1.64× | 6/64 | 58/64 (91%) |
+
+**Fixed cost.** With almost nothing attended (`MLXR_SPARSE_ATTN=4 MLXR_SPARSE_WINDOW=4 MLXR_SPARSE_MIN=16`),
+Qwen3 0.6B takes:
+- 4.82 ms at 16 tokens, against 3.33 ms dense: score, select and two extra dispatches cost about
+  53 µs per layer before any index bytes;
+- 4.89 ms at 8K;
+- 7.74 ms at 30K.
+
+At 30K the step therefore splits into:
+- 3.33 ms of weights;
+- about 1.5 ms of fixed per-layer work;
+- about 2.9 ms that grows with the number of blocks (the index read and the selection's
+  per-block work);
+- about 1.8 ms of attention over the 2,564 kept keys.
+
+## Review panel (2026-11-06): ranked next steps
+
+Three independent reviews: GPU cost, selection accuracy and the literature. They only read the code;
+the measurements above are the inputs. Qwen first, then Mistral 7B. Expected gains are their cost
+model's estimates, not measured.
+
+**Measure first**
+1. A stronger agreement bench in `benchLongContext`:
+   - a dense teacher-forced control;
+   - KL(dense‖sparse), and the change in NLL on the book's real next tokens;
+   - argmax agreement bucketed by dense's top-1/top-2 margin;
+   - at least 512 positions;
+   - several text offsets at the same length (16K and 30K currently read different parts of the
+     book);
+   - a needle test.
+
+   The likely explanation for the misses that ignore the budget is near-ties, which argmax counts as
+   flips.
+2. The cost of a verification pass at 30K (T = 5 against T = 1). Verification runs T separate
+   `attention_split` passes (Transformer.swift:1061), so it may read the KV cache T times. This
+   decides whether the lossless route (item 8) can pay.
+
+**Exact, or lossless with respect to dense**
+3. **Qwen3 14B has no split or sparse kernel.** For head size 128, `maxG` is 4 (Transformer.swift:667),
+   and Qwen3 14B has 5 query heads per KV head (32B has 8). So 14B decodes long contexts with the
+   single-threadgroup `attention` kernel, and `MLXR_SPARSE_ATTN` does nothing on it.
+   - Fix: add `INST_ASPLIT(4, 5)`, `INST_ASPLIT(4, 8)` and the matching `INST_ASPARSE` lines, and raise
+     `maxG` for E = 4.
+   - This is on the default path. It should be bit-identical; this is not measured yet.
+4. **`sparse_select` cost: −0.9 ms at 8K, −1.6 ms at 30K on 0.6B.** Two changes:
+   - Aggregate the round-1 histogram per simdgroup with ballots. Scores share their top byte, so
+     about N threadgroup atomics hit a few bins today.
+   - After 16 bits are decided, compact the candidates instead of re-scanning `scores` twice more.
+
+   The output is identical to the current sparse mode.
+
+**Changes the current sparse output (re-measure agreement)**
+5. **Per-KV-head lists.** Score and select per KV head instead of one list summed over all 8 heads.
+   - Attention bytes stay the same (each head reads only its own rows).
+   - The select runs as 8 threadgroups instead of 1.
+   - It removes one head's veto over another's keys.
+   - Follow-ups: max-normalised aggregation within a group of query heads, and SparQ-style
+     compensation for the attention mass that was not selected.
+6. **Reuse a selection.**
+   - Across 2–4 decode steps: `attention_sparse` also covers positions after the last selection.
+     Estimated −1.6 to −3.5 ms on 0.6B.
+   - Or across adjacent layers, as in TidalDecode and OmniKV.
+7. **A smaller index.** int8 with a per-row scale, or pool 8: about −1.1 ms at 30K on 0.6B. Later, a
+   channel subset ranked by `q_norm·k_norm` (the Double Sparsity approach) or Quest min/max bounds for
+   recall of single "needle" keys.
+
+**Larger bets**
+8. **Sparse drafts, dense verification** (MagicDec, TriForce).
+   - Greedy output stays identical to dense by construction, so this is the only route by which this
+     work could ever become default behaviour.
+   - Teacher-forced agreement is the acceptance rate.
+   - It needs a multi-query verification attention kernel that reads K/V once for all T tokens.
+     Estimate with that kernel: about 1.4× dense at 30K on Qwen3 0.6B, exact. 7–8B models lose until
+     the batched matvec is memory-bound.
+   - Separately, loading draft models with sparse attention (Engine.swift:268) is a one-line change
+     and lossless.
+9. **An int8 or int4 KV cache** (KIVI, mlx-lm's `QuantizedKVCache`). Opt-in.
+   - It cuts every long-context read.
+   - Estimate: 0.6B at 30K, 43.8 → about 114 tok/s with int4.
+   - It lets Qwen3 14B hold a 30K context in 16 GB, and it composes with sparsity.
+   - About 400 lines, touching every attention kernel and prefill.
+10. **Prefill.**
+    - Lossless: `flash_prefill` runs at about 1.5 of the 3.5 TFLOPS the GEMM tile reaches.
+    - Opt-in sparse prefill (XAttention): attention is about 85% of Qwen3 0.6B's prefill at 30K.
+
+Also noted:
+- Speculative decoding with a sparse model verifies densely, so it is slower than plain sparse decode
+  at long context.
+- `minContext` should scale with model size: at 8K a 7–8B model gains about 10% while changing greedy
+  output.
+
 The "Why" table below is the estimate made before any measurement. Measured dense decode fell more
 slowly with context than it predicted (Qwen3 0.6B at 30K: 43.8 tok/s, estimated about 37).
 
