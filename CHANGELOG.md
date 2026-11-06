@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+Sparse decode attention for long contexts, on by default, and faster long-context decode on Qwen3 14B.
+
+- **Sparse decode attention**, on by default from 5,128 tokens of context
+  ([docs/sparse-decode-attention.md](docs/sparse-decode-attention.md)).
+  - **How it works.** Each full-attention layer keeps a mean key per block of 4 keys. Each KV head
+    scores those blocks against its query heads and attends to the first 4 keys, its 2,048
+    best-scoring earlier keys and the latest 512, not the whole cache.
+  - **Speed** on an M2 Pro (4-bit), against dense decode:
+    - Qwen3 0.6B: 43.8 → 103.5 tok/s at 30K;
+    - Qwen3 8B: 17.8 → 29.0 tok/s at 30K;
+    - Mistral 7B: 19.7 → 31.5 tok/s at 30K;
+    - 1.1–1.3× at 8K and 1.25–1.8× at 16K.
+  - **It changes output** past 5,128 tokens. Perplexity on real text rises by up to 1.6% at 16K and
+    by 0.7–3% at 30K. Top-1 agreement with dense decode is 92–99%, and almost all disagreements are
+    where dense decode was nearly undecided. Below 5,128 tokens decode is dense and output is unchanged.
+  - **Settings.**
+    - App: the inspector's new **Long context** section (on/off, the long-range key budget, and
+      per-KV-head or shared selection). The **Model** section shows the layers that run sparse.
+    - CLI: `mlxr run` / `mlxr serve --sparse <on|off|N>`.
+    - Environment: `MLXR_SPARSE_ATTN` (0 turns it off), `MLXR_SPARSE_WINDOW`, `MLXR_SPARSE_MIN`,
+      `MLXR_SPARSE_SHARED`.
+  - **Memory.** If the index (an eighth of each full-attention layer's KV cache) does not fit, the
+    model loads with dense decode.
+  - **Coverage.** Every architecture: Qwen3, Qwen2.5, Llama, Mistral, Phi-3 and Gemma 1–4.
+    Sliding-window layers stay dense. Prefill, speculative verification and draft models stay dense.
+- **Qwen3 14B decodes long contexts 20–27% faster** (8K: 14.6 → 17.5 tok/s; 16K: 11.0 → 14.0) with
+  identical output. Its 5 query heads per KV head had no split-attention kernel, so decode used the
+  single-threadgroup kernel. G = 5 and 8 are now instantiated for head size 128, which also covers
+  Qwen2.5 14B / 32B and Qwen3 32B.
+- **`mlxr bench` with `MLXR_BENCH_CTX`** reports, besides speed:
+  - KL divergence, text NLL and margin-bucketed top-1 agreement between sparse and dense decode,
+    over `MLXR_BENCH_POSITIONS` positions of `MLXR_BENCH_TEXT`, from each of
+    `MLXR_BENCH_TEXT_OFFSETS`;
+  - a dense control;
+  - five passkey needles;
+  - the cost of a verification pass.
+
+  `MLXR_KERNEL_TIMING=1 swift test --filter SparseTimingTests` times the sparse kernels.
+- **Tests.**
+  - Each sparse kernel against a CPU reference.
+  - Full-budget sparse decode bit-identical to dense on every architecture.
+  - The 14B cases (Qwen3 14B, Gemma 4 12B) run with `MLXR_TEST_LARGE=1`, because next to the Gemma
+    suite they do not fit a 16 GB Mac.
+
 ## 1.3.0
 
 Faster prefill, a tokenizer fix for Gemma, speculative decoding with a draft model, and cheaper 2-token verification.
