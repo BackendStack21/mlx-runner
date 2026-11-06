@@ -23,6 +23,14 @@ Sparse decode attention for long contexts, on by default, and faster long-contex
     - CLI: `mlxr run` / `mlxr serve --sparse <on|off|N>`.
     - Environment: `MLXR_SPARSE_ATTN` (0 turns it off), `MLXR_SPARSE_WINDOW`, `MLXR_SPARSE_MIN`,
       `MLXR_SPARSE_SHARED`.
+  - **Against mlx-lm 0.32.2** (dense attention; it has no sparse mode), on the same machine and
+    files:
+    - Sparse decode is level at 8K on 7–14B models and 1.4–2.4× faster at 30K. Qwen3 8B at 30K runs
+      at 29.0 tok/s against 19.7; Mistral 7B at 30K at 31.5 against 22.1.
+    - Our dense decode is 3–11% behind mlx-lm on 7–14B models.
+    - Prefill is 1.4–2× slower than mlx-lm at 30K.
+    - mlx-lm's quantized KV cache reaches 65 tok/s on Qwen3 0.6B at 30K (our sparse: 103.5). It ran
+      out of GPU memory on the 7–8B models at 30K on 16 GB.
   - **Memory.** If the index (an eighth of each full-attention layer's KV cache) does not fit, the
     model loads with dense decode.
   - **Coverage.** Every architecture: Qwen3, Qwen2.5, Llama, Mistral, Phi-3 and Gemma 1–4.

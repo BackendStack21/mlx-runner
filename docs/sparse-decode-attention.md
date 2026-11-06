@@ -183,6 +183,54 @@ Notes:
   - Qwen3 14B: 100 / 80 tok/s (8K / 16K only);
   - Mistral 7B: 185 / 142 / 107 tok/s.
 
+### Against mlx-lm
+
+mlx-lm 0.32.2 with mlx 0.32.4 (the latest on PyPI), on the same machine, model files and text,
+2026-11-06:
+- Each run prompts mlx-lm with the first N tokens of the book, as tokenized by its own tokenizer, and
+  generates 64 greedy tokens with `stream_generate`.
+- The table shows mlx-lm's own `generation_tps` and `prompt_tps`, from a single run.
+- Our figures are from the runs in the table above.
+- mlx-lm has no sparse attention. Its option for long contexts is a quantized KV cache (`kv_bits`).
+
+Decode, tok/s:
+
+| Model | Context | mlx-lm | Ours, dense | Ours, sparse | Sparse / mlx-lm |
+|---|---|---|---|---|---|
+| Qwen3 0.6B | 8K | 105.5 | 113.2 | 144.5 | 1.37× |
+| Qwen3 0.6B | 16K | 68.3 | 71.0 | 130.7 | 1.91× |
+| Qwen3 0.6B | 30K | 43.6 | 43.8 | 103.5 | 2.37× |
+| Qwen3 8B | 8K | 31.2 | 29.0 | 32.3 | 1.04× |
+| Qwen3 8B | 16K | 25.2 | 23.5 | 31.2 | 1.24× |
+| Qwen3 8B | 30K | 19.7 | 17.8 | 29.0 | 1.47× |
+| Qwen3 14B | 8K | 18.1 | 17.5 | 19.1 | 1.06× |
+| Qwen3 14B | 16K | 15.7 | 14.9 | 18.7 | 1.19× |
+| Mistral 7B | 8K | 34.7 | 31.6 | 34.9 | 1.01× |
+| Mistral 7B | 16K | 28.3 | 25.4 | 33.9 | 1.20× |
+| Mistral 7B | 30K | 22.1 | 19.7 | 31.5 | 1.43× |
+
+- **Sparse decode** is level with mlx-lm at 8K on 7–14B models and ahead everywhere else: 1.2–1.9×
+  at 16K and 1.4–2.4× at 30K. It changes output, though, and mlx-lm's dense decode does not.
+- **Our dense decode** is behind mlx-lm by 3–11% on the 7–14B models. That is the gap in reading the
+  weights that the earlier performance passes recorded. On Qwen3 0.6B it is level or ahead.
+- **mlx-lm's quantized KV cache at 30K.** On Qwen3 0.6B it decodes 53.4 tok/s with `kv_bits=8` and
+  65.0 with `kv_bits=4`, against our sparse 103.5. Its peak memory is 8.2 GB, against 4.3 GB for its
+  dense cache. On Qwen3 8B and Mistral 7B both settings ran the GPU out of memory at 30K on this 16 GB
+  Mac, so they have no figure.
+
+Prefill, tok/s. It is dense in both engines, and at long contexts mlx-lm is well ahead:
+
+| Model | Context | mlx-lm | Ours | mlx-lm / ours |
+|---|---|---|---|---|
+| Qwen3 0.6B | 8K / 16K / 30K | 1,579 / 1,115 / 712 | 1,065 / 611 / 363 | 1.5 / 1.8 / 2.0× |
+| Qwen3 8B | 8K / 16K / 30K | 195 / 171 / 139 | 178 / 135 / 99 | 1.1 / 1.3 / 1.4× |
+| Qwen3 14B | 8K / 16K | 107 / 97 | 100 / 80 | 1.1 / 1.2× |
+| Mistral 7B | 8K / 16K / 30K | 272 / 241 / 202 | 185 / 142 / 107 | 1.5 / 1.7 / 1.9× |
+
+The gap grows with the prompt length, so it is most likely in our prefill attention (`flash_prefill`), not the
+GEMMs. Ingesting a 30K-token prompt takes about 83 s on Qwen3 0.6B and 280 s on Mistral 7B, against
+42 and 149 s with mlx-lm. At long contexts this is now a larger cost than decode.
+
 ### Per-head and shared selection
 
 | Model | Context | Selection | Mean KL | NLL Δ | Top-1 |
@@ -330,7 +378,8 @@ Roughly by expected value.
    long-context read, composes with sparsity, and would let Qwen3 14B hold 30K in 16 GB. It touches
    every attention kernel and prefill.
 8. **Scale `MLXR_SPARSE_MIN` with model size.** At 8K a 7–14B model gains only about 10%.
-9. **Prefill.** Prefill is still O(T²): at 30K attention is most of Qwen3 0.6B's prefill time.
+9. **Prefill.** It is still O(T²), and at 30K mlx-lm prefills 1.4–2× faster than we do (see "Against
+   mlx-lm"). At 30K attention is most of Qwen3 0.6B's prefill time.
    - Lossless headroom: `flash_prefill` runs well below the GEMM tile's throughput.
    - Opt-in sparse prefill (XAttention) would need a selection per query block.
 10. **Server option.** Sparse attention is set per load, so a server request cannot ask for dense
