@@ -116,7 +116,7 @@ Setup:
 - `bc95da5` + `1c01e65`: per-head selection, default budget (2,048 + 512 + 4).
 - M2 Pro, nothing else on the GPU.
 - *Pride and Prejudice*, 512 teacher-forced positions per context.
-- One run each. Earlier repeats agreed within 2%, except where noted.
+- One run each. Repeats usually agreed within 2%; the exceptions are noted below the table.
 - "Decisive" is agreement where dense decode's top-1 margin is at least 1 nat.
 - Needle recall was the same as dense in every run (5/5, or 4/5 for both on Qwen3 0.6B).
 
@@ -146,7 +146,12 @@ Setup:
 
 Notes on the table:
 - **Speeds at 16K** (Qwen3 0.6B and Mistral 7B) are from a rerun. The full run's 16K lines were about 1 ms
-  per token slow for dense and sparse alike (66.4 / 112.9 and 24.5 / 32.1 tok/s).
+  per token slow for dense and sparse alike (66.4 / 112.9 and 24.5 / 32.1 tok/s). Mistral's dense line at 30K
+  measured 19.7 tok/s in this run and 18.7 in the shared-selection run below.
+- **Memorisation.** Dense text NLL on the book is 3.35–3.66 nats for Qwen3 0.6B but 0.94–1.43 for
+  Qwen3 14B, 1.04–1.54 for Mistral 7B and 1.59–2.23 for Qwen3 8B. The larger models have probably
+  memorised parts of *Pride and Prejudice*, which flatters their agreement. A text they cannot have
+  memorised (code, or something recent) is the first item of a broader evaluation.
 - **Qwen3 0.6B** figures are for two regions of the book (start / +60K tokens). The "Decisive"
   column sums both.
 - **Qwen3 14B** at 30K was not tried: weights, KV cache and index come to about 14 GB, more than a
@@ -165,7 +170,8 @@ table above.
 | Mistral 7B | shared | 30.6 | 0.0171 | +0.013 | 95.7% |
 | Mistral 7B | per head | 31.5 | 0.0403 | +0.030 | 92.4% |
 
-**On Mistral 7B, per-head selection is worse.** At 30K its KL is 2.4× the shared selection's and its
+**On Mistral 7B, per-head selection was worse** in one run (one region, 30K only; the Qwen3 0.6B
+comparison used two regions at two contexts). At 30K its KL is 2.4× the shared selection's and its
 text NLL cost is 2.3×, and the gap holds at the median too (0.0171 against 0.0091), not just in
 outliers. Qwen3 0.6B (2 query heads per KV head) and Qwen3 8B (4) improve with per-head selection.
 Mistral (4, but no QK-norm) does not.
@@ -296,7 +302,9 @@ model's estimates, not measured.
    `attention_split` passes (Transformer.swift:1061), so it may read the KV cache T times. This
    decides whether the lossless route (item 8) can pay.
 
-   *Measured.* T = 5 costs 3.1× T = 1 at 16K and 30K, so the KV cache is read about once per token.
+   *Measured.* T = 5 costs 3.1–3.6× T = 1 at 8K–30K (on Qwen3 0.6B at 30K, 71 ms against 23; a full
+   re-read per token would be over 100 ms, so caching absorbs part of it). That is far above the
+   roughly 1× the draft-and-verify route needs.
 
 **Exact, or lossless with respect to dense**
 3. **Qwen3 14B has no split or sparse kernel.** For head size 128, `maxG` is 4 (Transformer.swift:667),

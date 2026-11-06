@@ -197,7 +197,8 @@ struct SparseAttentionTests {
 
     /// attention_sparse over the list 0 ..< L reproduces attention_split bit for bit; over a subset
     /// it equals attention over those positions.
-    @Test(arguments: [(128, 4, 2), (128, 8, 2), (64, 8, 1), (256, 8, 1)])
+    // (128, 10, 2) and (128, 16, 2): 5 and 8 query heads per KV head (Qwen3 14B / 32B shapes).
+    @Test(arguments: [(128, 4, 2), (128, 8, 2), (64, 8, 1), (256, 8, 1), (128, 10, 2), (128, 16, 2)])
     func attentionOverTheList(D: Int, nH: Int, nKV: Int) throws {
         let maxSeq = 128, offset = 100, L = offset + 1, e = D / 32
         let G = nH / nKV, gSub = e <= 4 ? G : min(G, 2)
