@@ -37,8 +37,8 @@ Sparse decode attention for long contexts, on by default, and faster long-contex
     Sliding-window layers stay dense. Prefill, speculative verification and draft models stay dense.
 - **Qwen3 14B decodes long contexts 20–27% faster** (8K: 14.6 → 17.5 tok/s; 16K: 11.0 → 14.0) with
   identical output. Its 5 query heads per KV head had no split-attention kernel, so decode used the
-  single-threadgroup kernel. G = 5 and 8 are now instantiated for head size 128, which also covers
-  Qwen2.5 14B / 32B and Qwen3 32B.
+  single-threadgroup kernel. G = 5 is now instantiated for head size 128, which also covers Qwen2.5
+  14B. (G = 8, for the 32B models, was left out: its split kernel was not bit-identical.)
 - **`mlxr bench` with `MLXR_BENCH_CTX`** reports, besides speed:
   - KL divergence, text NLL and margin-bucketed top-1 agreement between sparse and dense decode,
     over `MLXR_BENCH_POSITIONS` positions of `MLXR_BENCH_TEXT`, from each of

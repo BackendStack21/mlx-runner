@@ -36,6 +36,19 @@ struct SparseAttentionTests {
         #expect(SparseAttention().plan(position: 100) == nil)   // default minimum context: 2 · (4 + 2048 + 512)
     }
 
+    /// MLXR_SPARSE_ATTN: on unless turned off, and a value it does not understand turns it off.
+    @Test func environmentParsing() {
+        let std = SparseAttention.standard
+        #expect(SparseAttention.parse(environment: [:]) == std)
+        for on in ["", "1", "on", "ON", " true ", "yes"] { #expect(SparseAttention.parse(environment: ["MLXR_SPARSE_ATTN": on]) == std, "\(on)") }
+        for off in ["0", "off", "false", "no", "maybe", "-5"] { #expect(SparseAttention.parse(environment: ["MLXR_SPARSE_ATTN": off]) == nil, "\(off)") }
+        #expect(SparseAttention.parse(environment: ["MLXR_SPARSE_ATTN": "4096"])?.topK == 4096)
+        let env = ["MLXR_SPARSE_WINDOW": "256", "MLXR_SPARSE_MIN": "2000", "MLXR_SPARSE_SHARED": "1"]
+        let c = SparseAttention.configured(topK: 1024, environment: env)
+        #expect(c.topK == 1024 && c.window == 256 && c.minContext == 2000 && !c.perHead)
+        #expect(SparseAttention.parse(environment: env) == SparseAttention.configured(topK: std.topK, environment: env))
+    }
+
     @Test func configIsClampedToWholeBlocks() {
         let c = SparseAttention(topK: 2050, window: 0, sink: -3, minContext: -1)
         #expect(c.topK == 2048 && c.window == Self.pool && c.sink == 0 && c.minContext == 1)
@@ -197,8 +210,8 @@ struct SparseAttentionTests {
 
     /// attention_sparse over the list 0 ..< L reproduces attention_split bit for bit; over a subset
     /// it equals attention over those positions.
-    // (128, 10, 2) and (128, 16, 2): 5 and 8 query heads per KV head (Qwen3 14B / 32B shapes).
-    @Test(arguments: [(128, 4, 2), (128, 8, 2), (64, 8, 1), (256, 8, 1), (128, 10, 2), (128, 16, 2)])
+    // (128, 10, 2): 5 query heads per KV head (Qwen3 14B's shape).
+    @Test(arguments: [(128, 4, 2), (128, 8, 2), (64, 8, 1), (256, 8, 1), (128, 10, 2)])
     func attentionOverTheList(D: Int, nH: Int, nKV: Int) throws {
         let maxSeq = 128, offset = 100, L = offset + 1, e = D / 32
         let G = nH / nKV, gSub = e <= 4 ? G : min(G, 2)

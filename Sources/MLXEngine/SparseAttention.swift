@@ -23,7 +23,7 @@ import Foundation
 /// to split decode (`attention_split`; `ModelTests.sparseDecodeWithFullBudgetIsBitIdentical`), which
 /// itself equals the single-threadgroup decode kernel for head sizes up to 128.
 ///
-/// `MLXR_SPARSE_ATTN=0` turns it off (or sets the number of long-range keys), with `MLXR_SPARSE_WINDOW`,
+/// `MLXR_SPARSE_ATTN=0` (or off) turns it off, or sets the number of long-range keys, with `MLXR_SPARSE_WINDOW`,
 /// `MLXR_SPARSE_MIN`, `MLXR_SPARSE_SHARED=1` (one selection for every head); see
 /// docs/sparse-decode-attention.md.
 public struct SparseAttention: Equatable, Sendable {
@@ -53,19 +53,28 @@ public struct SparseAttention: Equatable, Sendable {
     /// The default budget: 2,048 long-range keys, a 512-key window and 4 sink keys, per KV head.
     public static let standard = SparseAttention()
 
-    /// From the environment: `MLXR_SPARSE_ATTN` = 0 (off), 1 (the default budget) or the number of long-range
-    /// keys; `MLXR_SPARSE_WINDOW` and `MLXR_SPARSE_MIN` set the window and the minimum context;
-    /// `MLXR_SPARSE_SHARED=1` shares one selection between the heads.
-    /// Unset: the default budget (sparse attention is on by default). nil (dense decode) for 0.
-    public static let fromEnvironment: SparseAttention? = {
-        let env = ProcessInfo.processInfo.environment
-        let v = env["MLXR_SPARSE_ATTN"].flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? 1
-        guard v > 0 else { return nil }
-        return SparseAttention(topK: v == 1 ? 2048 : v,
-                               window: env["MLXR_SPARSE_WINDOW"].flatMap { Int($0) } ?? 512,
-                               minContext: env["MLXR_SPARSE_MIN"].flatMap { Int($0) },
-                               perHead: env["MLXR_SPARSE_SHARED"] != "1")
-    }()
+    /// From the environment (sparse attention is on by default): see `parse(environment:)`.
+    public static let fromEnvironment: SparseAttention? = parse(environment: ProcessInfo.processInfo.environment)
+
+    /// `MLXR_SPARSE_ATTN`: unset, empty, `1`, `on`, `true` or `yes` is the default budget; a larger
+    /// number is the long-range key budget; `0`, `off`, `false`, `no` or anything else is nil
+    /// (dense decode), so a mistyped value never turns it on.
+    static func parse(environment env: [String: String]) -> SparseAttention? {
+        let s = (env["MLXR_SPARSE_ATTN"] ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+        if ["", "1", "on", "true", "yes"].contains(s) { return configured(topK: standard.topK, environment: env) }
+        guard let v = Int(s), v > 1 else { return nil }
+        return configured(topK: v, environment: env)
+    }
+
+    /// A budget of `topK` long-range keys with the rest from the environment: `MLXR_SPARSE_WINDOW`
+    /// and `MLXR_SPARSE_MIN` (the window and the minimum context), `MLXR_SPARSE_SHARED=1` (one
+    /// selection shared between the heads).
+    public static func configured(topK: Int, environment env: [String: String] = ProcessInfo.processInfo.environment) -> SparseAttention {
+        SparseAttention(topK: topK,
+                        window: env["MLXR_SPARSE_WINDOW"].flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? standard.window,
+                        minContext: env["MLXR_SPARSE_MIN"].flatMap { Int($0.trimmingCharacters(in: .whitespaces)) },
+                        perHead: env["MLXR_SPARSE_SHARED"]?.trimmingCharacters(in: .whitespaces) != "1")
+    }
 
     /// The decode step whose query sits at `position`: nil when it stays dense.
     func plan(position: Int) -> SparsePlan? {
@@ -105,7 +114,7 @@ extension Transformer {
     }
 
     /// Upper bound on the bytes `init` allocates for sparse decode attention at a context (the
-    /// load-time memory check adds it when `MLXR_SPARSE_ATTN` is set): the index of every eligible
+    /// load-time memory check adds it when the model loads with sparse attention): the index of every eligible
     /// layer, and the block scores and position lists of one row per KV head.
     public static func sparseBytes(config c: ModelConfig, context: Int) -> Int {
         let seq = max(256, context), pool = SparseAttention.pool

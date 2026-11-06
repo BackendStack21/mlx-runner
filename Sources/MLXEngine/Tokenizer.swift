@@ -191,6 +191,7 @@ public final class Tokenizer: @unchecked Sendable {
         if mode == .sentencePiece && hasSPNormalizer && !hasPrefixRule { spPrepend = false }
 
         // tokenizer_config.json: special tokens and chat template.
+        var bosSetting: Bool?   // add_bos_token, when the config states it
         if let cdata = try? Data(contentsOf: directory.appendingPathComponent("tokenizer_config.json")),
            let cfg = try? JSONSerialization.jsonObject(with: cdata) as? [String: Any] {
             func tok(_ k: String) -> String? {
@@ -199,7 +200,8 @@ public final class Tokenizer: @unchecked Sendable {
                 return nil
             }
             bosToken = tok("bos_token")
-            addBosToken = cfg["add_bos_token"] as? Bool ?? false
+            bosSetting = cfg["add_bos_token"] as? Bool
+            addBosToken = bosSetting ?? false
             eosToken = tok("eos_token")
             if let t = cfg["chat_template"] as? String { chatTemplate = t }
             else if let arr = cfg["chat_template"] as? [[String: Any]] {
@@ -222,9 +224,10 @@ public final class Tokenizer: @unchecked Sendable {
             chatTemplate = o["chat_template"] as? String
         }
         // A chat template that writes BOS (`{{ bos_token }}`, any whitespace control) shows the model
-        // was trained with it first. Gemma 4's tokenizer files do not say to add it to raw prompts,
+        // was trained with it first, unless the config says otherwise. Gemma 4's tokenizer files do
+        // not say whether to add it to raw prompts,
         // and without it the model produces nonsense.
-        if !addBosToken, let b = bosToken, vocab[ExactKey(b)] != nil, let t = chatTemplate, Self.templateWritesBos(t) {
+        if !addBosToken, bosSetting == nil, let b = bosToken, vocab[ExactKey(b)] != nil, let t = chatTemplate, Self.templateWritesBos(t) {
             addBosToken = true
         }
     }

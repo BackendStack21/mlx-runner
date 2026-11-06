@@ -1195,7 +1195,7 @@ kernel void attention_combine(device const float* part [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
-// Sparse decode attention (experimental, opt-in: see `SparseAttention`). After the training-free
+// Sparse decode attention (on by default from `SparseAttention.minContext`). After the training-free
 // variant of Latent Sparse Attention (arXiv 2610.42147), without its clustering and tree search:
 // every `pool` consecutive keys of a full-attention layer get one index key (their mean, f16);
 // a decode query scores the index blocks between the sink and the recent window, per KV head with
@@ -2052,7 +2052,7 @@ INST_ASPLIT(2, 1) INST_ASPLIT(2, 2) INST_ASPLIT(2, 3) INST_ASPLIT(2, 4)
 INST_ASPLIT(2, 5) INST_ASPLIT(2, 6) INST_ASPLIT(2, 7) INST_ASPLIT(2, 8)
 INST_ASPLIT(3, 1) INST_ASPLIT(3, 2) INST_ASPLIT(3, 3) INST_ASPLIT(3, 4)
 INST_ASPLIT(4, 1) INST_ASPLIT(4, 2) INST_ASPLIT(4, 3) INST_ASPLIT(4, 4)
-INST_ASPLIT(4, 5) INST_ASPLIT(4, 8)   // Qwen3 / Qwen2.5 14B and 32B
+INST_ASPLIT(4, 5)   // Qwen3 / Qwen2.5 14B (G = 8 measured not bit-identical to attention_4_32, so not instantiated)
 INST_ASPLIT_C(4, 1, true, "_cap") INST_ASPLIT_C(4, 2, true, "_cap") INST_ASPLIT_C(4, 3, true, "_cap") INST_ASPLIT_C(4, 4, true, "_cap")
 // head_dim 256 / 512 (Gemma): query heads in sub-groups of up to 4 / 2.
 INST_ASPLIT(8, 1) INST_ASPLIT(8, 2) INST_ASPLIT(8, 4)
@@ -2069,7 +2069,7 @@ INST_ASPARSE(2, 1) INST_ASPARSE(2, 2) INST_ASPARSE(2, 3) INST_ASPARSE(2, 4)
 INST_ASPARSE(2, 5) INST_ASPARSE(2, 6) INST_ASPARSE(2, 7) INST_ASPARSE(2, 8)
 INST_ASPARSE(3, 1) INST_ASPARSE(3, 2) INST_ASPARSE(3, 3) INST_ASPARSE(3, 4)
 INST_ASPARSE(4, 1) INST_ASPARSE(4, 2) INST_ASPARSE(4, 3) INST_ASPARSE(4, 4)
-INST_ASPARSE(4, 5) INST_ASPARSE(4, 8)
+INST_ASPARSE(4, 5)
 INST_ASPARSE_C(4, 1, true, "_cap") INST_ASPARSE_C(4, 2, true, "_cap") INST_ASPARSE_C(4, 3, true, "_cap") INST_ASPARSE_C(4, 4, true, "_cap")
 INST_ASPARSE(8, 1) INST_ASPARSE(8, 2) INST_ASPARSE(8, 4)
 INST_ASPARSE(16, 1) INST_ASPARSE(16, 2)

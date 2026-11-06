@@ -550,8 +550,9 @@ public final class Transformer {
     public var sparse: SparseAttention? { didSet { prepared = nil } }
     /// Has `init` allocated the sparse index (so `sparse` can take effect)?
     public var sparseAvailable: Bool { sparseScores != nil && sparseIndex.contains { $0 != nil } }
-    /// Layers with a sparse index (full-attention layers with their own KV cache).
-    public var sparseLayerCount: Int { sparseIndex.filter { $0 != nil }.count }
+    /// Layers that decode with sparse attention: full-attention layers with an index, and KV-shared
+    /// layers that read their source layer's (0 without sparse attention).
+    public let sparseLayerCount: Int
     /// Per layer: pooled index keys [cacheLen / pool][nKV][D] (f16), for a full-attention layer with
     /// its own cache and a sparse kernel for its head size. KV-shared layers use their source's.
     private let sparseIndex: [MTLBuffer?]
@@ -578,7 +579,7 @@ public final class Transformer {
         }
     }
 
-    /// `sparse` (by default from `MLXR_SPARSE_ATTN`, normally unset) loads the model with sparse
+    /// `sparse` (by default from `MLXR_SPARSE_ATTN`: on unless it is 0) loads the model with sparse
     /// decode attention: see `SparseAttention`.
     public init(directory: URL, contextLength: Int, sparse: SparseAttention? = SparseAttention.fromEnvironment) throws {
         let gpu = GPU.shared
@@ -668,7 +669,7 @@ public final class Transformer {
             // has 16 / 8 simdgroups, so the split result is not bit-identical there.
             let Gs = Set(c.layers.filter { $0.headDim == D }.map { c.numHeads / $0.numKVHeads })
             let V = Self.attnSplitVirtualSG
-            let maxG = e == 2 || e == 4 ? 8 : e <= 4 ? 4 : 2   // E = 4 has G = 1...5 and 8 (a missing G stays unsplit)
+            let maxG = e == 2 ? 8 : e == 4 ? 5 : e <= 4 ? 4 : 2   // E = 4: G = 1...5 (G = 8 was not bit-identical)
             let gSub = Gs.first.map { e <= 4 ? $0 : min($0, maxG) } ?? 0
             if (decodeSG == V && (2...4).contains(e)) || e >= 8, Gs.count == 1, let G = Gs.first, (1...maxG).contains(gSub), G % gSub == 0,
                let split = try? gpu.pipeline("attention_split_\(e)_\(gSub)\(cap)"),
@@ -691,43 +692,57 @@ public final class Transformer {
         attnKernels = kernels
 
         // Sparse decode attention: an index for every eligible layer, block scores and the position
-        // list (not scratch: `sparseBytes` accounts for them).
+        // lists (not scratch: `sparseBytes` accounts for them). Nothing is allocated when the context
+        // can never reach `minContext`; a setup failure (a pipeline, an allocation, a thread limit)
+        // leaves the model with dense decode rather than failing the load.
         var sparseLayers: [Bool] = []
         for l in layers {
             sparseLayers.append(Transformer.sparseEligible(l.spec, cacheLen: l.cacheLen, context: seq) && kernels[l.spec.headDim]?.sparse != nil)
         }
-        if sparse != nil, attnPartials != nil, sparseLayers.contains(true) {
-            let pool = SparseAttention.pool
-            var index: [MTLBuffer?] = []
-            for (l, on) in zip(layers, sparseLayers) {
-                if on { index.append(try gpu.buffer(seq / pool * l.spec.numKVHeads * l.spec.headDim * 2)) } else { index.append(nil) }
-            }
-            sparseIndex = index
-            // One score row and one list per KV head (a shared selection uses row 0).
-            let rows = max(1, zip(layers, sparseLayers).filter { $0.1 }.map { $0.0.spec.numKVHeads }.max() ?? 1)
-            sparseScores = try gpu.buffer(rows * (seq / pool + 1) * 4)
-            sparseList = try gpu.buffer(rows * seq * 4)
-            sparseListStride = seq
-            let indexPSO = try gpu.pipeline("sparse_index"), score = try gpu.pipeline("sparse_score"), select = try gpu.pipeline("sparse_select")
-            sparseIndexPSO = indexPSO
-            sparseScorePSO = score
-            sparseSelectPSO = select
-            sparseSelectThreads = min(1024, select.maxTotalThreadsPerThreadgroup) / 32 * 32
-            let maxD = layers.map(\.spec.headDim).max() ?? 0
-            guard sparseSelectThreads >= 32, score.maxTotalThreadsPerThreadgroup >= Self.sparseScoreThreads,
-                  indexPSO.maxTotalThreadsPerThreadgroup >= maxD else {
-                throw EngineError.unsupported("sparse attention: kernel thread limits")
-            }
-        } else {
-            sparseIndex = [MTLBuffer?](repeating: nil, count: layers.count)
-            sparseScores = nil
-            sparseList = nil
-            sparseListStride = 0
-            sparseIndexPSO = nil
-            sparseScorePSO = nil
-            sparseSelectPSO = nil
-            sparseSelectThreads = 0
+        struct SparseSetup {
+            var index: [MTLBuffer?]; var scores: MTLBuffer; var list: MTLBuffer
+            var indexPSO: MTLComputePipelineState; var scorePSO: MTLComputePipelineState; var selectPSO: MTLComputePipelineState
+            var selectThreads: Int
         }
+        var setup: SparseSetup?
+        if let sparse, seq >= sparse.minContext, attnPartials != nil, sparseLayers.contains(true) {
+            do {
+                let pool = SparseAttention.pool
+                var index: [MTLBuffer?] = []
+                for (l, on) in zip(layers, sparseLayers) {
+                    index.append(on ? try gpu.buffer(seq / pool * l.spec.numKVHeads * l.spec.headDim * 2) : nil)
+                }
+                let indexed = zip(layers.map(\.spec), sparseLayers).filter { $0.1 }.map(\.0)
+                // One score row and one list per KV head (a shared selection uses row 0).
+                let rows = max(1, indexed.map(\.numKVHeads).max() ?? 1)
+                let indexPSO = try gpu.pipeline("sparse_index"), score = try gpu.pipeline("sparse_score"), select = try gpu.pipeline("sparse_select")
+                let selectThreads = min(1024, select.maxTotalThreadsPerThreadgroup) / 32 * 32
+                guard selectThreads >= 32, score.maxTotalThreadsPerThreadgroup >= Self.sparseScoreThreads,
+                      indexPSO.maxTotalThreadsPerThreadgroup >= indexed.map(\.headDim).max() ?? 0 else {
+                    throw EngineError.unsupported("sparse attention: kernel thread limits")
+                }
+                setup = SparseSetup(index: index, scores: try gpu.buffer(rows * (seq / pool + 1) * 4), list: try gpu.buffer(rows * seq * 4),
+                                    indexPSO: indexPSO, scorePSO: score, selectPSO: select, selectThreads: selectThreads)
+            } catch {
+                setup = nil   // dense decode
+            }
+        }
+        sparseIndex = setup?.index ?? [MTLBuffer?](repeating: nil, count: layers.count)
+        sparseScores = setup?.scores
+        sparseList = setup?.list
+        sparseListStride = setup != nil ? seq : 0
+        sparseIndexPSO = setup?.indexPSO
+        sparseScorePSO = setup?.scorePSO
+        sparseSelectPSO = setup?.selectPSO
+        sparseSelectThreads = setup?.selectThreads ?? 0
+        // Layers that decode sparse: those with an index, and KV-shared layers reading their source's.
+        var sparseCount = 0
+        for (li, layer) in layers.enumerated() where setup != nil {
+            let spec = layer.spec, source = spec.hasOwnKV ? li : spec.kvSource, kv = layers[source].spec
+            if !spec.sliding, kv.numKVHeads == spec.numKVHeads, kv.headDim == spec.headDim,
+               sparseIndex[source] != nil, kernels[spec.headDim]?.sparse != nil { sparseCount += 1 }
+        }
+        sparseLayerCount = sparseCount
         self.sparse = sparse
 
         if c.perLayerInputSize > 0 {
@@ -762,7 +777,10 @@ public final class Transformer {
     /// Returns a pointer to the logits of the last token (valid until the next call).
     /// Runs the tokens at positions offset..<offset+count. Returns the last row's logits, or with
     /// `allLogits` (count <= maxVerifyTokens) a row-major [count][vocab] block.
-    public func forward(_ tokens: [Int32], offset: Int, allLogits: Bool = false, isCancelled: (() -> Bool)? = nil) throws -> UnsafeMutablePointer<Float> {
+    /// `dense`: no sparse attention even for a single token (speculative decoding, whose
+    /// verification passes are dense). Several tokens always run dense, like a prefill.
+    public func forward(_ tokens: [Int32], offset: Int, allLogits: Bool = false, dense: Bool = false,
+                        isCancelled: (() -> Bool)? = nil) throws -> UnsafeMutablePointer<Float> {
         guard !allLogits || tokens.count <= Self.maxVerifyTokens else { throw EngineError.invalidOutput("verify batch too large") }
         guard offset + tokens.count <= maxSeq else { throw EngineError.contextFull }
         let rows = embed.outDim
@@ -774,21 +792,22 @@ public final class Transformer {
             if start > 0, isCancelled?() == true { throw EngineError.cancelled }
             let n = min(maxBatch, tokens.count - start)
             let last = start + n == tokens.count
-            try step(Array(tokens[start..<start + n]), offset: offset + start, computeLogits: last, allLogits: allLogits)
+            try step(Array(tokens[start..<start + n]), offset: offset + start, computeLogits: last, allLogits: allLogits,
+                     dense: dense || tokens.count > 1)
             start += n
         }
         if allLogits { return logitsAll.contents().bindMemory(to: Float.self, capacity: tokens.count * lmHead.outDim) }
         return logits.contents().bindMemory(to: Float.self, capacity: lmHead.outDim)
     }
 
-    private func step(_ tokens: [Int32], offset: Int, computeLogits: Bool, allLogits: Bool = false) throws {
+    private func step(_ tokens: [Int32], offset: Int, computeLogits: Bool, allLogits: Bool = false, dense: Bool = false) throws {
         let T = tokens.count
         // A prepared buffer is exactly what encode(T: 1, offset:, computeLogits: true, allLogits: false)
         // returns now, so using it changes nothing on the GPU. Any other call shape discards it.
         var ready: MTLCommandBuffer?
-        if T == 1, computeLogits, !allLogits, let p = prepared, p.offset == offset { ready = p.cb }
+        if T == 1, computeLogits, !allLogits, !dense, let p = prepared, p.offset == offset { ready = p.cb }
         prepared = nil
-        let cb = try ready ?? encode(T: T, offset: offset, computeLogits: computeLogits, allLogits: allLogits)
+        let cb = try ready ?? encode(T: T, offset: offset, computeLogits: computeLogits, allLogits: allLogits, dense: dense)
         // Nothing is in flight (the previous step was waited for), so `hist` is free to write.
         writeHistory(tokens, at: offset)
         cb.commit()
@@ -859,7 +878,7 @@ public final class Transformer {
             let n = min(maxBatch, tokens.count - start)
             let last = start + n == tokens.count
             let at = offset + start
-            let cb = try encode(T: n, offset: at, computeLogits: last, allLogits: false, sample: last ? sample : nil)
+            let cb = try encode(T: n, offset: at, computeLogits: last, allLogits: false, sample: last ? sample : nil, dense: true)
             writeHistory(Array(tokens[start..<start + n]), at: at)
             cb.commit()
             writtenHigh = max(writtenHigh, at + n)
@@ -937,7 +956,9 @@ public final class Transformer {
     /// Encodes one forward pass over T tokens at positions offset..<offset+T. Token ids are read from
     /// `hist` when the buffer executes, so the encoding depends only on (T, offset, computeLogits, allLogits).
     /// With `sample`, the last row's logits are turned into a token on the GPU (see `sample_token`).
-    private func encode(T: Int, offset: Int, computeLogits: Bool, allLogits: Bool, sample: SampleParams? = nil) throws -> MTLCommandBuffer {
+    /// `dense`: no sparse attention (prefill, even a one-token tail, and dense forwards).
+    private func encode(T: Int, offset: Int, computeLogits: Bool, allLogits: Bool, sample: SampleParams? = nil,
+                        dense: Bool = false) throws -> MTLCommandBuffer {
         let c = config
         let H = c.hiddenSize, nH = c.numHeads
         guard T > 0, T <= maxBatch, offset >= 0, offset + T <= maxSeq else { throw EngineError.contextFull }
@@ -964,7 +985,7 @@ public final class Transformer {
         let smallT = T <= Self.maxVerifyTokens
         // Sparse decode attention: one plan per step (the blocks every eligible layer scores).
         var sparsePlan: SparsePlan?
-        if decode, sparseScores != nil, let sp = sparse { sparsePlan = sp.plan(position: offset) }
+        if decode, !dense, sparseScores != nil, let sp = sparse { sparsePlan = sp.plan(position: offset) }
         for (li, layer) in layers.enumerated() {
             let spec = layer.spec
             let D = spec.headDim, nKV = spec.numKVHeads, qkvCols = layer.qkvCols, I = layer.intermediate

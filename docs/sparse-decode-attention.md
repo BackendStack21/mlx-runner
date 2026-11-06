@@ -79,9 +79,10 @@ Gemma 4 E2B indexes 3 layers; its 4 KV-shared full-attention layers use their so
 - **Shapes with split and sparse kernels:**
   - head sizes 64, 96 and 128;
   - head sizes 256 and 512 in sub-groups;
-  - for head size 128, G = 1–5 and 8 query heads per KV head. That includes Qwen3 / Qwen2.5 14B and
-    32B. G = 5 also made Qwen3 14B's dense long-context decode 20% faster at 8K and 27% at 16K, with
-    bit-identical output.
+  - for head size 128, G = 1–5 query heads per KV head. That includes Qwen3 / Qwen2.5 14B. G = 8
+    (Qwen3 / Qwen2.5 32B) is not instantiated: its split kernel was not bit-identical to the
+    single-threadgroup kernel. G = 5 also made Qwen3 14B's dense long-context decode 20% faster at
+    8K and 27% at 16K, with bit-identical output.
 
   Other head sizes stay dense.
 - **Soft-capped attention** (Gemma 2) has its own kernel instantiations.

@@ -47,16 +47,17 @@ func draftDirectory(_ s: String?, target: URL) -> URL? {
     return m.directory
 }
 
-/// `--sparse <on|off|N>`: sparse decode attention for long contexts (N: long-range keys). Without the
+/// `--sparse <on|off|N>`: sparse decode attention for long contexts (N: long-range keys; the window,
+/// minimum context and shared selection still come from MLXR_SPARSE_*). Without the
 /// option: MLXR_SPARSE_ATTN, which defaults to on.
 func sparseOption(_ s: String?) -> SparseAttention? {
     guard let s else { return SparseAttention.fromEnvironment }
     switch s.lowercased() {
-    case "on", "1": return .standard
+    case "on", "1": return .configured(topK: SparseAttention.standard.topK)
     case "off", "0": return nil
     default:
         guard let n = Int(s), n > 0 else { fail("--sparse takes on, off or a number of long-range keys") }
-        return SparseAttention(topK: n)
+        return .configured(topK: n)
     }
 }
 

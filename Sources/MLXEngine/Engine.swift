@@ -271,13 +271,18 @@ public final class InferenceEngine: @unchecked Sendable {
                     let dirs = [directory] + (draftDirectory.map { [$0] } ?? [])
                     var sparse = requested
                     var sparseNote: String?
-                    if sparse != nil, (try? Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: true)) == nil {
+                    // The index exists only when the context can reach the sparse minimum context.
+                    let indexed = sparse.map { contextLength >= $0.minContext } ?? false
+                    if indexed, (try? Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: true)) == nil {
                         sparse = nil   // dense decode still fits? (it throws the usual error if not)
                         sparseNote = "its index does not fit in memory at this context length"
                     }
-                    try Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: sparse != nil)
+                    try Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: indexed && sparse != nil)
                     let model = try Transformer(directory: directory, contextLength: contextLength, sparse: sparse)
-                    if sparse != nil, !model.sparseAvailable { sparseNote = "no layer of this model supports it" }
+                    if let s = sparse, !model.sparseAvailable {
+                        sparseNote = model.maxSeq < s.minContext ? "the context length is below \(s.minContext) tokens, where it starts"
+                            : "no layer of this model supports it"
+                    }
                     var draft: Transformer?
                     if let draftDirectory {
                         guard model.supportsBatchedVerify else {
@@ -671,7 +676,9 @@ public final class InferenceEngine: @unchecked Sendable {
             let fromModel = draft.isEmpty && cap > 0 && draftOK
             if fromModel { draft = proposeFromModel(min(modelDraftLen, cap)) }
             if draft.isEmpty {
-                let row = try model.forward([Int32(pending)], offset: history.count - 1)
+                // Speculative decoding stays dense throughout (its verification passes are), so its
+                // output does not depend on which drafts were accepted.
+                let row = try model.forward([Int32(pending)], offset: history.count - 1, dense: speculative)
                 cachedTokens = history
                 running = accept(sampler.draw(try dist(row)))
                 continue
