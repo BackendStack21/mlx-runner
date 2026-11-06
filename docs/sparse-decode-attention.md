@@ -15,7 +15,7 @@ Branch `feat/sparse-decode-attention`. Status: **compiled, tested and measured o
 
 M2 Pro (16-core GPU, 16 GB), 4-bit models, nothing else on the GPU. The prompt is *Pride and Prejudice*
 (Project Gutenberg #1342, about 177K tokens, so no context repeats). Default budget: 2,048 long-range
-keys, a 512-key window and 4 sink keys. Each figure is the better of 2 runs; the runs agreed within 2%.
+keys, a 512-key window and 4 sink keys. Each figure is the better of 2 runs. The runs agreed within 2%, except two dense lines that differed by 4–5%.
 "Dense" is a separate process with `MLXR_SPARSE_ATTN` unset. The in-process dense line of the sparse
 runs was within 0.5% of it, so keeping the index costs nothing measurable. Agreement is over 64 decode
 steps: "greedy" counts how many tokens match dense decode before the first difference, and "teacher-forced"
@@ -28,15 +28,15 @@ counts how often the next-token argmax matches when both are fed dense decode's 
 | Qwen3 0.6B | 30,000 | 43.8 | 104.7 | 2.39× | 4/64 | 62/64 (97%) |
 | Mistral 7B | 8,192 | 31.6 | 35.0 | 1.11× | 4/64 | 62/64 (97%) |
 | Mistral 7B | 16,384 | 25.7 | 33.9 | 1.32× | 13/64 | 57/64 (89%) |
-| Mistral 7B | 30,000 | 19.7 | 31.6 | 1.61× | 9/64 | 59/64 (92%) |
+| Mistral 7B | 30,000 | 19.7 | 31.6 | 1.60× | 9/64 | 59/64 (92%) |
 
 GPU time per token, dense → sparse: Qwen3 0.6B 8.85 → 7.00, 14.09 → 7.74 and 22.83 → 9.54 ms;
 Mistral 7B 31.61 → 28.58, 38.87 → 29.46 and 50.83 → 31.63 ms. For reference, dense decode at 16
 tokens of context is 3.33 ms (Qwen3 0.6B) and 25.85 ms (Mistral 7B). Prefill, dense in both modes:
-Qwen3 0.6B 1,076 / 630 / 370 tok/s and Mistral 7B 185 / 145 / 106 tok/s at 8K / 16K / 30K.
+Qwen3 0.6B 1,076 / 630 / 370 tok/s and Mistral 7B 185 / 145 / 107 tok/s at 8K / 16K / 30K.
 
 Against the bar in step 6:
-- Sparse is 1.61× dense at 30K on Mistral 7B, above the 1.3× bar.
+- Sparse is 1.60× dense at 30K on Mistral 7B, above the 1.3× bar.
 - At 8K it is faster than dense, not slower.
 - Teacher-forced agreement reaches 95% only at 8K on both models and at 30K on Qwen3 0.6B. It falls
   to 89–92% at 16K and at Mistral's 30K. With 64 positions, each token is 1.6 points, so 95% means
@@ -52,11 +52,22 @@ run, same prompt):
 | Mistral 7B | 16,384 | 25.7 | 31.3 | 1.22× | 30/64 | 61/64 (95%) |
 | Mistral 7B | 30,000 | 19.6 | 29.7 | 1.52× | 21/64 | 61/64 (95%) |
 
-At this budget Mistral 7B meets all three bars at 30K: 1.52× and 61 of 64. The 5 misses on Qwen3
-0.6B at 16K do not change with the budget. They are probably near-ties that any change in summation
-order flips, rather than keys the selection dropped; this is not checked yet. Agreement measured over
-64 positions of one text is a coarse signal. A larger evaluation (several texts, more positions,
-needle retrieval) should come before any decision to ship.
+At this budget Mistral 7B meets the speed and agreement bars at 30K: 1.52× and 61 of 64. The 8K bar
+is met trivially, because the default minimum context becomes 10,248 and 8K decodes dense.
+
+Qwen3 0.6B at 16K barely responds to the budget, even with `MLXR_SPARSE_MIN=8192`:
+- 2,048 keys: 59 of 64;
+- 4,096 keys: 59 of 64;
+- 8,192 keys: 59 of 64;
+- 12,288 keys (78% of the context): 61 of 64, which is also slower than dense (66.6 tok/s against
+  70.9).
+
+These positions flip under almost any change to the attention, so a larger budget does not fix them.
+The cause is not identified yet. Both models also agree least at 16K, not at 30K, which more likely
+reflects that region of the book than the context length.
+
+Agreement over 64 positions of one text is a coarse signal. A larger evaluation (several texts, more
+positions, needle retrieval) should come before any decision to ship.
 
 The "Why" table below is the estimate made before any measurement. Measured dense decode fell more
 slowly with context than it predicted (Qwen3 0.6B at 30K: 43.8 tok/s, estimated about 37).
