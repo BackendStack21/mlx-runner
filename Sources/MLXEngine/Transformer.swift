@@ -550,6 +550,8 @@ public final class Transformer {
     public var sparse: SparseAttention? { didSet { prepared = nil } }
     /// Has `init` allocated the sparse index (so `sparse` can take effect)?
     public var sparseAvailable: Bool { sparseScores != nil && sparseIndex.contains { $0 != nil } }
+    /// Layers with a sparse index (full-attention layers with their own KV cache).
+    public var sparseLayerCount: Int { sparseIndex.filter { $0 != nil }.count }
     /// Per layer: pooled index keys [cacheLen / pool][nKV][D] (f16), for a full-attention layer with
     /// its own cache and a sparse kernel for its head size. KV-shared layers use their source's.
     private let sparseIndex: [MTLBuffer?]

@@ -1,4 +1,4 @@
-# Sparse decode attention (experimental)
+# Sparse decode attention
 
 At long contexts, decoding one token reads the whole KV cache of every layer. Sparse decode
 attention reads only part of it. Each full-attention layer's decode query attends to:
@@ -6,21 +6,40 @@ attention reads only part of it. Each full-attention layer's decode query attend
 - the most recent keys (the window);
 - the long-range keys whose 4-key blocks score highest against the query.
 
-It is training-free and works on any checkpoint.
+It is training-free and works on every architecture the engine supports.
 
 Status:
-- **Opt-in and experimental.** It is off unless `MLXR_SPARSE_ATTN` is set. It changes outputs, so
-  under the correctness gate in AGENTS.md it cannot become default behaviour.
-- **No app setting, CLI flag or server option yet.**
+- **On by default** from 5,128 tokens of context. Below that, decode is dense and output is unchanged.
+  It can be turned off in the app, with `--sparse off`, or with `MLXR_SPARSE_ATTN=0`.
+- **It changes outputs** past that context length. That is an exception to the token-identical
+  default path that AGENTS.md otherwise requires.
 - **Speed** (M2 Pro, 4-bit, default budget): 1.1–1.3× dense decode at 8K, 1.25–1.8× at 16K,
   1.6–2.4× at 30K.
 - **Quality:** the cost in perplexity on real text is at most 1.6% at 8K–16K and 0.7–3% at 30K.
 
 ## Using it
 
+**In the app:** the chat inspector's **Long context** section has three settings:
+- **Sparse attention**, on or off;
+- **Long-range keys**: 1,024, 2,048, 4,096 or 8,192;
+- **Key selection**: per KV head, or shared.
+
+Like context length, they apply the next time a model is loaded. The inspector's **Model** section
+shows how many layers run sparse and from which context length.
+
+**On the command line:** `mlxr run` and `mlxr serve` take `--sparse on|off|N`, where N is the
+long-range key budget. Without it they use `MLXR_SPARSE_ATTN`, and print the result on load:
+
+```bash
+mlxr run <model> --sparse off ...
+mlxr serve <model> --sparse 4096 ...
+```
+
+**Environment variables:**
+
 | Variable | Meaning | Default |
 |---|---|---|
-| `MLXR_SPARSE_ATTN` | `1` enables the default budget; a larger number is the long-range key budget | unset (dense) |
+| `MLXR_SPARSE_ATTN` | `0` turns it off, `1` is the default budget, a larger number is the long-range key budget | on (2,048 keys) |
 | `MLXR_SPARSE_WINDOW` | recent keys always attended | 512 |
 | `MLXR_SPARSE_MIN` | decode stays dense below this context length | 2 · (sink + topK + window) = 5,128 |
 | `MLXR_SPARSE_SHARED` | `1`: one selection shared by every head instead of one per KV head | per KV head |
@@ -28,33 +47,44 @@ Status:
 The sink is 4 keys and the long-range budget defaults to 2,048 keys (512 blocks of 4). With the
 default budget a step attends to 2,564 keys whatever the context length.
 
-```bash
-MLXR_SPARSE_ATTN=1 mlxr run <model> ...
-MLXR_SPARSE_ATTN=4096 MLXR_SPARSE_WINDOW=1024 mlxr serve <model> ...
-```
-
-The settings are read once per process. `Transformer.init` reads them to allocate the index, and the
-engine's load-time memory check reads them to account for it. `SparseAttention` and
-`Transformer.sparse` set the mode in code. A model loaded without sparse attention allocates
-nothing, and setting `sparse` on it has no effect.
+**In code:** `InferenceEngine.load(directory:draftDirectory:contextLength:sparse:)` takes a
+`SparseAttention?`; nil means dense. If the index would not fit in memory at the requested context
+length, the model loads with dense decode and `LoadedModelInfo.sparseNote` says why. A
+`Transformer` set up with sparse attention can switch per step through `Transformer.sparse`. One
+loaded without it allocates nothing, and setting `sparse` on it has no effect.
 
 **Choosing the selection.** Per-head selection (the default) is better on Qwen3. Shared selection was
 better on Mistral 7B at 30K (see "Performance and accuracy").
 
 ### Coverage
 
-- **Layers.** Every layer that attends over the full context and has a split-attention kernel for
-  its head size.
-- **Sliding-window layers** (Gemma) are bounded already and stay dense.
-- **Gemma 4's KV-shared layers** use their source layer's index when the shapes match. This is
-  untested.
+Every architecture runs sparse decode on all of its full-attention layers. Sliding-window layers are
+already bounded by their window, so they stay dense.
+
+| Model | Layers | Full-attention | Sparse |
+|---|---|---|---|
+| Qwen3 0.6B / 8B / 14B | 28 / 36 / 40 | all | all |
+| Qwen2.5 0.5B | 24 | 24 | 24 |
+| Llama 3.2 1B | 16 | 16 | 16 |
+| Mistral 7B | 32 | 32 | 32 |
+| Phi-3.5 mini | 32 | 32 | 32 |
+| Gemma 1.1 2B | 18 | 18 | 18 |
+| Gemma 2 2B | 26 | 13 | 13 |
+| Gemma 3 270M / 1B / 4B | 18 / 26 / 34 | 3 / 4 / 5 | 3 / 4 / 5 |
+| Gemma 4 E2B | 35 | 7 | 7 |
+| Gemma 4 12B | 48 | 8 | 8 |
+
+Gemma 4 E2B indexes 3 layers; its 4 KV-shared full-attention layers use their source layer's index.
+
 - **Shapes with split and sparse kernels:**
   - head sizes 64, 96 and 128;
   - head sizes 256 and 512 in sub-groups;
   - for head size 128, G = 1–5 and 8 query heads per KV head. That includes Qwen3 / Qwen2.5 14B and
     32B. G = 5 also made Qwen3 14B's dense long-context decode 20% faster at 8K and 27% at 16K, with
     bit-identical output.
-- **Other head sizes** stay dense.
+
+  Other head sizes stay dense.
+- **Soft-capped attention** (Gemma 2) has its own kernel instantiations.
 - **Steps that stay dense:** prefill, speculative verification passes and draft models.
 - **Memory.** The index adds an eighth of each eligible layer's KV cache, about 11% less maximum
   context on a 16 GB Mac. The scores and per-head lists add about 1.25 × context × KV heads × 4
@@ -93,8 +123,9 @@ Relation to *Latent Sparse Attention* (arXiv 2610.42147v2, training-free variant
 
 ### Invariants
 
-- **Off means untouched.** With `MLXR_SPARSE_ATTN` unset there are no sparse buffers, no sparse
-  dispatches, and outputs are bit-identical to `main`.
+- **Off means untouched.** With sparse attention off (`MLXR_SPARSE_ATTN=0`, `--sparse off`, the app
+  setting, or `sparse: nil`) there are no sparse buffers, no sparse dispatches, and outputs are
+  bit-identical to dense decode. With it on, decode below `minContext` is dense too.
 - **Bounded indices.** Every GPU index derives from host-checked values:
   - the plan guarantees `count <= L <= maxSeq`;
   - each KV head's list sits `listStride` (the context length) entries apart in a buffer sized for
@@ -219,9 +250,9 @@ Nothing else may use the GPU while measuring.
 
 ```bash
 # dense decode at long contexts
-MLXR_BENCH_DECODE=1 MLXR_BENCH_CTX=8192,16384,30000 mlxr bench <model>
+MLXR_SPARSE_ATTN=0 MLXR_BENCH_DECODE=1 MLXR_BENCH_CTX=8192,16384,30000 mlxr bench <model>
 # dense against sparse, with agreement on real text from two places in it
-MLXR_SPARSE_ATTN=1 MLXR_BENCH_TEXT=book.txt MLXR_BENCH_TEXT_OFFSETS=0,60000 \
+MLXR_BENCH_TEXT=book.txt MLXR_BENCH_TEXT_OFFSETS=0,60000 \
   MLXR_BENCH_DECODE=1 MLXR_BENCH_CTX=8192,16384,30000 mlxr bench <model>
 ```
 
@@ -273,7 +304,7 @@ Measured with the kernel timing; none changed the output.
 
 ## Open questions and next steps
 
-Roughly by expected value. Items that change outputs stay opt-in.
+Roughly by expected value.
 
 1. **Blend per-head and shared scores.** For example, normalise each query head's score before
    summing within the group, or mix in the shared score. This should keep the Qwen gain and fix
@@ -302,7 +333,8 @@ Roughly by expected value. Items that change outputs stay opt-in.
 9. **Prefill.** Prefill is still O(T²): at 30K attention is most of Qwen3 0.6B's prefill time.
    - Lossless headroom: `flash_prefill` runs well below the GEMM tile's throughput.
    - Opt-in sparse prefill (XAttention) would need a selection per query block.
-10. **Wiring.** An app setting, CLI flag and server option, once the numbers justify it.
+10. **Server option.** Sparse attention is set per load, so a server request cannot ask for dense
+    decode: `mlxr serve --sparse off`, or the app setting, applies to every request.
 
 ## Files
 
@@ -311,14 +343,17 @@ Roughly by expected value. Items that change outputs stay opt-in.
 - `Sources/MLXEngine/Kernels.swift`: `SparseParams`, `sparse_index`, `sparse_score`, `sparse_select`,
   `attention_sparse` and its instantiations.
 - `Sources/MLXEngine/Transformer.swift`:
-  - `init(directory:contextLength:sparse:)`;
+  - `init(directory:contextLength:sparse:)`, `sparseLayerCount`;
   - the index, score and list buffers;
   - index maintenance after `qkv_post`;
   - the sparse branch of decode attention;
   - `sparse` / `sparseAvailable`.
 - `Sources/MLXEngine/GPU.swift`: the Swift `SparseParams`.
-- `Sources/MLXEngine/Engine.swift`: the memory check counts the index when `MLXR_SPARSE_ATTN` is set.
-- `Sources/mlxr/main.swift`: `LongBench` and `benchLongContext`, the long-context bench section.
+- `Sources/MLXEngine/Engine.swift`: `load(..., sparse:)`, the memory check with its dense fallback,
+  and the sparse fields of `LoadedModelInfo`.
+- `Sources/MLXRunner/AppState.swift`, `ChatView.swift`: the app settings and the inspector's Long
+  context section.
+- `Sources/mlxr/main.swift`: `--sparse`, `LongBench` and `benchLongContext` (the long-context bench section).
 - `Tests/MLXEngineTests/SparseAttentionTests.swift`: kernel tests against CPU references.
 - `Tests/MLXEngineTests/ModelTests.swift`: end-to-end tests on installed models.
 - `Tests/MLXEngineTests/SparseTimingTests.swift`: opt-in kernel timing.

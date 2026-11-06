@@ -18,6 +18,11 @@ struct ModelTests {
     /// MLXR_TEST_LARGE=1, since next to the Gemma suite it does not fit a 16 GB Mac.
     static let qwen3_14b = "lmstudio-community/Qwen3-14B-MLX-4bit"
     static let large = ProcessInfo.processInfo.environment["MLXR_TEST_LARGE"] == "1" ? [qwen3_14b] : []
+    static let qwen25 = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+    /// Every architecture: sparse attention runs on each one's full-attention layers.
+    static let allArchitectures = [qwen3, llama, phi, mistral, qwen25, GemmaModelTests.gemma1, GemmaModelTests.gemma2,
+                                   GemmaModelTests.gemma3, GemmaModelTests.gemma4] + large
+        + (ProcessInfo.processInfo.environment["MLXR_TEST_LARGE"] == "1" ? [GemmaModelTests.gemma4Unified] : [])
 
     @Test(.enabled(if: installedModel(qwen3) != nil))
     func qwenTokenizerKnownIdsAndRoundTrip() throws {
@@ -109,7 +114,7 @@ struct ModelTests {
     /// so it must reproduce split decode bit for bit: the index, the scores, the selection and the
     /// sparse kernel end to end. (A real budget changes outputs; `mlxr bench` with MLXR_BENCH_CTX
     /// measures by how much.)
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral] + large)
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: allArchitectures)
     func sparseDecodeWithFullBudgetIsBitIdentical(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let full = SparseAttention(topK: 1 << 20, window: 16, sink: 4, minContext: 1)

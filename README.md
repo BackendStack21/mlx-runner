@@ -167,7 +167,8 @@ mlxr serve mlx-community/Qwen3-4B-4bit --port 1234     # OpenAI-compatible serve
 mlxr run mlx-community/Qwen3-8B-4bit --draft mlx-community/Qwen3-0.6B-4bit   # speculative decoding (or --draft auto)
 mlxr bench mlx-community/Qwen3-4B-4bit      # prefill/decode throughput, verification cost at short and 1,900-token contexts, kernel profile (MLXR_BENCH_NOPROFILE=1 skips it)
 mlxr tokenize <model> "some text"
-MLXR_BENCH_CTX=8192,30000 mlxr bench <model>   # adds decode after long prompts (dense; sparse too with MLXR_SPARSE_ATTN=1)
+MLXR_BENCH_CTX=8192,30000 MLXR_BENCH_TEXT=book.txt mlxr bench <model>   # adds dense vs sparse decode after long prompts, with agreement on the text
+mlxr run <model> --sparse off   # sparse decode attention is on from 5,128 tokens of context; off, on or a key budget (N)
 ```
 
 ## Architecture
@@ -178,7 +179,7 @@ Sources/
     Kernels.swift       Metal shader source, compiled at runtime
     GPU.swift           Device and pipelines; safetensors loader (one aligned copy per shard)
     Transformer.swift   Model graph: one command buffer per step, fused kernels
-    SparseAttention.swift  Experimental sparse decode attention (opt-in, docs/sparse-decode-attention.md)
+    SparseAttention.swift  Sparse decode attention for long contexts (on by default; docs/sparse-decode-attention.md)
     Tokenizer.swift     BPE from tokenizer.json (byte-level and SentencePiece)
     ChatTemplate.swift  ChatML / Llama 3 / Mistral / Phi-3 prompt formats
     Engine.swift        Generation loop, pipelined decode, KV-prefix reuse, cancellation, context fitting

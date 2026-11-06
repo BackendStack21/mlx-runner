@@ -5,9 +5,9 @@ import MLXEngine
 //   mlxr search <query>
 //   mlxr download <org/repo>
 //   mlxr list
-//   mlxr run <org/repo|path> [-p prompt] [--raw] [--max N] [--temp T] [--no-think] [--ctx N] [--draft <model|auto>]
+//   mlxr run <org/repo|path> [-p prompt] [--raw] [--max N] [--temp T] [--no-think] [--ctx N] [--draft <model|auto>] [--sparse <on|off|N>]
 //   mlxr tokenize <org/repo|path> <text>
-//   mlxr serve <org/repo|path> [--port 1234] [--ctx N] [--lan] [--draft <model|auto>]
+//   mlxr serve <org/repo|path> [--port 1234] [--ctx N] [--lan] [--draft <model|auto>] [--sparse <on|off|N>]
 
 setvbuf(stdout, nil, _IONBF, 0)
 var args = Array(CommandLine.arguments.dropFirst())
@@ -45,6 +45,26 @@ func draftDirectory(_ s: String?, target: URL) -> URL? {
         return nil
     }
     return m.directory
+}
+
+/// `--sparse <on|off|N>`: sparse decode attention for long contexts (N: long-range keys). Without the
+/// option: MLXR_SPARSE_ATTN, which defaults to on.
+func sparseOption(_ s: String?) -> SparseAttention? {
+    guard let s else { return SparseAttention.fromEnvironment }
+    switch s.lowercased() {
+    case "on", "1": return .standard
+    case "off", "0": return nil
+    default:
+        guard let n = Int(s), n > 0 else { fail("--sparse takes on, off or a number of long-range keys") }
+        return SparseAttention(topK: n)
+    }
+}
+
+func sparseSummary(_ info: LoadedModelInfo) -> String {
+    if info.sparseLayers > 0 {
+        return "sparse attention on \(info.sparseLayers) layers from \(info.sparseMinContext) tokens (\(info.sparseTopK) long-range keys)"
+    }
+    return "sparse attention off" + (info.sparseNote.map { ": \($0)" } ?? "")
 }
 
 func formatBytes(_ b: Int) -> String {
@@ -329,11 +349,13 @@ case "run":
     let noThink = flag("--no-think")
     let showIds = flag("--ids")
     let draftArg = option("--draft")
+    let sparseArg = sparseOption(option("--sparse"))
     guard let model = args.first else { fail("usage: mlxr run <model> [-p prompt]") }
     let engine = InferenceEngine.shared
     let dir = resolve(model)
-    let info = try await engine.load(directory: dir, draftDirectory: draftDirectory(draftArg, target: dir), contextLength: ctx)
+    let info = try await engine.load(directory: dir, draftDirectory: draftDirectory(draftArg, target: dir), contextLength: ctx, sparse: sparseArg)
     print("Loaded \(info.name) [\(info.modelType), \(info.quantization), \(info.layers) layers, \(info.chatFormat)]\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s")
+    print(sparseSummary(info))
     var params = SamplingParameters()
     params.temperature = temp
     params.maxTokens = maxTokens
@@ -366,13 +388,15 @@ case "serve":
     let ctx = Int(option("--ctx") ?? "8192") ?? 8192
     let lan = flag("--lan")
     let draftArg = option("--draft")
-    guard let model = args.first else { fail("usage: mlxr serve <model> [--port 1234] [--ctx N] [--lan] [--api-key KEY] [--draft <model|auto>]") }
+    let sparseArg = sparseOption(option("--sparse"))
+    guard let model = args.first else { fail("usage: mlxr serve <model> [--port 1234] [--ctx N] [--lan] [--api-key KEY] [--draft <model|auto>] [--sparse <on|off|N>]") }
     // LAN mode always needs a key: use --api-key / MLXR_API_KEY, or generate one.
     var key = option("--api-key") ?? ProcessInfo.processInfo.environment["MLXR_API_KEY"]
     if lan && key == nil { key = OpenAIServer.generateAPIKey() }
     let dir = resolve(model)
-    let info = try await InferenceEngine.shared.load(directory: dir, draftDirectory: draftDirectory(draftArg, target: dir), contextLength: ctx)
+    let info = try await InferenceEngine.shared.load(directory: dir, draftDirectory: draftDirectory(draftArg, target: dir), contextLength: ctx, sparse: sparseArg)
     print("Loaded \(info.name)\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s")
+    print(sparseSummary(info))
     let server = OpenAIServer(port: port, allowLAN: lan, apiKey: key)
     server.onLog = { print($0) }
     do { try server.start() } catch { fail("cannot start server: \(error.localizedDescription)") }

@@ -1,6 +1,6 @@
 import Foundation
 
-/// Sparse decode attention: an experimental, opt-in mode for long contexts. It changes outputs.
+/// Sparse decode attention: on by default for long contexts. It changes outputs (from `minContext` on).
 ///
 /// Decoding one token reads the whole KV cache of every layer, so past a few thousand tokens the
 /// cache, not the weights, sets the speed (Qwen3 0.6B: from about 3K tokens; a 4-bit 7B: from about
@@ -23,7 +23,7 @@ import Foundation
 /// to split decode (`attention_split`; `ModelTests.sparseDecodeWithFullBudgetIsBitIdentical`), which
 /// itself equals the single-threadgroup decode kernel for head sizes up to 128.
 ///
-/// Enable it with `MLXR_SPARSE_ATTN=1` (or the number of long-range keys), `MLXR_SPARSE_WINDOW`,
+/// `MLXR_SPARSE_ATTN=0` turns it off (or sets the number of long-range keys), with `MLXR_SPARSE_WINDOW`,
 /// `MLXR_SPARSE_MIN`, `MLXR_SPARSE_SHARED=1` (one selection for every head); see
 /// docs/sparse-decode-attention.md.
 public struct SparseAttention: Equatable, Sendable {
@@ -50,13 +50,17 @@ public struct SparseAttention: Equatable, Sendable {
         self.perHead = perHead
     }
 
-    /// From the environment: `MLXR_SPARSE_ATTN` = 1 (default budget) or the number of long-range
+    /// The default budget: 2,048 long-range keys, a 512-key window and 4 sink keys, per KV head.
+    public static let standard = SparseAttention()
+
+    /// From the environment: `MLXR_SPARSE_ATTN` = 0 (off), 1 (the default budget) or the number of long-range
     /// keys; `MLXR_SPARSE_WINDOW` and `MLXR_SPARSE_MIN` set the window and the minimum context;
     /// `MLXR_SPARSE_SHARED=1` shares one selection between the heads.
-    /// nil (dense decode) when unset or 0.
+    /// Unset: the default budget (sparse attention is on by default). nil (dense decode) for 0.
     public static let fromEnvironment: SparseAttention? = {
         let env = ProcessInfo.processInfo.environment
-        guard let s = env["MLXR_SPARSE_ATTN"], let v = Int(s), v > 0 else { return nil }
+        let v = env["MLXR_SPARSE_ATTN"].flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? 1
+        guard v > 0 else { return nil }
         return SparseAttention(topK: v == 1 ? 2048 : v,
                                window: env["MLXR_SPARSE_WINDOW"].flatMap { Int($0) } ?? 512,
                                minContext: env["MLXR_SPARSE_MIN"].flatMap { Int($0) },
