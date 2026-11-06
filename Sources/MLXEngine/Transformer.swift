@@ -553,6 +553,9 @@ public final class Transformer {
     /// Layers that decode with sparse attention: full-attention layers with an index, and KV-shared
     /// layers that read their source layer's (0 without sparse attention).
     public let sparseLayerCount: Int
+    /// Why a model loaded with sparse attention decodes dense anyway (nil when it is on, or was not
+    /// asked for): a context that cannot reach `minContext`, no eligible layer, or a setup failure.
+    public let sparseOffReason: String?
     /// Per layer: pooled index keys [cacheLen / pool][nKV][D] (f16), for a full-attention layer with
     /// its own cache and a sparse kernel for its head size. KV-shared layers use their source's.
     private let sparseIndex: [MTLBuffer?]
@@ -705,6 +708,11 @@ public final class Transformer {
             var selectThreads: Int
         }
         var setup: SparseSetup?
+        var offReason: String?
+        if let sparse {
+            if seq < sparse.minContext { offReason = "the context length (\(seq)) is below \(sparse.minContext) tokens, where it starts" }
+            else if attnPartials == nil || !sparseLayers.contains(true) { offReason = "no layer of this model supports it" }
+        }
         if let sparse, seq >= sparse.minContext, attnPartials != nil, sparseLayers.contains(true) {
             do {
                 let pool = SparseAttention.pool
@@ -725,8 +733,10 @@ public final class Transformer {
                                     indexPSO: indexPSO, scorePSO: score, selectPSO: select, selectThreads: selectThreads)
             } catch {
                 setup = nil   // dense decode
+                offReason = "it could not be set up on this GPU (\(error.localizedDescription))"
             }
         }
+        sparseOffReason = offReason
         sparseIndex = setup?.index ?? [MTLBuffer?](repeating: nil, count: layers.count)
         sparseScores = setup?.scores
         sparseList = setup?.list

@@ -2045,8 +2045,10 @@ INST_ATTN_SG(16, 8, false, "")
 // Soft-capped variants for Gemma 2's head sizes (128 and 256).
 INST_ATTN_SG(4, 32, true, "_cap")
 INST_ATTN_SG(8, 16, true, "_cap")
+// Each split shape also gets its sparse kernel (same shapes; the host looks both up by the same name).
 #define INST_ASPLIT_C(E, G, CAP, SFX) \
-  template [[host_name("attention_split_" #E "_" #G SFX)]] kernel void attention_split<E, G, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint3, uint, uint);
+  template [[host_name("attention_split_" #E "_" #G SFX)]] kernel void attention_split<E, G, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint3, uint, uint); \
+  template [[host_name("attention_sparse_" #E "_" #G SFX)]] kernel void attention_sparse<E, G, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, device const int*, constant int2&, uint3, uint, uint);
 #define INST_ASPLIT(E, G) INST_ASPLIT_C(E, G, false, "")
 INST_ASPLIT(2, 1) INST_ASPLIT(2, 2) INST_ASPLIT(2, 3) INST_ASPLIT(2, 4)
 INST_ASPLIT(2, 5) INST_ASPLIT(2, 6) INST_ASPLIT(2, 7) INST_ASPLIT(2, 8)
@@ -2061,19 +2063,6 @@ INST_ASPLIT_C(8, 1, true, "_cap") INST_ASPLIT_C(8, 2, true, "_cap") INST_ASPLIT_
 #define INST_ACOMB(E) \
   template [[host_name("attention_combine_" #E)]] kernel void attention_combine<E>(device const float*, device float*, constant AttnParams&, uint2, uint);
 INST_ACOMB(2) INST_ACOMB(3) INST_ACOMB(4) INST_ACOMB(8) INST_ACOMB(16)
-// Sparse decode attention: the same shapes as attention_split.
-#define INST_ASPARSE_C(E, G, CAP, SFX) \
-  template [[host_name("attention_sparse_" #E "_" #G SFX)]] kernel void attention_sparse<E, G, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, device const int*, constant int2&, uint3, uint, uint);
-#define INST_ASPARSE(E, G) INST_ASPARSE_C(E, G, false, "")
-INST_ASPARSE(2, 1) INST_ASPARSE(2, 2) INST_ASPARSE(2, 3) INST_ASPARSE(2, 4)
-INST_ASPARSE(2, 5) INST_ASPARSE(2, 6) INST_ASPARSE(2, 7) INST_ASPARSE(2, 8)
-INST_ASPARSE(3, 1) INST_ASPARSE(3, 2) INST_ASPARSE(3, 3) INST_ASPARSE(3, 4)
-INST_ASPARSE(4, 1) INST_ASPARSE(4, 2) INST_ASPARSE(4, 3) INST_ASPARSE(4, 4)
-INST_ASPARSE(4, 5)
-INST_ASPARSE_C(4, 1, true, "_cap") INST_ASPARSE_C(4, 2, true, "_cap") INST_ASPARSE_C(4, 3, true, "_cap") INST_ASPARSE_C(4, 4, true, "_cap")
-INST_ASPARSE(8, 1) INST_ASPARSE(8, 2) INST_ASPARSE(8, 4)
-INST_ASPARSE(16, 1) INST_ASPARSE(16, 2)
-INST_ASPARSE_C(8, 1, true, "_cap") INST_ASPARSE_C(8, 2, true, "_cap") INST_ASPARSE_C(8, 4, true, "_cap")
 #define INST_ATTNP_C(E, QB, CAP, SFX) \
   template [[host_name("attention_prefill_" #E SFX)]] kernel void attention_prefill<E, QB, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint, uint);
 #define INST_ATTNP(E, QB) INST_ATTNP_C(E, QB, false, "")

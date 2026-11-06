@@ -419,7 +419,7 @@ case "bench":
     if let sp = t.sparse {
         print(t.sparseAvailable
               ? "sparse decode attention: top-k \(sp.topK), window \(sp.window), sink \(sp.sink), from \(sp.minContext) tokens"
-              : "sparse decode attention: requested, but no layer of this model supports it")
+              : "sparse decode attention: off (\(t.sparseOffReason ?? "unavailable"))")
     }
     let quick = ProcessInfo.processInfo.environment["MLXR_BENCH_DECODE"] != nil
     let noProfile = quick || ProcessInfo.processInfo.environment["MLXR_BENCH_NOPROFILE"] != nil

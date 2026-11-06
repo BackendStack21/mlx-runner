@@ -141,7 +141,7 @@ public final class Tokenizer: @unchecked Sendable {
             case "Sequence": for sub in (p["processors"] as? [[String: Any]]) ?? [] { visitPost(sub) }
             case "TemplateProcessing":
                 if let first = (p["single"] as? [[String: Any]])?.first, let st = first["SpecialToken"] as? [String: Any],
-                   let id = st["id"] as? String { postBos = id }
+                   let id = (st["id"] as? String).map(unshield) { postBos = id }
             default: break
             }
         }
@@ -156,8 +156,8 @@ public final class Tokenizer: @unchecked Sendable {
                 for sub in (p["pretokenizers"] as? [[String: Any]]) ?? [] { visitPre(sub) }
             case "Split":
                 if let pat = p["pattern"] as? [String: Any] {
-                    if let r = pat["Regex"] as? String { preRegex = try? NSRegularExpression(pattern: r) }
-                    else if let s = pat["String"] as? String { preRegex = try? NSRegularExpression(pattern: NSRegularExpression.escapedPattern(for: s)) }
+                    if let r = (pat["Regex"] as? String).map(unshield) { preRegex = try? NSRegularExpression(pattern: r) }
+                    else if let s = (pat["String"] as? String).map(unshield) { preRegex = try? NSRegularExpression(pattern: NSRegularExpression.escapedPattern(for: s)) }
                 }
             case "ByteLevel":
                 isByteLevel = true
@@ -238,61 +238,67 @@ public final class Tokenizer: @unchecked Sendable {
     }
 
     /// JSONSerialization drops a U+FEFF that starts a string, raw or escaped, so Gemma's vocabulary
-    /// entry "\u{FEFF}\r" became a second "\r" and took its id: every carriage return got the wrong
-    /// token. U+FEFF (after the first byte, where it is the file's own BOM) is swapped for a
-    /// private-use character that the file does not contain, and `stand` maps it back after parsing.
+    /// entry U+FEFF + "\r" became a second "\r" and took its id: every carriage return got the wrong
+    /// token. Every string that starts with U+FEFF (raw, or escaped in any case) gets a private-use
+    /// stand-in there instead, one the file does not use, and `stand` maps it back after parsing.
+    /// U+FEFF anywhere else (which JSONSerialization keeps) and the file's own BOM are left alone.
+    /// One pass over the bytes, tracking whether it is inside a JSON string.
     static func shieldingBOM(_ data: Data) -> (data: Data, stand: Unicode.Scalar?) {
-        func hex(_ v: UInt32) -> [UInt8] { Array(String(format: "%04x", v).utf8) }
-        func contains(_ needle: [UInt8], from start: Int = 0) -> Bool {
-            start < data.count && data.range(of: Data(needle), in: start..<data.count) != nil
-        }
-        let rawBOM: [UInt8] = [0xEF, 0xBB, 0xBF]
-        let escapes = ["\\ufeff", "\\uFEFF", "\\uFeff", "\\ufEFF"].map { Array($0.utf8) }   // the common spellings
-        // Cheap test first, one pass over the bytes: most tokenizer files have no U+FEFF at all.
-        let mayHaveBOM = data.withUnsafeBytes { (p: UnsafeRawBufferPointer) -> Bool in
+        var starts: [(range: Range<Int>, escaped: Bool)] = []
+        var used = [Bool](repeating: false, count: 256)   // U+E000...U+E0FF already in the file
+        data.withUnsafeBytes { (p: UnsafeRawBufferPointer) in
             let n = p.count
-            var i = 1
-            while i + 2 < n {
-                let b = p[i]
-                if b == 0xEF, p[i + 1] == 0xBB, p[i + 2] == 0xBF { return true }
-                if b == 0x5C, i + 5 < n, p[i + 1] == 0x75, p[i + 2] | 0x20 == 0x66, p[i + 3] | 0x20 == 0x65,
-                   p[i + 4] | 0x20 == 0x66, p[i + 5] | 0x20 == 0x66 { return true }
-                i += 1
-            }
-            return false
-        }
-        guard mayHaveBOM, contains(rawBOM, from: 1) || escapes.contains(where: { contains($0) }) else { return (data, nil) }
-        // A private-use stand-in absent from the file, raw and escaped.
-        guard let stand = (0xE000...0xE0FF).lazy.compactMap({ Unicode.Scalar(UInt32($0)) }).first(where: { s in
-            !contains(Array(String(s).utf8)) && !contains(Array("\\u".utf8) + hex(s.value))
-                && !contains(Array("\\u".utf8) + Array(String(format: "%04X", s.value).utf8))
-        }) else { return (data, nil) }
-        let rawStand = Data(String(stand).utf8), escapedStand = Data(Array("\\u".utf8) + hex(stand.value))
-        let needles = [Data(rawBOM)] + escapes.map { Data($0) }
-        // Copy the file in chunks between occurrences (found with Data.range, not byte by byte).
-        var out = Data(capacity: data.count)
-        var pos = 0, searchFrom = 1   // a BOM at byte 0 is the file's own
-        // Each needle's next occurrence at or after `searchFrom` (nil: none left), searched again only
-        // once passed, so the whole scan stays linear.
-        var nextHit: [Range<Int>?] = needles.map { data.range(of: $0, in: 1..<max(1, data.count)) }
-        while true {
-            for k in needles.indices {
-                if let r = nextHit[k], r.lowerBound < searchFrom {
-                    nextHit[k] = searchFrom < data.count ? data.range(of: needles[k], in: searchFrom..<data.count) : nil
+            func hexDigit(_ b: UInt8) -> Int? {
+                switch b {
+                case 0x30...0x39: return Int(b - 0x30)
+                case 0x41...0x46: return Int(b - 0x41 + 10)
+                case 0x61...0x66: return Int(b - 0x61 + 10)
+                default: return nil
                 }
             }
-            guard let k = needles.indices.filter({ nextHit[$0] != nil }).min(by: { nextHit[$0]!.lowerBound < nextHit[$1]!.lowerBound }),
-                  let r = nextHit[k] else { break }
-            let escaped = k > 0
-            if escaped {   // an escape only when its backslash is not itself escaped (two backslashes are text)
-                var slashes = 0, j = r.lowerBound - 1
-                while j >= 0, data[j] == 0x5C { slashes += 1; j -= 1 }
-                if slashes % 2 == 1 { searchFrom = r.upperBound; continue }
+            var inString = false, atStart = false   // atStart: the next character is the string's first
+            var i = 0
+            while i < n {
+                let b = p[i]
+                guard inString else {
+                    if b == 0x22 { inString = true; atStart = true }
+                    i += 1
+                    continue
+                }
+                if b == 0x22 { inString = false; i += 1; continue }
+                if b == 0x5C {   // an escape: \uXXXX, or two bytes (\" \\ \n ...)
+                    if i + 5 < n, p[i + 1] == 0x75, let a = hexDigit(p[i + 2]), let c = hexDigit(p[i + 3]),
+                       let d = hexDigit(p[i + 4]), let e = hexDigit(p[i + 5]) {
+                        let v = a << 12 | c << 8 | d << 4 | e
+                        if v == 0xFEFF && atStart { starts.append((i..<(i + 6), true)) }
+                        if v >> 8 == 0xE0 { used[v & 0xFF] = true }
+                        i += 6
+                    } else {
+                        i += 2
+                    }
+                    atStart = false
+                    continue
+                }
+                if b == 0xEF, i + 2 < n, p[i + 1] == 0xBB, p[i + 2] == 0xBF {
+                    if atStart { starts.append((i..<(i + 3), false)) }
+                    i += 3; atStart = false
+                    continue
+                }
+                if b == 0xEE, i + 2 < n, (0x80...0x83).contains(p[i + 1]) {   // UTF-8 of U+E000...U+E0FF
+                    used[Int(p[i + 1] - 0x80) << 6 | Int(p[i + 2] & 0x3F)] = true
+                }
+                i += 1; atStart = false
             }
-            out.append(data[pos..<r.lowerBound])
-            out.append(escaped ? escapedStand : rawStand)
-            pos = r.upperBound
-            searchFrom = pos
+        }
+        guard !starts.isEmpty, let free = used.firstIndex(of: false),
+              let stand = Unicode.Scalar(UInt32(0xE000 + free)) else { return (data, nil) }
+        let raw = Data(String(stand).utf8), escaped = Data(String(format: "\\u%04x", stand.value).utf8)
+        var out = Data(capacity: data.count)
+        var pos = 0
+        for s in starts {
+            out.append(data[pos..<s.range.lowerBound])
+            out.append(s.escaped ? escaped : raw)
+            pos = s.range.upperBound
         }
         out.append(data[pos..<data.count])
         return (out, stand)

@@ -49,10 +49,11 @@ struct TokenizerVocabTests {
         // not an escape), and a merge whose left side starts with U+FEFF.
         let json = (#"""
         @BOM@{"model": {"type": "BPE", "vocab": {"\r": 0, "@BOM@\r": 1, "x": 2, "@ESC@x": 3,
-                   "\\ufeff": 4, "\\": 5, "u": 6, "f": 7, "e": 8, "a": 9, "@ESC@xa": 10},
+                   "\\ufeff": 4, "\\": 5, "u": 6, "f": 7, "e": 8, "a": 9, "@ESC@xa": 10, "@MIX@y": 11, "a@BOM@b": 12, "@PUA@": 13},
                    "merges": [["@ESC@", "x"], ["@ESC@x", "a"]]},
          "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "never"}}
         """#).replacingOccurrences(of: "@BOM@", with: "\u{FEFF}").replacingOccurrences(of: "@ESC@", with: "\\u" + "feff")
+            .replacingOccurrences(of: "@MIX@", with: "\\u" + "FeFf").replacingOccurrences(of: "@PUA@", with: "\\u" + "e000")
         try json.data(using: .utf8)!.write(to: dir.appendingPathComponent("tokenizer.json"))
         let t = try Tokenizer(directory: dir)
         #expect(t.tokenId("\r") == 0 && t.tokenId("\u{FEFF}\r") == 1)
@@ -61,6 +62,10 @@ struct TokenizerVocabTests {
         #expect(t.encode("\r") == [0])
         #expect(t.tokenId("\u{FEFF}xa") == 10)
         #expect(t.encode("\u{FEFF}xa") == [10], "the merge kept its U+FEFF")
+        #expect(t.tokenId("\u{FEFF}y") == 11, "a mixed-case escape")
+        #expect(t.tokenId("a\u{FEFF}b") == 12, "U+FEFF inside a string is left as it is")
+        #expect(t.tokenId("\u{E000}") == 13, "the stand-in is one the file does not use")
+        #expect(Tokenizer.shieldingBOM(try Data(contentsOf: dir.appendingPathComponent("tokenizer.json"))).stand == Unicode.Scalar(0xE001))
         // A file without U+FEFF is read unchanged.
         let plain = Data(#"{"a": "b"}"#.utf8)
         #expect(Tokenizer.shieldingBOM(plain).stand == nil && Tokenizer.shieldingBOM(plain).data == plain)
