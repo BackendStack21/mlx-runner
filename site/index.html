@@ -186,9 +186,10 @@
       </ol>
     </figure>
 
-    <ul class="cards">
+    <ul class="cards four">
       <li class="glass"><h3>Prefill on tensor tiles</h3><p>Quantized GEMMs on <code>simdgroup_matrix</code> tiles and flash attention. Short follow-ups get an 8- or 16-token tile.</p></li>
       <li class="glass"><h3>KV-cache prefix reuse</h3><p>Prompt tokens shared with the previous request are skipped, so follow-ups start almost instantly.</p></li>
+      <li class="glass"><h3>Sparse attention at long contexts</h3><p>Past 5K tokens each new token reads the first and latest keys plus the 2,048 that score highest: decode 1.4–2.4× faster than <code>mlx-lm</code> at 30K, with a small change in output.</p></li>
       <li class="glass"><h3>Nothing else</h3><p>Swift plus Apple frameworks. No SwiftPM packages, no vendored code, no Python.</p></li>
     </ul>
 
@@ -225,7 +226,7 @@
             <ul>
               <li>Streaming Markdown and highlighted code, with live tok/s and time to first token on every reply.</li>
               <li>Edit and resend, regenerate, a per-chat system prompt and searchable history.</li>
-              <li>Inspector for temperature, top-p, top-k, min-p, repeat penalty and context length.</li>
+              <li>Inspector for temperature, top-p, top-k, min-p, repeat penalty, context length and sparse attention.</li>
             </ul>
           </div>
         </li>
