@@ -117,7 +117,8 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
         guard let s = try? String(contentsOfFile: path, encoding: .utf8) else { fail("cannot read MLXR_BENCH_TEXT \(path)") }
         text = tokenizer.encode(s).map { Int32($0) }.filter { $0 >= 0 && Int($0) < V }
         guard !text.isEmpty else { fail("MLXR_BENCH_TEXT \(path) has no tokens") }
-        print("long-context prompt: \(path), \(text.count) tokens (repeated to length)")
+        let bos = tokenizer.bosToken.flatMap { b in tokenizer.tokenId(b).map { " (prompts start with \(b), id \($0))" } } ?? ""
+        print("long-context prompt: \(path), \(text.count) tokens (repeated to length)\(bos)")
     } else {
         print("long-context prompt: pseudo-random tokens (MLXR_BENCH_TEXT=<file.txt> for real text)")
     }
@@ -162,6 +163,9 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
                     prompt.replaceSubrange(at..<(at + ids.count), with: ids)
                     needles.append((k + 1, code))
                 }
+                // Text starts with BOS when the tokenizer has one: Gemma without it gives nonsense
+                // (and Gemma 4's tokenizer does not say to add it). It replaces the first text token.
+                if let b = tokenizer.bosToken, let id = tokenizer.tokenId(b), id >= 0, id < V { prompt[0] = Int32(id) }
             }
             let at = off > 0 ? " from text token \(off)" : ""
             t.sparse = nil
