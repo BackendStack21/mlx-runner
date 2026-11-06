@@ -632,6 +632,9 @@ struct InspectorView: View {
                 .disabled(!state.sparseAttention)
                 Text(sparseCaption)
                     .font(.caption).foregroundStyle(.secondary)
+                // Opened through SafeLinkHandling, which asks first for hosts other than huggingface.co.
+                Link("Based on Latent Sparse Attention (arXiv 2610.42147)", destination: Self.sparsePaper)
+                    .font(.caption)
             }
             if let info = state.loadedInfo {
                 Section("Model") {
@@ -649,6 +652,9 @@ struct InspectorView: View {
         }
         .formStyle(.grouped)
     }
+
+    /// Kubicek et al., "Latent Sparse Attention: Towards Subquadratic Ultra-Long Context Attention".
+    static let sparsePaper = URL(string: "https://arxiv.org/abs/2610.42147")!
 
     /// Long-range key budgets offered (plus a saved value that is not one of them).
     static func sparseKeyChoices(including current: Int) -> [Int] {
