@@ -665,7 +665,7 @@ struct InspectorView: View {
         guard let s = state.sparseConfig else {
             return "Every token attends to the whole context. Applies the next time a model is loaded."
         }
-        return "From \(s.minContext) tokens of context on, each new token attends to the first and latest tokens and the \(s.topK) earlier ones that score highest, not the whole context: faster at long contexts, with a small change in output. Shared selection did better on Mistral. Applies the next time a model is loaded."
+        return "From \(s.minContext) tokens of context on, each new token attends to the first and latest tokens and the \(s.topK) earlier ones that score highest, not the whole context: faster at long contexts, with a small change in output. Applies the next time a model is loaded."
     }
 
     static func sparseStatus(_ info: LoadedModelInfo) -> String {
