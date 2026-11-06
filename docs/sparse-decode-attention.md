@@ -1,11 +1,65 @@
 # Sparse decode attention (experimental)
 
-Branch `feat/sparse-decode-attention`. Status: **written without a Swift toolchain or a Metal GPU.
-None of it has been compiled, run or benchmarked yet.** Expect compile fixes before the first test run.
-Done so far without a compiler:
-- a line-by-line review of the diff by a second reader (no defects found; its four hardening notes are applied);
-- a CPU simulation of `sparse_select`'s exact algorithm against a reference on 400 random cases
-  (ties, ±0, negative scores, p = N, 32–1024 threads), all matching.
+Branch `feat/sparse-decode-attention`. Status: **compiled, tested and measured on an M2 Pro (16 GB,
+2026-11-06).** It was written without a Swift toolchain or a Metal GPU, then picked up on a Mac:
+- The Swift and the Metal source compiled as written, with no fixes.
+- `swift test --filter SparseAttentionTests` passes: 6 tests, 18 cases.
+- `sparseDecodeWithFullBudgetIsBitIdentical` passes on Qwen3 0.6B, Llama 3.2 1B, Phi-3.5 mini and
+  Mistral 7B, and `sparseDecodeStaysDenseBelowItsMinimumContext` passes.
+- With `MLXR_SPARSE_ATTN` unset, the full `swift test` passes: 161 tests in 28 suites.
+- Start-up is unchanged: a one-token `mlxr run` on Qwen3 0.6B takes 0.46 s on this branch and 0.47 s
+  on `main` (warm).
+- The decision to keep, tune or drop it is open. See "Measured" below.
+
+## Measured
+
+M2 Pro (16-core GPU, 16 GB), 4-bit models, nothing else on the GPU. The prompt is *Pride and Prejudice*
+(Project Gutenberg #1342, about 177K tokens, so no context repeats). Default budget: 2,048 long-range
+keys, a 512-key window and 4 sink keys. Each figure is the better of 2 runs; the runs agreed within 2%.
+"Dense" is a separate process with `MLXR_SPARSE_ATTN` unset. The in-process dense line of the sparse
+runs was within 0.5% of it, so keeping the index costs nothing measurable. Agreement is over 64 decode
+steps: "greedy" counts how many tokens match dense decode before the first difference, and "teacher-forced"
+counts how often the next-token argmax matches when both are fed dense decode's tokens.
+
+| Model | Context | Dense tok/s | Sparse tok/s | Speed-up | Greedy prefix | Teacher-forced |
+|---|---|---|---|---|---|---|
+| Qwen3 0.6B | 8,192 | 112.9 | 142.7 | 1.26× | 64/64 | 64/64 (100%) |
+| Qwen3 0.6B | 16,384 | 70.9 | 129.0 | 1.82× | 12/64 | 59/64 (92%) |
+| Qwen3 0.6B | 30,000 | 43.8 | 104.7 | 2.39× | 4/64 | 62/64 (97%) |
+| Mistral 7B | 8,192 | 31.6 | 35.0 | 1.11× | 4/64 | 62/64 (97%) |
+| Mistral 7B | 16,384 | 25.7 | 33.9 | 1.32× | 13/64 | 57/64 (89%) |
+| Mistral 7B | 30,000 | 19.7 | 31.6 | 1.61× | 9/64 | 59/64 (92%) |
+
+GPU time per token, dense → sparse: Qwen3 0.6B 8.85 → 7.00, 14.09 → 7.74 and 22.83 → 9.54 ms;
+Mistral 7B 31.61 → 28.58, 38.87 → 29.46 and 50.83 → 31.63 ms. For reference, dense decode at 16
+tokens of context is 3.33 ms (Qwen3 0.6B) and 25.85 ms (Mistral 7B). Prefill, dense in both modes:
+Qwen3 0.6B 1,076 / 630 / 370 tok/s and Mistral 7B 185 / 145 / 106 tok/s at 8K / 16K / 30K.
+
+Against the bar in step 6:
+- Sparse is 1.61× dense at 30K on Mistral 7B, above the 1.3× bar.
+- At 8K it is faster than dense, not slower.
+- Teacher-forced agreement reaches 95% only at 8K on both models and at 30K on Qwen3 0.6B. It falls
+  to 89–92% at 16K and at Mistral's 30K. With 64 positions, each token is 1.6 points, so 95% means
+  at least 61 of 64.
+
+A larger budget (`MLXR_SPARSE_ATTN=4096 MLXR_SPARSE_WINDOW=1024`, so about 5.1K keys attended; one
+run, same prompt):
+
+| Model | Context | Dense tok/s | Sparse tok/s | Speed-up | Greedy prefix | Teacher-forced |
+|---|---|---|---|---|---|---|
+| Qwen3 0.6B | 16,384 | 71.1 | 105.1 | 1.48× | 12/64 | 59/64 (92%) |
+| Qwen3 0.6B | 30,000 | 43.8 | 90.6 | 2.07× | 7/64 | 61/64 (95%) |
+| Mistral 7B | 16,384 | 25.7 | 31.3 | 1.22× | 30/64 | 61/64 (95%) |
+| Mistral 7B | 30,000 | 19.6 | 29.7 | 1.52× | 21/64 | 61/64 (95%) |
+
+At this budget Mistral 7B meets all three bars at 30K: 1.52× and 61 of 64. The 5 misses on Qwen3
+0.6B at 16K do not change with the budget. They are probably near-ties that any change in summation
+order flips, rather than keys the selection dropped; this is not checked yet. Agreement measured over
+64 positions of one text is a coarse signal. A larger evaluation (several texts, more positions,
+needle retrieval) should come before any decision to ship.
+
+The "Why" table below is the estimate made before any measurement. Measured dense decode fell more
+slowly with context than it predicted (Qwen3 0.6B at 30K: 43.8 tok/s, estimated about 37).
 
 ## Why
 
