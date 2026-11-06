@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## 1.4.0
 
-Sparse decode attention for long contexts, on by default, and faster long-context decode on Qwen3 14B.
+Sparse decode attention for long contexts, on by default; faster long-context decode on Qwen3 14B; and
+fixes to Gemma tokenization and raw prompts.
 
 - **Sparse decode attention**, on by default from 5,128 tokens of context
   ([docs/sparse-decode-attention.md](docs/sparse-decode-attention.md)).
@@ -13,7 +14,7 @@ Sparse decode attention for long contexts, on by default, and faster long-contex
     - Qwen3 0.6B: 43.8 → 103.5 tok/s at 30K;
     - Qwen3 8B: 17.8 → 29.0 tok/s at 30K;
     - Mistral 7B: 19.7 → 31.5 tok/s at 30K;
-    - 1.1–1.3× at 8K and 1.25–1.8× at 16K.
+    - across every model measured, 1.06–1.4× at 8K, 1.2–2.1× at 16K and 1.4–3.0× at 30K.
   - **It changes output** past 5,128 tokens. Perplexity on real text rises by at most about 3% on every
     model measured except Gemma 4 E2B (+8% at 30K, and clearly lossier at every length) and Gemma 1.1
     (+3.6% at 7K). Top-1
