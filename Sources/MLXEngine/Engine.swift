@@ -369,7 +369,7 @@ public final class InferenceEngine: @unchecked Sendable {
                          token: CancelToken = CancelToken()) -> AsyncThrowingStream<GenerationEvent, Error> {
         stream(token, parameters: parameters) { tok, _ in
             var ids = tok.encode(prompt)
-            // Models such as Llama and Mistral expect BOS on raw prompts (add_bos_token).
+            // Models such as Llama, Mistral and Gemma expect BOS on raw prompts (`Tokenizer.addBosToken`).
             if tok.addBosToken, let b = tok.bosToken, let id = tok.tokenId(b), ids.first != id { ids.insert(id, at: 0) }
             return ids
         }

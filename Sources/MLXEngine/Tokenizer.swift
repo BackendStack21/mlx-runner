@@ -221,6 +221,17 @@ public final class Tokenizer: @unchecked Sendable {
            let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
             chatTemplate = o["chat_template"] as? String
         }
+        // A chat template that writes BOS (`{{ bos_token }}`, any whitespace control) shows the model
+        // was trained with it first. Gemma 4's tokenizer files do not say to add it to raw prompts,
+        // and without it the model produces nonsense.
+        if !addBosToken, let b = bosToken, vocab[ExactKey(b)] != nil, let t = chatTemplate, Self.templateWritesBos(t) {
+            addBosToken = true
+        }
+    }
+
+    /// Does a Jinja chat template output `bos_token` (`{{ bos_token }}`, `{{- bos_token -}}`, ...)?
+    static func templateWritesBos(_ template: String) -> Bool {
+        template.range(of: #"\{\{-?\s*bos_token\s*-?\}\}"#, options: .regularExpression) != nil
     }
 
     public func tokenId(_ token: String) -> Int? { vocab[ExactKey(token)] }
