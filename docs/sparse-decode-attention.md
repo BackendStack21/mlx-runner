@@ -13,9 +13,11 @@ Status:
   It can be turned off in the app, with `--sparse off`, or with `MLXR_SPARSE_ATTN=0`.
 - **It changes outputs** past that context length. That is an exception to the token-identical
   default path that AGENTS.md otherwise requires.
-- **Speed** (M2 Pro, 4-bit, default budget): 1.1–1.3× dense decode at 8K, 1.25–1.8× at 16K,
-  1.6–2.4× at 30K.
-- **Quality:** the cost in perplexity on real text is at most 1.6% at 8K–16K and 0.7–3% at 30K.
+- **Speed** (M2 Pro, 4-bit, default budget): 1.06–1.4× dense decode at 8K, 1.2–2.1× at 16K and
+  1.4–3.0× at 30K, on every architecture.
+- **Quality:** on real text the perplexity cost is at most about 3% on every model, at every context
+  measured, except Gemma 4 E2B (+8% at 30K) and, to a lesser degree, Gemma 1.1 (KL 0.08). See
+  "Every architecture".
 
 ## Using it
 
@@ -53,8 +55,8 @@ length, the model loads with dense decode and `LoadedModelInfo.sparseNote` says 
 `Transformer` set up with sparse attention can switch per step through `Transformer.sparse`. One
 loaded without it allocates nothing, and setting `sparse` on it has no effect.
 
-**Choosing the selection.** Per-head selection (the default) is better on Qwen3. Shared selection was
-better on Mistral 7B at 30K (see "Performance and accuracy").
+**Choosing the selection.** Per-head selection (the default) was better than shared or level on every
+model compared: Qwen3 0.6B and 8B, and Mistral 7B (see "Per-head and shared selection").
 
 ### Coverage
 
@@ -141,7 +143,8 @@ Relation to *Latent Sparse Attention* (arXiv 2610.42147v2, training-free variant
 - M2 Pro (16-core GPU, 197 GB/s), 16 GB, 4-bit weights, nothing else on the GPU, 2026-11-06.
 - Default budget, per-head selection.
 - Prompt: *Pride and Prejudice* (Project Gutenberg #1342, about 177K tokens, so no context repeats
-  text).
+  text), starting with BOS where the tokenizer has one. (Without it Gemma produces nonsense, and the
+  first measurements of Mistral and Gemma were redone with it.)
 
 **Columns.**
 - **Mean KL** is KL(dense‖sparse) over 512 positions of the text after the prompt. Both modes are
@@ -164,16 +167,17 @@ slow.
 | Qwen3 8B | 30K | 17.8 | 29.0 | 1.63× | 0.011 | +0.007 | 95.1% | 304/304 |
 | Qwen3 14B | 8K | 17.5 | 19.1 | 1.09× | 0.002 | −0.007 | 99.0% | 422/422 |
 | Qwen3 14B | 16K | 14.9 | 18.7 | 1.25× | 0.009 | +0.014 | 93.8% | 359/361 |
-| Mistral 7B | 8K | 31.6 | 34.9 | 1.10× | 0.015* | −0.005 | 97.5% | 358/359 |
-| Mistral 7B | 16K | 25.4 | 33.9 | 1.33× | 0.013 | +0.009 | 95.3% | 372/372 |
-| Mistral 7B | 30K | 19.7 | 31.5 | 1.60× | 0.040 | +0.030 | 92.4% | 295/296 |
+| Mistral 7B | 8K | 31.6 | 34.9 | 1.10× | 0.014* | −0.007 | 97.3% | 363/364 |
+| Mistral 7B | 16K | 25.4 | 33.9 | 1.33× | 0.004 | +0.004 | 96.3% | 371/371 |
+| Mistral 7B | 30K | 19.7 | 31.5 | 1.60× | 0.011 | −0.014 | 94.5% | 302/302 |
 
 Notes:
 - **Qwen3 0.6B** is measured at two places in the book (from token 0 and from token 60,000).
-- **Mistral 7B at 8K (\*):** the mean KL is one outlier position (5.4 nats); the median is 0.0000.
+- **Mistral 7B at 8K (\*):** the mean KL is one outlier position (5.2 nats); the median is 0.0000.
 - **Qwen3 14B at 30K** was not run. Weights, KV cache and index come to about 14 GB.
-- **Needle recall.** Five passkeys at 10–90% depth were recalled by sparse decode exactly as by dense
-  decode in every run.
+- **Needle recall.** Five passkeys at 10–90% depth. Sparse decode recalled as many as dense decode in
+  every run but two, and more in two (Llama 3.2 1B at 30K, Phi-3.5 at 16K). The two exceptions are
+  Gemma 3 1B at 8K and 16K, with one needle fewer each.
 - **Near-ties.** Almost every top-1 disagreement is at a position where dense decode itself was
   nearly undecided. The "Decisive" column shows agreement elsewhere is effectively complete.
 - **Memorisation.** Dense NLL on the book is 3.35–3.66 nats for Qwen3 0.6B but 0.9–2.2 for the 7B+
@@ -183,6 +187,47 @@ Notes:
   - Qwen3 8B: 178 / 135 / 99 tok/s;
   - Qwen3 14B: 100 / 80 tok/s (8K / 16K only);
   - Mistral 7B: 185 / 142 / 107 tok/s.
+
+### Every architecture
+
+The rest of the supported architectures, with the same setup.
+- **Gemma 1.1 and Gemma 2** support 8K tokens, so they were measured at 7,000.
+- **Phi-3.5 mini** has a large KV cache (384 KB per token), so it stops at 16K on 16 GB.
+- **Gemma** gains less because only some of its layers attend over the full context; the rest use a
+  sliding window (see "Coverage").
+- **Speeds** are from a run with nothing else on the GPU. **Accuracy** is from the runs with BOS and,
+  for Gemma, the corrected tokenizer (see the CHANGELOG).
+
+| Model | Context | Dense tok/s | Sparse tok/s | Speed-up | Mean KL | NLL Δ | Top-1 | Decisive |
+|---|---|---|---|---|---|---|---|---|
+| Qwen2.5 0.5B | 8K | 137.7 | 188.3 | 1.37× | 0.002 | +0.004 | 98.0% | 234/234 |
+| Qwen2.5 0.5B | 16K | 87.1 | 179.9 | 2.07× | 0.007 | −0.007 | 95.9% | 202/202 |
+| Qwen2.5 0.5B | 30K | 54.5 | 163.8 | 3.01× | 0.015 | +0.005 | 91.4% | 232/232 |
+| Llama 3.2 1B | 8K | 123.1 | 149.2 | 1.21× | 0.002 | −0.009 | 98.4% | 275/275 |
+| Llama 3.2 1B | 16K | 89.5 | 144.4 | 1.61× | 0.008 | +0.016 | 96.1% | 219/219 |
+| Llama 3.2 1B | 30K | 59.4 | 126.4 | 2.13× | 0.017 | +0.012 | 94.3% | 217/217 |
+| Phi-3.5 mini | 8K | 31.4 | 39.2 | 1.25× | 0.001 | −0.003 | 99.6% | 349/349 |
+| Phi-3.5 mini | 16K | 20.4 | 33.3 | 1.63× | 0.006 | +0.001 | 96.9% | 279/279 |
+| Gemma 1.1 2B | 7K | 60.1 | 65.6 | 1.09× | 0.078 | +0.036 | 93.8% | 316/321 |
+| Gemma 2 2B | 7K | 60.2 | 65.8 | 1.09× | 0.000 | −0.001 | 99.4% | 313/313 |
+| Gemma 3 1B | 8K | 152.6 | 162.0 | 1.06× | 0.002 | +0.004 | 98.6% | 351/351 |
+| Gemma 3 1B | 16K | 134.7 | 161.0 | 1.20× | 0.003 | +0.027 | 97.5% | 329/329 |
+| Gemma 3 1B | 30K | 113.0 | 158.1 | 1.40× | 0.005 | +0.020 | 94.5% | 271/271 |
+| Gemma 4 E2B | 8K | 60.4 | 65.0 | 1.08× | 0.068 | −0.049 | 92.6% | 390/396 |
+| Gemma 4 E2B | 16K | 53.1 | 64.5 | 1.21× | 0.150 | −0.024 | 86.9% | 367/384 |
+| Gemma 4 E2B | 30K | 43.8 | 63.5 | 1.45× | 0.191 | +0.079 | 85.2% | 362/383 |
+
+**Gemma 4 E2B is the outlier, and Gemma 1.1 the lesser one.** Gemma 4 E2B's KL is 5–20× the other
+models', it disagrees at 4–6% of the positions where dense decode is decisive (others: under 1%,
+Gemma 1.1: 1.6%), and perplexity rises 8% at 30K (Gemma 1.1: 3.6% at 7K). The NLL
+change swings from −0.05 to +0.08, and the dense model itself scores poorly on this text (4.3–5.5
+nats against 2–3.5 for models of similar size, and mlx-lm agrees: 4.9). So the signal is noisy,
+but the KL and decisive-position figures are not. Possible causes, unverified:
+- 4 of its 7 full-attention layers share their KV cache with another layer, and select with that
+  layer's index;
+- its 512-wide global heads are scored and attended in sub-groups.
+
+To turn sparse attention off for it, use the inspector's switch or `--sparse off`.
 
 ### Against mlx-lm
 
@@ -242,17 +287,16 @@ GEMMs. Ingesting a 30K-token prompt takes about 83 s on Qwen3 0.6B and 280 s on 
 | Qwen3 0.6B | 30K (two regions) | per head | 0.010 / 0.013 | +0.016 / +0.012 | 93.9% / 92.2% |
 | Qwen3 8B | 30K | shared | 0.015 | +0.014 | 93.2% |
 | Qwen3 8B | 30K | per head | 0.011 | +0.007 | 95.1% |
-| Mistral 7B | 30K | shared | 0.017 | +0.013 | 95.7% |
-| Mistral 7B | 30K | per head | 0.040 | +0.030 | 92.4% |
+| Mistral 7B | 30K | shared | 0.014 | +0.011 | 94.3% |
+| Mistral 7B | 30K | per head | 0.011 | −0.014 | 94.5% |
 
 Speed is the same in both modes.
 
 On Qwen3, per-head selection cuts KL 1.3–9× and the perplexity cost 2–4.5×. On Mistral 7B it is
-worse, and the gap holds at the median, not just in outliers. That Mistral comparison is a single
-run at one context.
+level to slightly better (one run at 30K).
 
-An untested explanation: Mistral has no QK-norm, so one KV head's mean-pooled score is a noisier
-proxy, and summing over every head averages the noise out.
+An earlier Mistral run, whose prompts lacked BOS, had shared selection ahead (KL 0.017 against
+0.040). With BOS that reversal disappeared, so it was an artifact of the out-of-distribution prompt.
 
 ### Where the time goes
 
@@ -355,35 +399,38 @@ Measured with the kernel timing; none changed the output.
 
 Roughly by expected value.
 
-1. **Blend per-head and shared scores.** For example, normalise each query head's score before
-   summing within the group, or mix in the shared score. This should keep the Qwen gain and fix
-   Mistral. Measure shared against per-head on Mistral at 8K and 16K, and on Qwen3 14B, first.
-2. **A broader evaluation.** Use a text the models cannot have memorised (code, or something
+1. **Gemma 4 E2B's quality.** Find out why its sparse decode is lossier than every other model's:
+   the KV-shared layers, the 512-wide heads in sub-groups, or the model itself. Until then, consider
+   leaving it dense by default.
+2. **Blend per-head and shared scores.** For example, normalise each query head's score before
+   summing within the group, or mix in the shared score. Per-head is already better or level on every
+   model compared, so this is about the 4–8% of misses that remain at 30K.
+3. **A broader evaluation.** Use a text the models cannot have memorised (code, or something
    recent), more needle depths and more than one run.
-3. **Reuse a selection** across 2–4 decode steps, with `attention_sparse` also covering positions
+4. **Reuse a selection** across 2–4 decode steps, with `attention_sparse` also covering positions
    written since the last selection, or across adjacent layers (TidalDecode, OmniKV). This removes
    most scoring and selection work: an estimated 1.6–3.5 ms per token on Qwen3 0.6B at 30K.
-4. **A smaller index.** int8 with a per-row scale, or pooling 8:1, would halve the scoring bytes (about
+5. **A smaller index.** int8 with a per-row scale, or pooling 8:1, would halve the scoring bytes (about
    −1 ms at 30K on Qwen3 0.6B) and the index memory. Later options:
    - a channel subset ranked by `q_norm · k_norm` (the Double Sparsity approach);
    - Quest-style min/max bounds, for single "needle" keys that a 4-key mean dilutes.
-5. **A multi-query verification kernel.** It would read K/V once for all T tokens. That makes
+6. **A multi-query verification kernel.** It would read K/V once for all T tokens. That makes
    sparse-drafted, dense-verified self-speculation (MagicDec, TriForce) possible, which is greedy
    token-identical to dense and could become default behaviour. With the agreement measured above as
    the acceptance rate, the estimate is about 1.4× dense at 30K on Qwen3 0.6B. 7–8B models also need
    a memory-bound batched matvec.
-6. **Load draft models with sparse attention** (`Engine.swift`, where drafts load with
+7. **Load draft models with sparse attention** (`Engine.swift`, where drafts load with
    `sparse: nil`). Verification keeps the output exact. Today speculation with a sparse model is
    slower than plain sparse decode at long context.
-7. **An int8 or int4 KV cache** (KIVI; mlx-lm's `QuantizedKVCache`), opt-in. It cuts every
+8. **An int8 or int4 KV cache** (KIVI; mlx-lm's `QuantizedKVCache`), opt-in. It cuts every
    long-context read, composes with sparsity, and would let Qwen3 14B hold 30K in 16 GB. It touches
    every attention kernel and prefill.
-8. **Scale `MLXR_SPARSE_MIN` with model size.** At 8K a 7–14B model gains only about 10%.
-9. **Prefill.** It is still O(T²), and at 30K mlx-lm prefills 1.4–2× faster than we do (see "Against
+9. **Scale `MLXR_SPARSE_MIN` with model size.** At 8K a 7–14B model gains only about 10%.
+10. **Prefill.** It is still O(T²), and at 30K mlx-lm prefills 1.4–2× faster than we do (see "Against
    mlx-lm"). At 30K attention is most of Qwen3 0.6B's prefill time.
    - Lossless headroom: `flash_prefill` runs well below the GEMM tile's throughput.
    - Opt-in sparse prefill (XAttention) would need a selection per query block.
-10. **Server option.** Sparse attention is set per load, so a server request cannot ask for dense
+11. **Server option.** Sparse attention is set per load, so a server request cannot ask for dense
     decode: `mlxr serve --sparse off`, or the app setting, applies to every request.
 
 ## Files

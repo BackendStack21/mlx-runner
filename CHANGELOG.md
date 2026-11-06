@@ -14,9 +14,11 @@ Sparse decode attention for long contexts, on by default, and faster long-contex
     - Qwen3 8B: 17.8 → 29.0 tok/s at 30K;
     - Mistral 7B: 19.7 → 31.5 tok/s at 30K;
     - 1.1–1.3× at 8K and 1.25–1.8× at 16K.
-  - **It changes output** past 5,128 tokens. Perplexity on real text rises by up to 1.6% at 16K and
-    by 0.7–3% at 30K. Top-1 agreement with dense decode is 92–99%, and almost all disagreements are
-    where dense decode was nearly undecided. Below 5,128 tokens decode is dense and output is unchanged.
+  - **It changes output** past 5,128 tokens. Perplexity on real text rises by at most about 3% on every
+    model measured except Gemma 4 E2B (+8% at 30K, and clearly lossier at every length) and Gemma 1.1
+    (+3.6% at 7K). Top-1
+    agreement with dense decode is 91–99% elsewhere, and almost all disagreements are where dense
+    decode was nearly undecided. Below 5,128 tokens decode is dense and output is unchanged.
   - **Settings.**
     - App: the inspector's new **Long context** section (on/off, the long-range key budget, and
       per-KV-head or shared selection). The **Model** section shows the layers that run sparse.
@@ -39,6 +41,19 @@ Sparse decode attention for long contexts, on by default, and faster long-contex
   identical output. Its 5 query heads per KV head had no split-attention kernel, so decode used the
   single-threadgroup kernel. G = 5 is now instantiated for head size 128, which also covers Qwen2.5
   14B. (G = 8, for the 32B models, was left out: its split kernel was not bit-identical.)
+- **Fixes Gemma tokenization of carriage returns and long space runs.** Whole-book tokenizations now
+  match the reference (transformers) tokenizer on Gemma 1.1–4, Qwen3, Qwen2.5, Llama 3.2, Mistral
+  and Phi-3.5.
+  - **Carriage returns.** Foundation's JSON parser drops a U+FEFF that starts a string, so Gemma's
+    vocabulary entry for U+FEFF + CR replaced the one for CR. Every carriage return was encoded as
+    the wrong token, and Gemma 1.1 read CRLF text as near-nonsense.
+  - **Space runs.** BPE now merges in Hugging Face's order: one pair at a time, the lowest rank first.
+    Gemma's merge list ranks whitespace runs early, so a run of 32 or more spaces was split
+    differently.
+- **Gemma 4 raw completions start with BOS** (`mlxr run --raw`, `/v1/completions`). Its tokenizer
+  files never say to add it, and without it the model produces nonsense. A chat template that writes
+  `bos_token` now implies BOS on raw prompts, unless `add_bos_token` says otherwise. Chat was
+  unaffected.
 - **`mlxr bench` with `MLXR_BENCH_CTX`** reports, besides speed:
   - KL divergence, text NLL and margin-bucketed top-1 agreement between sparse and dense decode,
     over `MLXR_BENCH_POSITIONS` positions of `MLXR_BENCH_TEXT`, from each of
