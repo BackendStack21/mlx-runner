@@ -1,5 +1,75 @@
 # Changelog
 
+## 1.4.0
+
+Sparse decode attention for long contexts, on by default; faster long-context decode on Qwen3 14B; and
+fixes to Gemma tokenization and raw prompts.
+
+- **Sparse decode attention**, on by default from 5,128 tokens of context
+  ([docs/sparse-decode-attention.md](docs/sparse-decode-attention.md)).
+  - **How it works.** Each full-attention layer keeps a mean key per block of 4 keys. Each KV head
+    scores those blocks against its query heads and attends to the first 4 keys, its 2,048
+    best-scoring earlier keys and the latest 512, not the whole cache.
+  - **Speed** on an M2 Pro (4-bit), against dense decode:
+    - Qwen3 0.6B: 43.8 → 103.5 tok/s at 30K;
+    - Qwen3 8B: 17.8 → 29.0 tok/s at 30K;
+    - Mistral 7B: 19.7 → 31.5 tok/s at 30K;
+    - across every model measured, 1.06–1.4× at 8K, 1.2–2.1× at 16K and 1.4–3.0× at 30K.
+  - **It changes output** past 5,128 tokens. Perplexity on real text rises by at most about 3% on every
+    model measured except Gemma 4 E2B (+8% at 30K, and clearly lossier at every length) and Gemma 1.1
+    (+3.6% at 7K). Top-1
+    agreement with dense decode is 91–99% elsewhere, and almost all disagreements are where dense
+    decode was nearly undecided. Below 5,128 tokens decode is dense and output is unchanged.
+  - **Settings.**
+    - App: the inspector's new **Long context** section (on/off, the long-range key budget, and
+      per-KV-head or shared selection). The **Model** section shows the layers that run sparse.
+    - CLI: `mlxr run` / `mlxr serve --sparse <on|off|N>`.
+    - Environment: `MLXR_SPARSE_ATTN` (0 turns it off), `MLXR_SPARSE_WINDOW`, `MLXR_SPARSE_MIN`,
+      `MLXR_SPARSE_SHARED`.
+  - **Against mlx-lm 0.32.2** (dense attention; it has no sparse mode), on the same machine and
+    files:
+    - Sparse decode is level at 8K on 7–14B models and 1.4–2.4× faster at 30K. Qwen3 8B at 30K runs
+      at 29.0 tok/s against 19.7; Mistral 7B at 30K at 31.5 against 22.1.
+    - Our dense decode is 3–11% behind mlx-lm on 7–14B models.
+    - Prefill is 1.4–2× slower than mlx-lm at 30K.
+    - mlx-lm's quantized KV cache reaches 65 tok/s on Qwen3 0.6B at 30K (our sparse: 103.5). It ran
+      out of GPU memory on the 7–8B models at 30K on 16 GB.
+  - **Memory.** If the index (an eighth of each full-attention layer's KV cache) does not fit, the
+    model loads with dense decode.
+  - **Coverage.** Every architecture: Qwen3, Qwen2.5, Llama, Mistral, Phi-3 and Gemma 1–4.
+    Sliding-window layers stay dense. Prefill, speculative verification and draft models stay dense.
+- **Qwen3 14B decodes long contexts 20–27% faster** (8K: 14.6 → 17.5 tok/s; 16K: 11.0 → 14.0) with
+  identical output. Its 5 query heads per KV head had no split-attention kernel, so decode used the
+  single-threadgroup kernel. G = 5 is now instantiated for head size 128, which also covers Qwen2.5
+  14B. (G = 8, for the 32B models, was left out: its split kernel was not bit-identical.)
+- **Fixes Gemma tokenization of carriage returns and long space runs.** Whole-book tokenizations now
+  match the reference (transformers) tokenizer on Gemma 1.1–4, Qwen3, Qwen2.5, Llama 3.2, Mistral
+  and Phi-3.5.
+  - **Carriage returns.** Foundation's JSON parser drops a U+FEFF that starts a string, so Gemma's
+    vocabulary entry for U+FEFF + CR replaced the one for CR. Every carriage return was encoded as
+    the wrong token, and Gemma 1.1 read CRLF text as near-nonsense.
+  - **Space runs.** BPE now merges in Hugging Face's order: one pair at a time, the lowest rank first.
+    Gemma's merge list ranks whitespace runs early, so a run of 32 or more spaces was split
+    differently.
+- **Gemma 4 raw completions start with BOS** (`mlxr run --raw`, `/v1/completions`). Its tokenizer
+  files never say to add it, and without it the model produces nonsense. A chat template that writes
+  `bos_token` now implies BOS on raw prompts, unless `add_bos_token` says otherwise. Chat was
+  unaffected.
+- **`mlxr bench` with `MLXR_BENCH_CTX`** reports, besides speed:
+  - KL divergence, text NLL and margin-bucketed top-1 agreement between sparse and dense decode,
+    over `MLXR_BENCH_POSITIONS` positions of `MLXR_BENCH_TEXT`, from each of
+    `MLXR_BENCH_TEXT_OFFSETS`;
+  - a dense control;
+  - five passkey needles;
+  - the cost of a verification pass.
+
+  `MLXR_KERNEL_TIMING=1 swift test --filter SparseTimingTests` times the sparse kernels.
+- **Tests.**
+  - Each sparse kernel against a CPU reference.
+  - Full-budget sparse decode bit-identical to dense on every architecture.
+  - The 14B cases (Qwen3 14B, Gemma 4 12B) run with `MLXR_TEST_LARGE=1`, because next to the Gemma
+    suite they do not fit a 16 GB Mac.
+
 ## 1.3.0
 
 Faster prefill, a tokenizer fix for Gemma, speculative decoding with a draft model, and cheaper 2-token verification.

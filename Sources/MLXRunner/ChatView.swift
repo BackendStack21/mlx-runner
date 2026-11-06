@@ -619,6 +619,23 @@ struct InspectorView: View {
                 Text("Context length and draft model apply the next time a model is loaded. A small model of the same family drafts tokens for the loaded one to verify: the output is unchanged.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            Section("Long context") {
+                Toggle("Sparse attention", isOn: $state.sparseAttention)
+                Picker("Long-range keys", selection: $state.sparseKeys) {
+                    ForEach(Self.sparseKeyChoices(including: state.sparseKeys), id: \.self) { Text("\($0)").tag($0) }
+                }
+                .disabled(!state.sparseAttention)
+                Picker("Key selection", selection: $state.sparsePerHead) {
+                    Text("Per KV head").tag(true)
+                    Text("Shared").tag(false)
+                }
+                .disabled(!state.sparseAttention)
+                Text(sparseCaption)
+                    .font(.caption).foregroundStyle(.secondary)
+                // Opened through SafeLinkHandling, which asks first for hosts other than huggingface.co.
+                Link("Based on Latent Sparse Attention (arXiv 2610.42147)", destination: Self.sparsePaper)
+                    .font(.caption)
+            }
             if let info = state.loadedInfo {
                 Section("Model") {
                     LabeledContent("Architecture", value: info.modelType)
@@ -627,12 +644,33 @@ struct InspectorView: View {
                     LabeledContent("Hidden size", value: "\(info.hiddenSize)")
                     LabeledContent("Context", value: "\(info.contextLength)")
                     if let d = info.draftName { LabeledContent("Draft model", value: d) }
+                    LabeledContent("Sparse attention", value: Self.sparseStatus(info))
                     LabeledContent("Prompt format", value: info.chatFormat)
                     LabeledContent("Load time", value: String(format: "%.2fs", info.loadSeconds))
                 }
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// Kubicek et al., "Latent Sparse Attention: Towards Subquadratic Ultra-Long Context Attention".
+    static let sparsePaper = URL(string: "https://arxiv.org/abs/2610.42147")!
+
+    /// Long-range key budgets offered (plus a saved value that is not one of them).
+    static func sparseKeyChoices(including current: Int) -> [Int] {
+        Array(Set([1024, 2048, 4096, 8192, current])).sorted()
+    }
+
+    private var sparseCaption: String {
+        guard let s = state.sparseConfig else {
+            return "Every token attends to the whole context. Applies the next time a model is loaded."
+        }
+        return "From \(s.minContext) tokens of context on, each new token attends to the first and latest tokens and the \(s.topK) earlier ones that score highest, not the whole context: faster at long contexts, with a small change in output. Applies the next time a model is loaded."
+    }
+
+    static func sparseStatus(_ info: LoadedModelInfo) -> String {
+        if info.sparseLayers > 0 { return "\(info.sparseLayers) of \(info.layers) layers, from \(info.sparseMinContext) tokens" }
+        return info.sparseNote.map { "Off: \($0)" } ?? "Off"
     }
 
     /// Installed models that can draft for the loaded one (same family, at most a quarter of its size).

@@ -446,6 +446,7 @@ struct AttentionKernelTests {
         Case(D: 256, window: 0, softcap: 0, nH: 8, nKV: 1),   // split attention in two sub-groups of 4 heads
         Case(D: 512, window: 0, softcap: 0), Case(D: 512, window: 9, softcap: 0),
         Case(D: 512, window: 0, softcap: 0, nH: 8, nKV: 2),   // sub-groups of 2
+        Case(D: 128, window: 0, softcap: 0, nH: 10, nKV: 2),  // 5 query heads per KV head (Qwen3 14B)
     ]
 
     /// CPU attention for queries at positions offset..<offset+T over cache rows 0...pos.
@@ -552,7 +553,8 @@ struct AttentionKernelTests {
         let q1 = (0..<(nH * D)).map { _ in rng.float() }
         let ref1 = reference(q: q1, k: k, v: v, D: D, nH: nH, nKV: nKV, maxSeq: maxSeq, offset: offset, T: 1, scale: scale, window: c.window, softcap: c.softcap)
         let sg = e >= 16 ? 8 : e >= 8 ? 16 : 32
-        assertClose(try run("attention_\(e)_\(sg)\(cap)", threads: sg * 32, grid: (nH, 1), T: 1, offset: offset, q: q1), ref1, "decode D=\(D)")
+        let decoded = try run("attention_\(e)_\(sg)\(cap)", threads: sg * 32, grid: (nH, 1), T: 1, offset: offset, q: q1)
+        assertClose(decoded, ref1, "decode D=\(D)")
         do {
             // Split decode: attention_split + attention_combine (query-head sub-groups for D >= 256).
             let G = nH / nKV, gSub = e <= 4 ? G : min(G, 2)
@@ -570,7 +572,10 @@ struct AttentionKernelTests {
                 enc.set(part, 0, 0); enc.set(out, 0, 1); enc.params(p, 2)
                 enc.dispatchThreadgroups(MTLSize(width: nH, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             }
-            assertClose(readFloats(out, nH * D), ref1, "split decode D=\(D)")
+            let splitOut = readFloats(out, nH * D)
+            assertClose(splitOut, ref1, "split decode D=\(D)")
+            // Up to head size 128 the split kernel reproduces the single-threadgroup kernel exactly.
+            if D <= 128 { #expect(splitOut.map(\.bitPattern) == decoded.map(\.bitPattern), "split vs decode D=\(D) G=\(G)") }
         }
         // Prefill: 45 queries after 10 cached positions.
         let T = 45, off = 10

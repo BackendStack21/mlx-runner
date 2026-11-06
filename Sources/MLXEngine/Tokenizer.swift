@@ -78,13 +78,18 @@ public final class Tokenizer: @unchecked Sendable {
     public var vocabularySize: Int { idToToken.count }
 
     public init(directory: URL) throws {
-        guard let data = try? Data(contentsOf: directory.appendingPathComponent("tokenizer.json")),
+        guard let raw = try? Data(contentsOf: directory.appendingPathComponent("tokenizer.json")),
+              case let (data, stand) = Self.shieldingBOM(raw),
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let model = json["model"] as? [String: Any] else {
             throw EngineError.unsupported("tokenizer.json is missing or unreadable")
         }
         guard (model["type"] as? String ?? "BPE") == "BPE", let v = model["vocab"] as? NSDictionary else {
             throw EngineError.unsupported("only BPE tokenizers are supported")
+        }
+        func unshield(_ s: String) -> String {
+            guard let stand, s.unicodeScalars.contains(stand) else { return s }
+            return String(String.UnicodeScalarView(s.unicodeScalars.map { $0 == stand ? "\u{FEFF}" : $0 }))
         }
         var maxId = 0
         vocab.reserveCapacity(v.count)
@@ -94,28 +99,28 @@ public final class Tokenizer: @unchecked Sendable {
         for (key, id) in v {
             guard let k = key as? String, let i = (id as? NSNumber)?.intValue else { throw EngineError.invalidFile("tokenizer.json: malformed vocabulary entry") }
             guard idRange.contains(i) else { throw EngineError.invalidFile("tokenizer.json: token id \(i) is out of range") }
-            vocab[ExactKey(k)] = i; maxId = max(maxId, i)
+            vocab[ExactKey(unshield(k))] = i; maxId = max(maxId, i)
         }
 
         if let merges = model["merges"] as? [Any] {
             mergeRanks.reserveCapacity(merges.count)
             for (rank, m) in merges.enumerated() {
-                if let s = m as? String {
+                if let s = (m as? String).map(unshield) {
                     if let sp = s.utf8.firstIndex(of: 0x20) {
                         mergeRanks[ExactKey(String(s[..<sp]) + "\u{0}" + String(s[s.utf8.index(after: sp)...]))] = rank
                     }
-                } else if let pair = m as? [String], pair.count == 2 {
+                } else if let pair = (m as? [String])?.map(unshield), pair.count == 2 {
                     mergeRanks[ExactKey(pair[0] + "\u{0}" + pair[1])] = rank
                 }
             }
         }
         ignoreMerges = model["ignore_merges"] as? Bool ?? false
         byteFallback = model["byte_fallback"] as? Bool ?? false
-        if let unk = model["unk_token"] as? String { unkId = vocab[ExactKey(unk)] }
+        if let unk = (model["unk_token"] as? String).map(unshield) { unkId = vocab[ExactKey(unk)] }
 
         var added: [(String, Int)] = []
         for t in (json["added_tokens"] as? [[String: Any]]) ?? [] {
-            guard let content = t["content"] as? String, let id = (t["id"] as? NSNumber)?.intValue else { continue }
+            guard let content = (t["content"] as? String).map(unshield), let id = (t["id"] as? NSNumber)?.intValue else { continue }
             guard idRange.contains(id) else { throw EngineError.invalidFile("tokenizer.json: added token id \(id) is out of range") }
             vocab[ExactKey(content)] = id
             maxId = max(maxId, id)
@@ -136,7 +141,7 @@ public final class Tokenizer: @unchecked Sendable {
             case "Sequence": for sub in (p["processors"] as? [[String: Any]]) ?? [] { visitPost(sub) }
             case "TemplateProcessing":
                 if let first = (p["single"] as? [[String: Any]])?.first, let st = first["SpecialToken"] as? [String: Any],
-                   let id = st["id"] as? String { postBos = id }
+                   let id = (st["id"] as? String).map(unshield) { postBos = id }
             default: break
             }
         }
@@ -151,8 +156,8 @@ public final class Tokenizer: @unchecked Sendable {
                 for sub in (p["pretokenizers"] as? [[String: Any]]) ?? [] { visitPre(sub) }
             case "Split":
                 if let pat = p["pattern"] as? [String: Any] {
-                    if let r = pat["Regex"] as? String { preRegex = try? NSRegularExpression(pattern: r) }
-                    else if let s = pat["String"] as? String { preRegex = try? NSRegularExpression(pattern: NSRegularExpression.escapedPattern(for: s)) }
+                    if let r = (pat["Regex"] as? String).map(unshield) { preRegex = try? NSRegularExpression(pattern: r) }
+                    else if let s = (pat["String"] as? String).map(unshield) { preRegex = try? NSRegularExpression(pattern: NSRegularExpression.escapedPattern(for: s)) }
                 }
             case "ByteLevel":
                 isByteLevel = true
@@ -191,6 +196,7 @@ public final class Tokenizer: @unchecked Sendable {
         if mode == .sentencePiece && hasSPNormalizer && !hasPrefixRule { spPrepend = false }
 
         // tokenizer_config.json: special tokens and chat template.
+        var bosSetting: Bool?   // add_bos_token, when the config states it
         if let cdata = try? Data(contentsOf: directory.appendingPathComponent("tokenizer_config.json")),
            let cfg = try? JSONSerialization.jsonObject(with: cdata) as? [String: Any] {
             func tok(_ k: String) -> String? {
@@ -199,7 +205,8 @@ public final class Tokenizer: @unchecked Sendable {
                 return nil
             }
             bosToken = tok("bos_token")
-            addBosToken = cfg["add_bos_token"] as? Bool ?? false
+            bosSetting = cfg["add_bos_token"] as? Bool
+            addBosToken = bosSetting ?? false
             eosToken = tok("eos_token")
             if let t = cfg["chat_template"] as? String { chatTemplate = t }
             else if let arr = cfg["chat_template"] as? [[String: Any]] {
@@ -221,6 +228,85 @@ public final class Tokenizer: @unchecked Sendable {
            let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
             chatTemplate = o["chat_template"] as? String
         }
+        // A chat template that writes BOS (`{{ bos_token }}`, any whitespace control) shows the model
+        // was trained with it first, unless the config says otherwise. Gemma 4's tokenizer files do
+        // not say whether to add it to raw prompts,
+        // and without it the model produces nonsense.
+        if !addBosToken, bosSetting == nil, let b = bosToken, vocab[ExactKey(b)] != nil, let t = chatTemplate, Self.templateWritesBos(t) {
+            addBosToken = true
+        }
+    }
+
+    /// JSONSerialization drops a U+FEFF that starts a string, raw or escaped, so Gemma's vocabulary
+    /// entry U+FEFF + "\r" became a second "\r" and took its id: every carriage return got the wrong
+    /// token. Every string that starts with U+FEFF (raw, or escaped in any case) gets a private-use
+    /// stand-in there instead, one the file does not use, and `stand` maps it back after parsing.
+    /// U+FEFF anywhere else (which JSONSerialization keeps) and the file's own BOM are left alone.
+    /// One pass over the bytes, tracking whether it is inside a JSON string.
+    static func shieldingBOM(_ data: Data) -> (data: Data, stand: Unicode.Scalar?) {
+        var starts: [(range: Range<Int>, escaped: Bool)] = []
+        var used = [Bool](repeating: false, count: 256)   // U+E000...U+E0FF already in the file
+        data.withUnsafeBytes { (p: UnsafeRawBufferPointer) in
+            let n = p.count
+            func hexDigit(_ b: UInt8) -> Int? {
+                switch b {
+                case 0x30...0x39: return Int(b - 0x30)
+                case 0x41...0x46: return Int(b - 0x41 + 10)
+                case 0x61...0x66: return Int(b - 0x61 + 10)
+                default: return nil
+                }
+            }
+            var inString = false, atStart = false   // atStart: the next character is the string's first
+            var i = 0
+            while i < n {
+                let b = p[i]
+                guard inString else {
+                    if b == 0x22 { inString = true; atStart = true }
+                    i += 1
+                    continue
+                }
+                if b == 0x22 { inString = false; i += 1; continue }
+                if b == 0x5C {   // an escape: \uXXXX, or two bytes (\" \\ \n ...)
+                    if i + 5 < n, p[i + 1] == 0x75, let a = hexDigit(p[i + 2]), let c = hexDigit(p[i + 3]),
+                       let d = hexDigit(p[i + 4]), let e = hexDigit(p[i + 5]) {
+                        let v = a << 12 | c << 8 | d << 4 | e
+                        if v == 0xFEFF && atStart { starts.append((i..<(i + 6), true)) }
+                        if v >> 8 == 0xE0 { used[v & 0xFF] = true }
+                        i += 6
+                    } else {
+                        i += 2
+                    }
+                    atStart = false
+                    continue
+                }
+                if b == 0xEF, i + 2 < n, p[i + 1] == 0xBB, p[i + 2] == 0xBF {
+                    if atStart { starts.append((i..<(i + 3), false)) }
+                    i += 3; atStart = false
+                    continue
+                }
+                if b == 0xEE, i + 2 < n, (0x80...0x83).contains(p[i + 1]) {   // UTF-8 of U+E000...U+E0FF
+                    used[Int(p[i + 1] - 0x80) << 6 | Int(p[i + 2] & 0x3F)] = true
+                }
+                i += 1; atStart = false
+            }
+        }
+        guard !starts.isEmpty, let free = used.firstIndex(of: false),
+              let stand = Unicode.Scalar(UInt32(0xE000 + free)) else { return (data, nil) }
+        let raw = Data(String(stand).utf8), escaped = Data(String(format: "\\u%04x", stand.value).utf8)
+        var out = Data(capacity: data.count)
+        var pos = 0
+        for s in starts {
+            out.append(data[pos..<s.range.lowerBound])
+            out.append(s.escaped ? escaped : raw)
+            pos = s.range.upperBound
+        }
+        out.append(data[pos..<data.count])
+        return (out, stand)
+    }
+
+    /// Does a Jinja chat template output `bos_token` (`{{ bos_token }}`, `{{- bos_token -}}`, ...)?
+    static func templateWritesBos(_ template: String) -> Bool {
+        template.range(of: #"\{\{-?\s*bos_token\s*-?\}\}"#, options: .regularExpression) != nil
     }
 
     public func tokenId(_ token: String) -> Int? { vocab[ExactKey(token)] }
@@ -322,36 +408,70 @@ public final class Tokenizer: @unchecked Sendable {
         return r
     }
 
-    private func bpe(_ word: String) -> [Int] {
-        if ignoreMerges, let id = vocab[ExactKey(word)] { return [id] }
-        var symbols = word.unicodeScalars.map { String($0) }
-        if symbols.count > 1 {
-            while true {
-                var bestRank = Int.max
-                var bestPair = ("", "")
-                for i in 0..<(symbols.count - 1) {
-                    if let r = mergeRanks[ExactKey(symbols[i] + "\u{0}" + symbols[i + 1])], r < bestRank {
-                        bestRank = r
-                        bestPair = (symbols[i], symbols[i + 1])
-                    }
-                }
-                if bestRank == Int.max { break }
-                var merged: [String] = []
-                merged.reserveCapacity(symbols.count)
-                var i = 0
-                while i < symbols.count {
-                    if i < symbols.count - 1 && symbols[i].utf8.elementsEqual(bestPair.0.utf8) && symbols[i + 1].utf8.elementsEqual(bestPair.1.utf8) {
-                        merged.append(bestPair.0 + bestPair.1)
-                        i += 2
-                    } else {
-                        merged.append(symbols[i])
-                        i += 1
-                    }
-                }
-                symbols = merged
-                if symbols.count == 1 { break }
+    /// BPE merges in Hugging Face's order: one merge at a time, always the adjacent pair with the
+    /// lowest rank, leftmost first, so a pair the merge creates competes at once. (Merging every
+    /// occurrence of the best pair in one pass, as GPT-2's reference code does, agrees only when the
+    /// merge list is in training order. Gemma's is not: its whitespace-run merges rank early, and
+    /// 32 spaces came out as 16 + 16 instead of 31 + one that joins the next word.) A heap keyed by
+    /// (rank, position) keeps it O(n log n) for long words.
+    static func mergePairs(_ start: [String], rank: (String, String) -> Int?) -> [String] {
+        var symbols = start
+        let n = symbols.count
+        guard n > 1 else { return symbols }
+        var next = Array(1...n), prev = Array(-1..<(n - 1)), version = [Int](repeating: 0, count: n)
+        var alive = [Bool](repeating: true, count: n)
+        struct Candidate { let rank: Int, pos: Int, right: Int, leftVersion: Int, rightVersion: Int }
+        var heap: [Candidate] = []
+        func before(_ a: Candidate, _ b: Candidate) -> Bool { a.rank != b.rank ? a.rank < b.rank : a.pos < b.pos }
+        func push(_ c: Candidate) {
+            heap.append(c)
+            var i = heap.count - 1
+            while i > 0 {
+                let p = (i - 1) / 2
+                guard before(heap[i], heap[p]) else { break }
+                heap.swapAt(i, p); i = p
             }
         }
+        func pop() -> Candidate {
+            let top = heap[0]
+            heap[0] = heap[heap.count - 1]
+            heap.removeLast()
+            var i = 0
+            while true {
+                let l = 2 * i + 1, r = l + 1
+                var m = i
+                if l < heap.count, before(heap[l], heap[m]) { m = l }
+                if r < heap.count, before(heap[r], heap[m]) { m = r }
+                if m == i { break }
+                heap.swapAt(i, m); i = m
+            }
+            return top
+        }
+        func consider(_ i: Int) {   // the pair (i, next[i])
+            let j = next[i]
+            guard i >= 0, j < n, let r = rank(symbols[i], symbols[j]) else { return }
+            push(Candidate(rank: r, pos: i, right: j, leftVersion: version[i], rightVersion: version[j]))
+        }
+        for i in 0..<(n - 1) { consider(i) }
+        while !heap.isEmpty {
+            let c = pop()
+            // Stale: either side was merged into something else since this pair was queued.
+            guard alive[c.pos], alive[c.right], next[c.pos] == c.right,
+                  version[c.pos] == c.leftVersion, version[c.right] == c.rightVersion else { continue }
+            symbols[c.pos] += symbols[c.right]
+            version[c.pos] += 1
+            alive[c.right] = false
+            next[c.pos] = next[c.right]
+            if next[c.pos] < n { prev[next[c.pos]] = c.pos }
+            if prev[c.pos] >= 0 { consider(prev[c.pos]) }
+            consider(c.pos)
+        }
+        return symbols.indices.filter { alive[$0] }.map { symbols[$0] }
+    }
+
+    private func bpe(_ word: String) -> [Int] {
+        if ignoreMerges, let id = vocab[ExactKey(word)] { return [id] }
+        let symbols = Self.mergePairs(word.unicodeScalars.map { String($0) }) { a, b in mergeRanks[ExactKey(a + "\u{0}" + b)] }
         var ids: [Int] = []
         ids.reserveCapacity(symbols.count)
         for s in symbols {

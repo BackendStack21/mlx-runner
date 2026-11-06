@@ -130,6 +130,15 @@ final class AppState {
     /// Speculative decoding draft model: "" off, "auto", or a model directory path.
     var draftModel: String = "" { didSet { saveSettings() } }
     var enableThinking: Bool = true { didSet { saveSettings() } }
+    /// Sparse decode attention for long contexts (on by default), its long-range key budget, and
+    /// whether each KV head selects its own keys or every head shares one selection.
+    var sparseAttention: Bool = true { didSet { saveSettings() } }
+    var sparseKeys: Int = SparseAttention.standard.topK { didSet { saveSettings() } }
+    var sparsePerHead: Bool = true { didSet { saveSettings() } }
+    /// The sparse attention the next load uses (nil: dense decode).
+    var sparseConfig: SparseAttention? {
+        sparseAttention ? SparseAttention(topK: sparseKeys, perHead: sparsePerHead) : nil
+    }
     var lastModelPath: String? { didSet { saveSettings() } }
 
     @ObservationIgnored private var activeDownloads: [String: ModelDownload] = [:]
@@ -195,6 +204,7 @@ final class AppState {
         loadState = .loading(model.name)
         let ctx = contextLength
         let draftSetting = draftModel
+        let sparse = sparseConfig
         let models = localModels
         Task {
             do {
@@ -212,7 +222,7 @@ final class AppState {
                         return d.directory
                     }
                 }.value
-                let info = try await engine.load(directory: model.directory, draftDirectory: draft, contextLength: ctx)
+                let info = try await engine.load(directory: model.directory, draftDirectory: draft, contextLength: ctx, sparse: sparse)
                 loadState = .loaded(info)
                 lastModelPath = model.directory.path
             } catch {
@@ -518,6 +528,9 @@ final class AppState {
         contextLength = d.object(forKey: "contextLength") as? Int ?? 8192
         draftModel = d.string(forKey: "draftModel") ?? ""
         enableThinking = d.object(forKey: "enableThinking") as? Bool ?? true
+        sparseAttention = d.object(forKey: "sparseAttention") as? Bool ?? true
+        sparseKeys = d.object(forKey: "sparseKeys") as? Int ?? SparseAttention.standard.topK
+        sparsePerHead = d.object(forKey: "sparsePerHead") as? Bool ?? true
         lastModelPath = d.string(forKey: "lastModelPath")
     }
 
@@ -529,6 +542,9 @@ final class AppState {
         d.set(contextLength, forKey: "contextLength")
         d.set(draftModel, forKey: "draftModel")
         d.set(enableThinking, forKey: "enableThinking")
+        d.set(sparseAttention, forKey: "sparseAttention")
+        d.set(sparseKeys, forKey: "sparseKeys")
+        d.set(sparsePerHead, forKey: "sparsePerHead")
         d.set(lastModelPath, forKey: "lastModelPath")
     }
 }

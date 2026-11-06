@@ -61,7 +61,7 @@ gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx
 - Qwen3 thinking mode: reasoning appears in a collapsible "Thought for N s" block, and a toggle turns it off.
 - Live tok/s while generating. Each reply also shows tok/s, token count and time to first token.
 - Edit and resend, regenerate, copy, a per-chat system prompt, and searchable, persistent chat history.
-- An inspector panel for temperature, top-p, top-k, min-p, repeat penalty, max tokens and context length.
+- An inspector panel for temperature, top-p, top-k, min-p, repeat penalty, max tokens, context length, draft model and long-context sparse attention.
 
 **Local Server**
 - OpenAI-compatible: the Responses API (`POST /v1/responses`, with typed streaming events), Chat Completions (`developer` role, content parts, `max_completion_tokens`, `stream_options.include_usage`), legacy Completions, and `/v1/models`.
@@ -103,8 +103,10 @@ Each checkpoint above passes end-to-end generation and the prefill-versus-decode
 - **Unsupported model types:** mixture-of-experts (Mixtral, Qwen3-MoE, Gemma 4 26B-A4B), Gemma 3n, and the vision and audio parts of multimodal models (Gemma 3 and Gemma 4 exports run as text-only). Discover marks unsupported types as not runnable.
 - **Gemma:** no tool calling and no Gemma 4 thinking mode (Gemma 4 runs with thinking off, its template's default). Sliding-window layers keep a ring of window + 512 K/V rows, so a chat whose shared prefix with the previous request ends more than 512 tokens before that request's end is processed from the start instead of reusing the cache.
 - **Chat templates:** the prompt format is detected (ChatML, Llama 3, Mistral, Phi-3, Gemma, Gemma 4) rather than executed as Jinja, so a model with an unusual template may get a near-match format.
-- **Prefill speed:** about 247 tok/s on a 7B model on an M2 Pro, against about 305 for mlx-lm on the same files. The 64×64 GEMM tile measures about 3.5 TFLOPS. Prompts shorter than about 128 tokens use the 32×32 tile and are further behind mlx-lm.
+- **Prefill speed:** about 247 tok/s on a 7B model on an M2 Pro, against about 305 for mlx-lm on the same files. The 64×64 GEMM tile measures about 3.5 TFLOPS. Prompts shorter than about 128 tokens use the 32×32 tile and are further behind mlx-lm. Long prompts fall further behind, because prefill attention grows with the prompt: at 30K tokens mlx-lm prefills 1.4–2× faster (Mistral 7B: 107 against 202 tok/s, so 280 s against 149 s for the prompt). See [docs/sparse-decode-attention.md](docs/sparse-decode-attention.md#against-mlx-lm).
+- **Long-context decode against mlx-lm:** with sparse attention (the default) decode is level with mlx-lm at 8K on 7–14B models and 1.4–2.4× faster at 30K. Dense decode (`--sparse off`) is 3–11% behind mlx-lm on 7–14B models.
 - **Speculative decoding is opt-in and, for now, slower.** Prompt lookup (`mlxr run --spec`) and a draft model (`mlxr run --draft <model|auto>`, or the app's "Draft model" setting) both verify exactly, so greedy output is identical to a plain run. But verifying 3–8 drafted tokens costs about three decode steps on this GPU (the batched kernel is ALU-bound, see CHANGELOG 1.3.0), verifying 2 costs about 1.5, and Qwen3 0.6B's drafts for Qwen3 8B are accepted about 45% of the time on chat text: Qwen3 8B generates at 28 tok/s with the draft instead of 38. Both stay off by default until the verify kernel pays for them.
+- **Sparse decode attention changes output at long contexts.** It is on by default from 5,128 tokens of context, where each new token attends to the first and latest tokens and the 2,048 earlier ones that score highest. That makes decode 1.4–3× faster at 30K, but greedy output is no longer identical to dense decode: perplexity on real text rises by at most about 3% on every model measured except Gemma 4 E2B (+8% at 30K) and Gemma 1.1 (+3.6% at 7K). Turn it off in the inspector's Long context section, with `--sparse off`, or with `MLXR_SPARSE_ATTN=0`. See [docs/sparse-decode-attention.md](docs/sparse-decode-attention.md).
 - **Glass effects:** set `MLXRUNNER_NO_GLASS=1` to use plain materials instead of Liquid Glass.
 
 ## Performance
@@ -167,6 +169,8 @@ mlxr serve mlx-community/Qwen3-4B-4bit --port 1234     # OpenAI-compatible serve
 mlxr run mlx-community/Qwen3-8B-4bit --draft mlx-community/Qwen3-0.6B-4bit   # speculative decoding (or --draft auto)
 mlxr bench mlx-community/Qwen3-4B-4bit      # prefill/decode throughput, verification cost at short and 1,900-token contexts, kernel profile (MLXR_BENCH_NOPROFILE=1 skips it)
 mlxr tokenize <model> "some text"
+MLXR_BENCH_CTX=8192,30000 MLXR_BENCH_TEXT=book.txt mlxr bench <model>   # adds dense vs sparse decode after long prompts, with agreement on the text
+mlxr run <model> --sparse off   # sparse decode attention is on from 5,128 tokens of context; off, on or a key budget (N)
 ```
 
 ## Architecture
@@ -177,6 +181,7 @@ Sources/
     Kernels.swift       Metal shader source, compiled at runtime
     GPU.swift           Device and pipelines; safetensors loader (one aligned copy per shard)
     Transformer.swift   Model graph: one command buffer per step, fused kernels
+    SparseAttention.swift  Sparse decode attention for long contexts (on by default; docs/sparse-decode-attention.md)
     Tokenizer.swift     BPE from tokenizer.json (byte-level and SentencePiece)
     ChatTemplate.swift  ChatML / Llama 3 / Mistral / Phi-3 prompt formats
     Engine.swift        Generation loop, pipelined decode, KV-prefix reuse, cancellation, context fitting
@@ -194,7 +199,8 @@ How the engine works:
   - q/k/v and gate/up are each one fused quantized matvec over several weight matrices, with bias folded in.
   - Per-head RMSNorm, RoPE and the KV-cache append run as a single kernel.
   - The residual add is fused with the next RMSNorm.
-  - Attention uses online softmax across 16 to 32 simdgroups.
+  - Attention uses online softmax across 16 to 32 simdgroups; long contexts split it across threadgroups.
+  - From 5,128 tokens of context, full-attention layers attend sparsely: each KV head scores 4-key blocks by their mean key and attends to the sink, the 2,048 best long-range keys and a 512-key window ([docs/sparse-decode-attention.md](docs/sparse-decode-attention.md)).
   - The token is selected on the GPU at the end of the same command buffer (repetition penalty, exact top-k, min-p, top-p, one seeded draw) and written to a token-history buffer that the next step's embedding lookup reads. The next step is therefore committed before the current one is read back, and the GPU never waits for sampling or detokenization.
 - **Prefill:**
   - Quantized GEMMs on `simdgroup_matrix` tiles; each weight tile is dequantized once and shared by 32 tokens.
@@ -211,6 +217,7 @@ How the engine works:
 - Tokenizer known ids and Unicode round-trips; chat templates; sampler behavior (greedy, repetition penalty, top-k, top-p, seeding); the safetensors loader, including misaligned tensors.
 - On real models:
   - Prefill and token-by-token decode produce the same next-token distribution, for all five architectures.
+  - Sparse decode attention with a budget covering the whole context is bit-identical to dense decode on every architecture, and each sparse kernel is checked against a CPU reference.
   - KV-cache reuse works on follow-up turns.
   - Long conversations are trimmed to fit.
   - Cancelling one request leaves others untouched.

@@ -56,6 +56,13 @@ public struct LoadedModelInfo: Sendable, Hashable {
     public let loadSeconds: Double
     /// The chat template defines native tool calling.
     public var supportsTools: Bool = false
+    /// Layers that decode with sparse attention from `sparseMinContext` tokens on (0: dense decode).
+    public var sparseLayers: Int = 0
+    /// Long-range keys per sparse decode step, and the context length where sparse decode starts.
+    public var sparseTopK: Int = 0
+    public var sparseMinContext: Int = 0
+    /// Why sparse attention is off although it was asked for (nil when it is on or was not asked for).
+    public var sparseNote: String? = nil
     /// The draft model used for speculative decoding (nil = none).
     public var draftName: String? = nil
 }
@@ -238,7 +245,10 @@ public final class InferenceEngine: @unchecked Sendable {
 
     /// Loads a model. `draftDirectory`: a small model with the same tokenizer that drafts tokens for
     /// speculative decoding (see `checkDraftCompatible`); the output is unchanged.
-    public func load(directory: URL, draftDirectory: URL? = nil, contextLength: Int = 8192) async throws -> LoadedModelInfo {
+    /// `sparse`: sparse decode attention for long contexts (on by default; nil for dense decode).
+    /// When its index would not fit in memory the model loads with dense decode instead.
+    public func load(directory: URL, draftDirectory: URL? = nil, contextLength: Int = 8192,
+                     sparse requested: SparseAttention? = SparseAttention.fromEnvironment) async throws -> LoadedModelInfo {
         try await withCheckedThrowingContinuation { cont in
             queue.async {
                 do {
@@ -258,14 +268,25 @@ public final class InferenceEngine: @unchecked Sendable {
                     if draftDirectory != nil, let bits = try ModelConfig(directory: directory).bits, bits != 4 {
                         throw EngineError.unsupported("\(directory.lastPathComponent) is \(bits)-bit: batched verification needs 4-bit weights, so a draft model cannot help")
                     }
-                    try Self.checkMemory(directories: [directory] + (draftDirectory.map { [$0] } ?? []), contextLength: contextLength)
-                    let model = try Transformer(directory: directory, contextLength: contextLength)
+                    let dirs = [directory] + (draftDirectory.map { [$0] } ?? [])
+                    var sparse = requested
+                    var sparseNote: String?
+                    do {
+                        try Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: sparse)
+                    } catch where sparse != nil {
+                        // Without the index? (Dense decode not fitting either throws the usual error.)
+                        try Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: nil)
+                        sparse = nil
+                        sparseNote = "its index does not fit in memory at this context length"
+                    }
+                    let model = try Transformer(directory: directory, contextLength: contextLength, sparse: sparse)
+                    if sparse != nil, !model.sparseAvailable { sparseNote = model.sparseOffReason ?? "unavailable" }
                     var draft: Transformer?
                     if let draftDirectory {
                         guard model.supportsBatchedVerify else {
                             throw EngineError.unsupported("\(directory.lastPathComponent) has no batched verify kernels (4-bit weights are required), so a draft model cannot help")
                         }
-                        let d = try Transformer(directory: draftDirectory, contextLength: model.maxSeq)
+                        let d = try Transformer(directory: draftDirectory, contextLength: model.maxSeq, sparse: nil)   // drafts stay dense
                         guard d.vocabSize >= min(model.vocabSize, tok.vocabularySize) else {
                             throw EngineError.unsupported("draft model \(draftDirectory.lastPathComponent) has a smaller vocabulary than \(directory.lastPathComponent)")
                         }
@@ -291,7 +312,11 @@ public final class InferenceEngine: @unchecked Sendable {
                         parameterBytes: model.weightBytes, contextLength: model.maxSeq,
                         layers: model.config.numLayers, hiddenSize: model.config.hiddenSize,
                         chatFormat: tpl.format.rawValue, supportsThinking: tpl.supportsThinkingToggle,
-                        loadSeconds: Date().timeIntervalSince(start), supportsTools: tpl.supportsTools, draftName: draftDirectory?.lastPathComponent)
+                        loadSeconds: Date().timeIntervalSince(start), supportsTools: tpl.supportsTools,
+                        sparseLayers: model.sparseAvailable ? model.sparseLayerCount : 0,
+                        sparseTopK: model.sparseAvailable ? sparse?.topK ?? 0 : 0,
+                        sparseMinContext: model.sparseAvailable ? sparse?.minContext ?? 0 : 0,
+                        sparseNote: sparseNote, draftName: draftDirectory?.lastPathComponent)
                     self.info = info
                     cont.resume(returning: info)
                 } catch {
@@ -347,7 +372,7 @@ public final class InferenceEngine: @unchecked Sendable {
                          token: CancelToken = CancelToken()) -> AsyncThrowingStream<GenerationEvent, Error> {
         stream(token, parameters: parameters) { tok, _ in
             var ids = tok.encode(prompt)
-            // Models such as Llama and Mistral expect BOS on raw prompts (add_bos_token).
+            // Models such as Llama, Mistral and Gemma expect BOS on raw prompts (`Tokenizer.addBosToken`).
             if tok.addBosToken, let b = tok.bosToken, let id = tok.tokenId(b), ids.first != id { ids.insert(id, at: 0) }
             return ids
         }
@@ -477,6 +502,12 @@ public final class InferenceEngine: @unchecked Sendable {
         // Plain decoding selects tokens on the GPU, so each step is queued before the previous one
         // is read back and the GPU never waits for sampling or detokenisation.
         let gpuSampling = !speculative && !nameOpen
+        // Speculative decoding runs dense throughout: its verification passes are dense, so every
+        // step (and every prepared buffer) is too, and its output does not depend on which drafts
+        // were accepted or how much of the prompt was cached.
+        let modelSparse = model.sparse
+        if speculative { model.sparse = nil }
+        defer { if speculative { model.sparse = modelSparse } }
         let gpuParams = SampleParams(parameters, vocab: count)
 
         cachedTokens = Array(tokens[0..<common])
@@ -499,7 +530,8 @@ public final class InferenceEngine: @unchecked Sendable {
                 model.seedSampler(seed)
                 firstToken = try model.prefill(prompt, offset: common, sample: gpuParams, isCancelled: { token.isCancelled })
             } else {
-                logits = try model.forward(prompt, offset: common, isCancelled: { token.isCancelled })
+                // A prompt is a prefill: dense even when only its last token is new.
+                logits = try model.forward(prompt, offset: common, dense: true, isCancelled: { token.isCancelled })
             }
             // The draft model catches up on the prompt lazily (`proposeFromModel`, after the first
             // token is out), so the time to first token stays the target's own.
@@ -724,7 +756,7 @@ extension InferenceEngine {
     }
 
     /// Weights + KV cache + scratch of one model at a context length (and the context it gets).
-    static func memoryNeed(directory: URL, contextLength: Int) throws -> (bytes: Int, context: Int) {
+    static func memoryNeed(directory: URL, contextLength: Int, sparse: SparseAttention? = SparseAttention.fromEnvironment) throws -> (bytes: Int, context: Int) {
         let fm = FileManager.default
         var weights = 0
         for f in (try? WeightStore.shardFiles(in: directory)) ?? [] {
@@ -733,16 +765,21 @@ extension InferenceEngine {
         }
         let cfg = try ModelConfig(directory: directory)
         let ctx = min(contextLength, max(cfg.maxPositionEmbeddings, 256))
-        return (weights + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg), ctx)
+        // Sparse decode attention (on by default) adds its index when the context can reach its
+        // minimum context (`Transformer.init` allocates nothing otherwise).
+        let index = sparse.map { ctx >= $0.minContext } == true ? Transformer.sparseBytes(config: cfg, context: ctx) : 0
+        return (weights + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg) + index, ctx)
     }
 
     /// Refuses to load models (a target and its draft) whose weights plus KV caches would not fit
     /// in GPU-addressable memory together.
-    static func checkMemory(directories: [URL], contextLength: Int, budget: UInt64 = GPU.shared.device.recommendedMaxWorkingSetSize) throws {
+    static func checkMemory(directories: [URL], contextLength: Int, sparse: SparseAttention? = SparseAttention.fromEnvironment,
+                            budget: UInt64 = GPU.shared.device.recommendedMaxWorkingSetSize) throws {
         var need: UInt64 = 0
         var ctx = contextLength
         for (i, d) in directories.enumerated() {
-            let n = try memoryNeed(directory: d, contextLength: contextLength)
+            // Only the target loads with sparse attention (the draft is created with `sparse: nil`).
+            let n = try memoryNeed(directory: d, contextLength: contextLength, sparse: i == 0 ? sparse : nil)
             need += UInt64(n.bytes)
             if i == 0 { ctx = n.context }
         }

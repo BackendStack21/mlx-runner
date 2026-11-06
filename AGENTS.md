@@ -12,7 +12,13 @@ How to work on MLX Runner (a native macOS app by 21no.de).
   benchmarking.
 - **Correctness gates:** `swift test` passes; greedy output stays token-identical; prefill matches
   incremental decode for every architecture (`prefillMatchesIncrementalDecode`). Model tests run when the
-  model is installed (`mlxr download <repo>`), otherwise they skip.
+  model is installed (`mlxr download <repo>`), otherwise they skip. The 14B cases need
+  `MLXR_TEST_LARGE=1` (with the Gemma suite they do not fit 16 GB).
+- **One deliberate exception: sparse decode attention**, on by default from 5,128 tokens of context,
+  changes output past that point. Every other path stays token-identical, and so does sparse decode
+  with a budget covering the whole context (`sparseDecodeWithFullBudgetIsBitIdentical`). Check a change
+  to it with the long-context bench (`MLXR_BENCH_CTX` with `MLXR_BENCH_TEXT`: KL, text NLL, agreement);
+  `MLXR_SPARSE_ATTN=0` turns it off. See docs/sparse-decode-attention.md.
 - **Untrusted input:** anything read from a model directory, the network or the local server is
   validated before use. MLXEngine builds with `-Ounchecked`, so overflow and bounds traps are not a
   safety net: check sizes explicitly.

@@ -140,6 +140,26 @@ struct GemmaModelTests {
     static let installed = [gemma1, gemma2, gemma3, gemma3Multimodal, gemma4, gemma4Unified].filter { installedModel($0) != nil }
     static let installedTokenizers = [gemma2, gemma3, gemma4].filter { installedModel($0) != nil }
 
+    /// Raw prompts (`InferenceEngine.complete`, the bench) start with BOS on every model whose chat
+    /// template writes it, including Gemma 4, whose tokenizer files do not say so; Qwen3 and
+    /// Phi-3.5 have none in their templates.
+    @Test(arguments: [gemma1, gemma2, gemma3, gemma4, ModelTests.llama, ModelTests.mistral, ModelTests.qwen3, ModelTests.phi])
+    func rawPromptsStartWithBosWhereTheTemplateWritesIt(repo: String) throws {
+        guard let dir = installedModel(repo) else { return }
+        let tok = try Tokenizer(directory: dir)
+        let expectsBos = ![ModelTests.qwen3, ModelTests.phi].contains(repo)
+        #expect(tok.addBosToken == expectsBos, "\(repo)")
+    }
+
+    @Test func templateBosDetection() {
+        for t in ["{{ bos_token }}<start_of_turn>", "{{- bos_token -}}", "{{bos_token}}", "{%- set x = 1 %}\n{{- bos_token }}"] {
+            #expect(Tokenizer.templateWritesBos(t), "\(t)")
+        }
+        for t in ["{% if bos_token %}x{% endif %}", "{{ eos_token }}", "bos_token", "<|im_start|>"] {
+            #expect(!Tokenizer.templateWritesBos(t), "\(t)")
+        }
+    }
+
     /// Ids from transformers' tokenizer for the same files.
     @Test(arguments: installedTokenizers)
     func tokenizerKnownIdsAndRoundTrip(repo: String) throws {

@@ -14,6 +14,15 @@ struct ModelTests {
     static let llama = "mlx-community/Llama-3.2-1B-Instruct-4bit"
     static let phi = "mlx-community/Phi-3.5-mini-instruct-4bit"
     static let mistral = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
+    /// 5 query heads per KV head (the split and sparse kernels with G = 5). 8.3 GB: it runs only with
+    /// MLXR_TEST_LARGE=1, since next to the Gemma suite it does not fit a 16 GB Mac.
+    static let qwen3_14b = "lmstudio-community/Qwen3-14B-MLX-4bit"
+    static let large = ProcessInfo.processInfo.environment["MLXR_TEST_LARGE"] == "1" ? [qwen3_14b] : []
+    static let qwen25 = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+    /// Every architecture: sparse attention runs on each one's full-attention layers.
+    static let allArchitectures = [qwen3, llama, phi, mistral, qwen25, GemmaModelTests.gemma1, GemmaModelTests.gemma2,
+                                   GemmaModelTests.gemma3, GemmaModelTests.gemma4] + large
+        + (ProcessInfo.processInfo.environment["MLXR_TEST_LARGE"] == "1" ? [GemmaModelTests.gemma4Unified] : [])
 
     @Test(.enabled(if: installedModel(qwen3) != nil))
     func qwenTokenizerKnownIdsAndRoundTrip() throws {
@@ -34,7 +43,7 @@ struct ModelTests {
 
     /// Prefill (GEMM + flash attention) and token-by-token decode (matvec + decode attention)
     /// must produce the same next-token distribution.
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral])
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral] + large)
     func prefillMatchesIncrementalDecode(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let model = try Transformer(directory: dir, contextLength: 1024)
@@ -81,7 +90,7 @@ struct ModelTests {
 
     /// The long-context split decode attention (attention_split + attention_combine) must give
     /// bit-identical logits to the single-kernel decode attention, at long and short contexts.
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral])
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral] + large)
     func splitDecodeAttentionIsBitIdentical(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let model = try Transformer(directory: dir, contextLength: 1024)
@@ -99,6 +108,56 @@ struct ModelTests {
             #expect(ref == split, "split decode attention differs at offset \(offset)")
         }
         model.attnSplitMinContext = Transformer.defaultSplitMinContext
+    }
+
+    /// Sparse decode with a budget that covers the whole context selects every position in order,
+    /// so it must reproduce split decode bit for bit: the index, the scores, the selection and the
+    /// sparse kernel end to end. (A real budget changes outputs; `mlxr bench` with MLXR_BENCH_CTX
+    /// measures by how much.)
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: allArchitectures)
+    func sparseDecodeWithFullBudgetIsBitIdentical(repo: String) throws {
+        guard let dir = installedModel(repo) else { return }
+        let full = SparseAttention(topK: 1 << 20, window: 16, sink: 4, minContext: 1)
+        let model = try Transformer(directory: dir, contextLength: 1024, sparse: full)
+        #expect(model.sparseAvailable)
+        let tok = try Tokenizer(directory: dir)
+        var ids = tok.encode(String(repeating: "The quick brown fox jumps over the lazy dog, then it ran into the forest. ", count: 30)).map { Int32($0) }
+        ids = Array(ids.prefix(450))
+        #expect(ids.count > 300)
+        let V = model.vocabSize
+        _ = try model.forward(Array(ids.dropLast()), offset: 0)
+        model.attnSplitMinContext = 1   // dense decode through attention_split, which the sparse kernel mirrors
+        defer { model.attnSplitMinContext = Transformer.defaultSplitMinContext }
+        for offset in [ids.count - 1, 300, 64] {
+            model.sparse = nil
+            let dense = Array(UnsafeBufferPointer(start: try model.forward([ids[offset]], offset: offset), count: V))
+            for perHead in [true, false] {   // one selection per KV head, or one shared
+                var mode = full
+                mode.perHead = perHead
+                model.sparse = mode
+                let before = model.sparseLayerSteps
+                let sparse = Array(UnsafeBufferPointer(start: try model.forward([ids[offset]], offset: offset), count: V))
+                #expect(model.sparseLayerSteps > before, "sparse attention did not run at offset \(offset)")
+                #expect(dense == sparse, "sparse decode (perHead \(perHead)) with a full budget differs at offset \(offset)")
+            }
+        }
+    }
+
+    /// With a real budget sparse decode changes outputs, but below its minimum context it must not
+    /// run at all, and a model loaded without it allocates nothing.
+    @Test(.enabled(if: installedModel(qwen3) != nil))
+    func sparseDecodeStaysDenseBelowItsMinimumContext() throws {
+        let dir = installedModel(Self.qwen3)!
+        let model = try Transformer(directory: dir, contextLength: 1024, sparse: SparseAttention(topK: 64, window: 64, minContext: 400))
+        #expect(model.sparseAvailable)
+        let tok = try Tokenizer(directory: dir)
+        let ids = Array(tok.encode(String(repeating: "Sparse attention keeps the sink, the window and the best blocks. ", count: 40)).map { Int32($0) }.prefix(390))
+        #expect(ids.count == 390)
+        _ = try model.forward(Array(ids.dropLast()), offset: 0)
+        _ = try model.forward([ids.last!], offset: ids.count - 1)
+        #expect(model.sparseLayerSteps == 0)
+        let plain = try Transformer(directory: dir, contextLength: 1024, sparse: nil)
+        #expect(!plain.sparseAvailable)
     }
 
     /// A speculative verification batch (T = 2...8: qmvt4 / qmvx4 and per-token decode or split
