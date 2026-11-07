@@ -107,6 +107,46 @@ final class Linear {
         }
     }
 
+    /// Reorders the output rows in place: row r becomes the old row perm[r] (the weight, its
+    /// quantization scales and biases, and a bias). Rows are independent, so the layer computes the
+    /// same outputs in the new order. `perm` must be a permutation of 0..<outDim.
+    func permuteRows(_ perm: [Int]) throws {
+        guard perm.count == outDim, Set(perm).count == outDim, perm.allSatisfy({ (0..<outDim).contains($0) }) else {
+            throw EngineError.invalidOutput("bad row permutation")
+        }
+        for t in [weight, scales, biases, bias].compactMap({ $0 }) {
+            guard t.shape.first == outDim, t.offset >= 0, t.nbytes <= t.buffer.length - t.offset else { throw EngineError.invalidFile("\(description): tensor outside its file") }
+            let rowBytes = t.nbytes / outDim
+            let p = t.buffer.contents() + t.offset
+            let old = Data(bytes: p, count: t.nbytes)
+            old.withUnsafeBytes { src in
+                for (r, from) in perm.enumerated() { (p + r * rowBytes).copyMemory(from: src.baseAddress! + from * rowBytes, byteCount: rowBytes) }
+            }
+        }
+    }
+
+    /// One layer computing [a | b] (b's rows after a's), when both are stored alike; nil otherwise.
+    /// The tensors are copied into new buffers (meant for small projections).
+    static func concatRows(_ a: Linear, _ b: Linear, name: String) throws -> Linear? {
+        guard a.inDim == b.inDim, a.bias == nil, b.bias == nil, a.weight.dtype == b.weight.dtype,
+              a.weight.shape.count == 2, a.weight.shape[1] == b.weight.shape[1],
+              (a.scales == nil) == (b.scales == nil), a.scales?.dtype == b.scales?.dtype,
+              a.scales?.shape.last == b.scales?.shape.last, a.biases?.dtype == b.biases?.dtype else { return nil }
+        func cat(_ x: Tensor, _ y: Tensor) throws -> Tensor {
+            guard x.offset >= 0, y.offset >= 0, x.nbytes <= x.buffer.length - x.offset, y.nbytes <= y.buffer.length - y.offset else {
+                throw EngineError.invalidFile("\(name): tensor outside its file")
+            }
+            let buf = try GPU.shared.buffer(x.nbytes + y.nbytes)
+            buf.contents().copyMemory(from: x.buffer.contents() + x.offset, byteCount: x.nbytes)
+            (buf.contents() + x.nbytes).copyMemory(from: y.buffer.contents() + y.offset, byteCount: y.nbytes)
+            return Tensor(buffer: buf, offset: 0, dtype: x.dtype, shape: [x.shape[0] + y.shape[0]] + Array(x.shape.dropFirst()))
+        }
+        var s: Tensor?, q: Tensor?
+        if let sa = a.scales, let sb = b.scales, let ba = a.biases, let bb = b.biases { s = try cat(sa, sb); q = try cat(ba, bb) }
+        return try Linear(weight: try cat(a.weight, b.weight), scales: s, biases: q, bias: nil, inDim: a.inDim,
+                          outDim: a.outDim + b.outDim, name: name)
+    }
+
     /// Can these layers be computed by one fused decode dispatch?
     static func fusable(_ parts: [Linear]) -> Bool {
         guard let f = parts.first, parts.count <= 3, let s0 = f.scales else { return false }
@@ -299,8 +339,70 @@ final class RMSNorm {
     }
 }
 
+/// The token mixer of a Qwen 3.5 linear-attention layer (see the `gdn_*` kernels): input projections
+/// laid out [q | k | v | z | b | a] per token, the causal convolution, the recurrent state and the
+/// gated output norm. Its output projection is the layer's `o`.
+final class GatedDeltaNet {
+    let dims: ModelConfig.LinearAttention
+    /// [in_proj_qkv, in_proj_z, in_proj_b ‖ in_proj_a], or with b and a apart when they cannot be merged.
+    let proj: [Linear]
+    let projFusable: Bool
+    /// Floats per token row of the projection buffer (projCols rounded up to whole float4s).
+    let stride: Int
+    let convW: MTLBuffer     // [convDim] float4: the taps, right-aligned (w.w multiplies the current input)
+    let negA: MTLBuffer      // [Hv] f32: -exp(A_log)
+    let dtBias: MTLBuffer    // [Hv] f32
+    let normW: MTLBuffer     // [Dv] f32
+    let ring: MTLBuffer      // [4][convDim] f32: convolution inputs by position mod 4
+    let state: MTLBuffer     // [Hv][Dv][Dk] f32
+
+    static func stride(_ d: ModelConfig.LinearAttention) -> Int { (d.projCols + 3) / 4 * 4 }
+
+    init(_ s: WeightStore, _ p: String, _ c: ModelConfig, _ d: ModelConfig.LinearAttention) throws {
+        let gpu = GPU.shared, H = c.hiddenSize
+        func bad(_ what: String) -> EngineError { .invalidFile("\(p): \(what)") }
+        dims = d
+        stride = Self.stride(d)
+        let qkv = try Linear(s, "\(p).in_proj_qkv", inDim: H, outDim: d.convDim)
+        let z = try Linear(s, "\(p).in_proj_z", inDim: H, outDim: d.valueDim)
+        let b = try Linear(s, "\(p).in_proj_b", inDim: H, outDim: d.numValueHeads)
+        let a = try Linear(s, "\(p).in_proj_a", inDim: H, outDim: d.numValueHeads)
+        if let ba = try Linear.concatRows(b, a, name: "\(p).in_proj_ba") { proj = [qkv, z, ba] } else { proj = [qkv, z, b, a] }
+        projFusable = proj.count == 3 && Linear.fusable(proj)
+
+        // Convolution taps: [convDim, K, 1] (MLX) or [convDim, 1, K] (Hugging Face): the same memory.
+        let w = try s.require("\(p).conv1d.weight")
+        let K = d.convKernel
+        guard w.shape.count == 3, w.shape[0] == d.convDim, w.count == d.convDim * K else { throw bad("conv1d.weight shape \(w.shape)") }
+        let taps = try w.floats()
+        var w4 = [Float](repeating: 0, count: 4 * d.convDim)
+        for ch in 0..<d.convDim { for j in 0..<K { w4[4 * ch + 4 - K + j] = taps[ch * K + j] } }
+        func f32(_ v: [Float]) throws -> MTLBuffer {
+            let buf = try gpu.buffer(v.count * 4)
+            v.withUnsafeBytes { buf.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+            return buf
+        }
+        convW = try f32(w4)
+        let Hv = d.numValueHeads
+        func vector(_ name: String, _ n: Int) throws -> [Float] {
+            let t = try s.require("\(p).\(name)")
+            guard t.count == n, t.shape.filter({ $0 != 1 }).count <= 1 else { throw bad("\(name) shape \(t.shape)") }
+            let v = try t.floats()
+            guard v.allSatisfy(\.isFinite) else { throw bad("\(name) is not finite") }
+            return v
+        }
+        negA = try f32(try vector("A_log", Hv).map { -exp($0) })
+        dtBias = try f32(try vector("dt_bias", Hv))
+        normW = try f32(try vector("norm.weight", d.valueHeadDim))
+        ring = try gpu.buffer(ModelConfig.LinearAttention.convRing * d.convDim * 4)
+        state = try gpu.buffer(Hv * d.valueHeadDim * d.keyHeadDim * 4)
+    }
+}
+
 final class TransformerLayer {
     let spec: ModelConfig.LayerSpec
+    /// Qwen 3.5 linear-attention layers (no q/k/v projections, KV cache or attention).
+    let gdn: GatedDeltaNet?
     let qkvFusable: Bool
     let gateUpFusable: Bool
     let qkvPostPSO: MTLComputePipelineState
@@ -351,19 +453,42 @@ final class TransformerLayer {
             attnOutNorm = nil
             mlpOutNorm = nil
         }
-        qNorm = s.has("\(p).self_attn.q_norm.weight") ? try RMSNorm(s, "\(p).self_attn.q_norm.weight", eps: eps, dim: D, offset: off) : nil
-        kNorm = spec.hasOwnKV && s.has("\(p).self_attn.k_norm.weight") ? try RMSNorm(s, "\(p).self_attn.k_norm.weight", eps: eps, dim: D, offset: off) : nil
-        if spec.hasOwnKV, (qNorm == nil) != (kNorm == nil) { throw EngineError.invalidFile("\(p): q_norm and k_norm must come together") }
-        qkvCols = (c.numHeads + 2 * nKV) * D
-        if !spec.hasOwnKV {
-            qkv = [try Linear(s, "\(p).self_attn.q_proj", inDim: H, outDim: c.numHeads * D)]
-        } else if s.has("\(p).self_attn.qkv_proj.weight") {
-            qkv = [try Linear(s, "\(p).self_attn.qkv_proj", inDim: H, outDim: qkvCols)]
+        if spec.linear {
+            guard let d = c.linearAttention else { throw EngineError.invalidFile("\(p): linear attention without its dimensions") }
+            let g = try GatedDeltaNet(s, "\(p).linear_attn", c, d)
+            gdn = g
+            qNorm = nil
+            kNorm = nil
+            qkvCols = g.stride
+            qkv = []
+            o = try Linear(s, "\(p).linear_attn.out_proj", inDim: d.valueDim, outDim: H)
         } else {
-            let parts = spec.kEqV ? [("q_proj", c.numHeads), ("k_proj", nKV)] : [("q_proj", c.numHeads), ("k_proj", nKV), ("v_proj", nKV)]
-            qkv = try parts.map { try Linear(s, "\(p).self_attn.\($0.0)", inDim: H, outDim: $0.1 * D) }
+            gdn = nil
+            qNorm = s.has("\(p).self_attn.q_norm.weight") ? try RMSNorm(s, "\(p).self_attn.q_norm.weight", eps: eps, dim: D, offset: off) : nil
+            kNorm = spec.hasOwnKV && s.has("\(p).self_attn.k_norm.weight") ? try RMSNorm(s, "\(p).self_attn.k_norm.weight", eps: eps, dim: D, offset: off) : nil
+            if spec.hasOwnKV, (qNorm == nil) != (kNorm == nil) { throw EngineError.invalidFile("\(p): q_norm and k_norm must come together") }
+            // Qwen 3.5: q_proj also yields a per-head output gate (rows [q_h | gate_h] per head). Its rows
+            // are reordered to [all q | all gates], so the projection row is [q | gate | k | v].
+            let gated = c.attnOutputGate
+            qkvCols = TransformerLayer.qkvColumns(spec, c)
+            if gated && (!spec.hasOwnKV || spec.kEqV || s.has("\(p).self_attn.qkv_proj.weight")) {
+                throw EngineError.unsupported("\(p): gated attention with this projection layout")
+            }
+            if !spec.hasOwnKV {
+                qkv = [try Linear(s, "\(p).self_attn.q_proj", inDim: H, outDim: c.numHeads * D)]
+            } else if s.has("\(p).self_attn.qkv_proj.weight") {
+                qkv = [try Linear(s, "\(p).self_attn.qkv_proj", inDim: H, outDim: qkvCols)]
+            } else {
+                let parts = spec.kEqV ? [("q_proj", c.numHeads), ("k_proj", nKV)]
+                    : [("q_proj", c.numHeads * (gated ? 2 : 1)), ("k_proj", nKV), ("v_proj", nKV)]
+                qkv = try parts.map { try Linear(s, "\(p).self_attn.\($0.0)", inDim: H, outDim: $0.1 * D) }
+            }
+            if gated {
+                let n = c.numHeads * D
+                try qkv[0].permuteRows((0..<2 * n).map { r in r < n ? r / D * 2 * D + r % D : (r - n) / D * 2 * D + D + (r - n) % D })
+            }
+            o = try Linear(s, "\(p).self_attn.o_proj", inDim: c.numHeads * D, outDim: H)
         }
-        o = try Linear(s, "\(p).self_attn.o_proj", inDim: c.numHeads * D, outDim: H)
         // Gemma 4's MLP width varies per layer: take it from the weights.
         let I0: Int? = c.isGemma4 ? nil : c.intermediateSize
         if s.has("\(p).mlp.gate_up_proj.weight") {
@@ -410,14 +535,23 @@ final class TransformerLayer {
     }
 }
 
+extension TransformerLayer {
+    /// Row stride of a layer's projection buffer: [q | k | v] ([q | gate | k | v] with Qwen 3.5's
+    /// output gate), or a linear-attention layer's input projections.
+    static func qkvColumns(_ spec: ModelConfig.LayerSpec, _ c: ModelConfig) -> Int {
+        if spec.linear, let d = c.linearAttention { return GatedDeltaNet.stride(d) }
+        return ((c.attnOutputGate ? 2 : 1) * c.numHeads + 2 * spec.numKVHeads) * spec.headDim
+    }
+}
+
 extension Transformer {
     /// Upper bound on the scratch buffers `init` allocates for a config (the load-time memory
     /// check adds it to the weights and the KV caches). A test keeps it above `scratchAllocated`.
     public static func scratchBytes(config c: ModelConfig) -> Int {
         let B = maxBatch, H = c.hiddenSize
         let I = c.intermediateSize * (c.isGemma4 ? 2 : 1)   // Gemma 4's KV-shared layers double the MLP
-        let qkv = c.layers.map { (c.numHeads + 2 * $0.numKVHeads) * $0.headDim }.max() ?? 0
-        let attn = c.layers.map { c.numHeads * $0.headDim }.max() ?? 0
+        let qkv = c.layers.map { TransformerLayer.qkvColumns($0, c) }.max() ?? 0
+        let attn = max(c.layers.map { c.numHeads * $0.headDim }.max() ?? 0, c.linearAttention?.valueDim ?? 0)
         let maxD = c.layers.map(\.headDim).max() ?? 0
         var bytes = B * 4 * (3 * H + qkv + attn + 3 * I)                     // h, xn, tmp, qkv, attn, gate|up, mlp
         bytes += (1 + maxVerifyTokens) * max(c.vocabSize, 1) * 4             // logits, logitsAll
@@ -532,6 +666,19 @@ public final class Transformer {
     /// The MLP's gated activation: SiLU, or GELU (tanh / exact) for Gemma.
     private let siluPSO: MTLComputePipelineState
     private let addPSO: MTLComputePipelineState
+    /// Qwen 3.5: the attention output gate, and the Gated DeltaNet kernels.
+    private let gateSigmoidPSO: MTLComputePipelineState?
+    struct GDNKernels {
+        let step: MTLComputePipelineState   // decode: one dispatch per layer
+        let lpr: Int                        // lanes per state row (step and scan)
+        let conv, prep, scan, norm: MTLComputePipelineState   // a batch of tokens
+    }
+    private let gdnKernels: GDNKernels?
+    static let gdnDefaultLPR = 8
+    /// Hybrid models: the position the recurrent state has reached (the end of the last committed
+    /// step), or -1 when it is unknown (a failed step). Unlike a KV cache it cannot be rewound, so a
+    /// step must start there or at 0.
+    public private(set) var recurrentPosition = 0
     /// Gemma: embedding scale and final-logit soft-capping (nil when unused).
     private let scalePSO: MTLComputePipelineState?
     private let softcapPSO: MTLComputePipelineState?
@@ -577,7 +724,8 @@ public final class Transformer {
     public var weightBytes: Int { store.totalBytes }
     /// Every projection has the batched 4-bit kernel, so verifying a few tokens is cheap.
     public var supportsBatchedVerify: Bool {
-        Linear.canFuse([lmHead], T: 2) && layers.allSatisfy { l in
+        // Verification runs drafts that may be rejected, and a recurrent state cannot drop them.
+        !config.isHybrid && Linear.canFuse([lmHead], T: 2) && layers.allSatisfy { l in
             Linear.canFuse(l.qkv, T: 2) && Linear.canFuse([l.o], T: 2) && Linear.canFuse(l.gateUp, T: 2) && Linear.canFuse([l.down], T: 2)
         }
     }
@@ -586,12 +734,18 @@ public final class Transformer {
     /// decode attention: see `SparseAttention`.
     public init(directory: URL, contextLength: Int, sparse: SparseAttention? = SparseAttention.fromEnvironment) throws {
         let gpu = GPU.shared
-        let c = try ModelConfig(directory: directory)
-        config = c
+        var c = try ModelConfig(directory: directory)
         let seq = max(256, min(contextLength, max(c.maxPositionEmbeddings, 256)))
         maxSeq = seq
         let store = try WeightStore(directory: directory, device: gpu.device)
         self.store = store
+        // Qwen 3.5 converted straight from Hugging Face (conv1d still [C, 1, K]) stores its RMSNorm
+        // weights as offsets from 1, except the linear-attention output norm (mlx-lm's sanitize).
+        if c.isHybrid, let i = c.layers.firstIndex(where: \.linear),
+           let w = store.get("model.layers.\(i).linear_attn.conv1d.weight"), w.shape.count == 3, w.shape[2] != 1 {
+            c.normWeightOffset = true
+        }
+        config = c
         let headDims = Set(c.layers.map(\.headDim))
         for d in headDims {
             guard d % 32 == 0, d / 32 <= 8 || d == 512 else { throw EngineError.unsupported("head_dim \(d)") }
@@ -616,7 +770,8 @@ public final class Transformer {
         }
 
         // Scratch buffers fit the largest layer.
-        let qkvMax = layers.map(\.qkvCols).max()!, attnMax = layers.map { c.numHeads * $0.spec.headDim }.max()!
+        let qkvMax = layers.map(\.qkvCols).max()!
+        let attnMax = max(layers.map { c.numHeads * $0.spec.headDim }.max()!, c.linearAttention?.valueDim ?? 0)
         let I = layers.map(\.intermediate).max()!
         let H = c.hiddenSize, B = maxBatch
         hist = try gpu.buffer((seq + 1) * 4)
@@ -747,7 +902,7 @@ public final class Transformer {
         sparseSelectThreads = setup?.selectThreads ?? 0
         // Layers that decode sparse: those with an index, and KV-shared layers reading their source's.
         var sparseCount = 0
-        for (li, layer) in layers.enumerated() where setup != nil {
+        for (li, layer) in layers.enumerated() where setup != nil && !layer.spec.linear {
             let spec = layer.spec, source = spec.hasOwnKV ? li : spec.kvSource, kv = layers[source].spec
             if !spec.sliding, kv.numKVHeads == spec.numKVHeads, kv.headDim == spec.headDim,
                sparseIndex[source] != nil, kernels[spec.headDim]?.sparse != nil { sparseCount += 1 }
@@ -778,6 +933,23 @@ public final class Transformer {
         case .gelu: siluPSO = try gpu.pipeline("gelu_mul")
         }
         addPSO = try gpu.pipeline("add_inplace")
+        gateSigmoidPSO = c.attnOutputGate ? try gpu.pipeline("sigmoid_gate") : nil
+        if c.isHybrid {
+            // Decode: 8 lanes per state row (1024 threads) unless MLXR_GDN_LPR says otherwise or the GPU
+            // cannot run that many threads per threadgroup.
+            var lpr = Int(ProcessInfo.processInfo.environment["MLXR_GDN_LPR"] ?? "") ?? Self.gdnDefaultLPR
+            if lpr != 4 && lpr != 8 { lpr = Self.gdnDefaultLPR }
+            var step = try gpu.pipeline("gdn_step_\(lpr)")
+            if step.maxTotalThreadsPerThreadgroup < 128 * lpr { lpr = 4; step = try gpu.pipeline("gdn_step_4") }
+            let scan = try gpu.pipeline("gdn_scan_\(lpr)")
+            guard step.maxTotalThreadsPerThreadgroup >= 128 * lpr, scan.maxTotalThreadsPerThreadgroup >= 64 else {
+                throw EngineError.unsupported("Gated DeltaNet kernels: thread limits")
+            }
+            gdnKernels = GDNKernels(step: step, lpr: lpr, conv: try gpu.pipeline("gdn_conv"), prep: try gpu.pipeline("gdn_prep"),
+                                    scan: scan, norm: try gpu.pipeline("gdn_norm"))
+        } else {
+            gdnKernels = nil
+        }
         scalePSO = c.embedScale != nil ? try gpu.pipeline("scale_inplace") : nil
         softcapPSO = c.finalLogitSoftcap > 0 ? try gpu.pipeline("softcap_inplace") : nil
         embedPSO = try embed.lookupPipeline()
@@ -817,11 +989,13 @@ public final class Transformer {
         var ready: MTLCommandBuffer?
         if T == 1, computeLogits, !allLogits, !dense, let p = prepared, p.offset == offset { ready = p.cb }
         prepared = nil
+        try checkRecurrent(offset)
         let cb = try ready ?? encode(T: T, offset: offset, computeLogits: computeLogits, allLogits: allLogits, dense: dense)
         // Nothing is in flight (the previous step was waited for), so `hist` is free to write.
         writeHistory(tokens, at: offset)
         cb.commit()
         writtenHigh = max(writtenHigh, offset + T)
+        recurrentPosition = offset + T
         // Overlap CPU encoding of the likely next decode step (the following position) with this
         // step's GPU work. It is only committed after this buffer completes, on an exact match.
         if computeLogits, offset + T < maxSeq, let next = try? encode(T: 1, offset: offset + T, computeLogits: true, allLogits: false) {
@@ -831,8 +1005,15 @@ public final class Transformer {
         lastGPUTime = cb.gpuEndTime - cb.gpuStartTime
         if let err = cb.error {
             prepared = nil
+            recurrentPosition = -1
             throw EngineError.gpu(err)
         }
+    }
+
+    /// Hybrid models: a step must continue the recurrent state where it is, or restart at 0.
+    private func checkRecurrent(_ offset: Int) throws {
+        guard config.isHybrid, offset != 0, offset != recurrentPosition else { return }
+        throw EngineError.unsupported("the recurrent state is at position \(recurrentPosition) and cannot resume at \(offset)")
     }
 
     private func writeHistory(_ tokens: [Int32], at offset: Int) {
@@ -855,6 +1036,9 @@ public final class Transformer {
     /// prompt is processed from the start. `previousLength` is the caller's own count, used
     /// when it is larger (it never should be).
     public func reusablePrefix(_ common: Int, previousLength: Int) -> Int {
+        // A recurrent state holds exactly the positions processed so far: it is reusable only when the
+        // new run continues right where it stopped.
+        if config.isHybrid { return common > 0 && common == recurrentPosition ? common : 0 }
         let written = max(previousLength, writtenHigh)
         for l in layers where l.spec.hasOwnKV && l.cacheLen < maxSeq {
             if written - common > l.cacheLen - config.slidingWindow + 1 { return 0 }
@@ -888,13 +1072,15 @@ public final class Transformer {
             let n = min(maxBatch, tokens.count - start)
             let last = start + n == tokens.count
             let at = offset + start
+            try checkRecurrent(at)
             let cb = try encode(T: n, offset: at, computeLogits: last, allLogits: false, sample: last ? sample : nil, dense: true)
             writeHistory(Array(tokens[start..<start + n]), at: at)
             cb.commit()
             writtenHigh = max(writtenHigh, at + n)
+            recurrentPosition = at + n
             cb.waitUntilCompleted()
             lastGPUTime = cb.gpuEndTime - cb.gpuStartTime
-            if let err = cb.error { throw EngineError.gpu(err) }
+            if let err = cb.error { recurrentPosition = -1; throw EngineError.gpu(err) }
             start += n
         }
         return try sampledToken(at: offset + tokens.count)
@@ -907,9 +1093,11 @@ public final class Transformer {
     public func beginDecodeStep(offset: Int, sample: SampleParams) throws -> DecodeStep {
         guard offset >= 0, offset + 1 < maxSeq else { throw EngineError.contextFull }
         prepared = nil
+        try checkRecurrent(offset)
         let cb = try encode(T: 1, offset: offset, computeLogits: true, allLogits: false, sample: sample)
         cb.commit()
         writtenHigh = max(writtenHigh, offset + 1)
+        recurrentPosition = offset + 1
         return DecodeStep(cb: cb, offset: offset)
     }
 
@@ -932,10 +1120,13 @@ public final class Transformer {
         for i in single ? 0..<n : 0..<1 {
             let last = !single || i == n - 1
             let b: MTLCommandBuffer
-            do { b = try encode(T: single ? 1 : n, offset: offset + i, computeLogits: last, allLogits: false, sample: last ? sample : nil) }
-            catch { cb?.waitUntilCompleted(); throw error }
+            do {
+                try checkRecurrent(offset + i)
+                b = try encode(T: single ? 1 : n, offset: offset + i, computeLogits: last, allLogits: false, sample: last ? sample : nil)
+            } catch { cb?.waitUntilCompleted(); throw error }
             b.commit()
             writtenHigh = max(writtenHigh, offset + i + (single ? 1 : n))
+            recurrentPosition = offset + i + (single ? 1 : n)
             cb = b
         }
         return DecodeStep(cb: cb!, offset: offset + n - 1)
@@ -945,7 +1136,7 @@ public final class Transformer {
     public func finish(_ step: DecodeStep) throws -> Int {
         step.cb.waitUntilCompleted()
         lastGPUTime = step.cb.gpuEndTime - step.cb.gpuStartTime
-        if let err = step.cb.error { throw EngineError.gpu(err) }
+        if let err = step.cb.error { recurrentPosition = -1; throw EngineError.gpu(err) }
         return try sampledToken(at: step.offset + 1)
     }
 
@@ -999,6 +1190,10 @@ public final class Transformer {
         for (li, layer) in layers.enumerated() {
             let spec = layer.spec
             let D = spec.headDim, nKV = spec.numKVHeads, qkvCols = layer.qkvCols, I = layer.intermediate
+            if let g = layer.gdn {
+                // Linear attention: projections → convolution, recurrence, gated norm (into attnBuf).
+                encodeGatedDeltaNet(enc, g, T: T, offset: offset, skipProj: skipQKV, skipMixer: skipAttn)
+            } else {
             let kv = spec.hasOwnKV ? layer : layers[spec.kvSource]
             let kernels = attnKernels[D]!
             // Attention block: [q|k|v] projection → norm/rope/cache → attention → o_proj
@@ -1027,7 +1222,7 @@ public final class Transformer {
             enc.params(QKVPostParams(D: Int32(D), nH: Int32(nH), nKV: Int32(nKV), rowStride: Int32(qkvCols),
                                      offset: Int32(offset), maxSeq: Int32(kv.cacheLen), traditional: c.ropeTraditional ? 1 : 0,
                                      rotDim: Int32(spec.rotDim), eps: c.rmsNormEps, hasNorm: layer.qNorm != nil ? 1 : 0,
-                                     vNorm: c.valueNorm ? 1 : 0, kEqV: spec.kEqV ? 1 : 0), 6)
+                                     vNorm: c.valueNorm ? 1 : 0, kEqV: spec.kEqV ? 1 : 0, gateHeads: c.attnOutputGate ? Int32(nH) : 0), 6)
             // A KV-shared layer only prepares its queries.
             enc.dispatchThreadgroups(MTLSize(width: spec.hasOwnKV ? nH + 2 * nKV : nH, height: T, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: D, height: 1, depth: 1))
@@ -1118,8 +1313,17 @@ public final class Transformer {
                 enc.dispatchThreadgroups(MTLSize(width: nH, height: smallT ? T : (T + kernels.prefillQB - 1) / kernels.prefillQB, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: attnThreads, height: 1, depth: 1))
             }
+            if let gatePSO = gateSigmoidPSO, !skipAttn {
+                // Qwen 3.5: attn · sigmoid(gate), the gate sitting after the q section of the projection row.
+                enc.setComputePipelineState(gatePSO)
+                enc.set(attnBuf, 0, 0)
+                enc.set(qkvBuf, nH * D * 4, 1)
+                enc.params(EWParams(n: 0, stride: Int32(qkvCols), cols: Int32(nH * D)), 2)
+                enc.dispatchThreads(MTLSize(width: nH * D, height: T, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
+            }
 
-            if !skipO { layer.o.encode(enc, x: attnBuf, xStride: nH * D, y: tmp, yStride: H, T: T) }
+            if !skipO { layer.o.encode(enc, x: attnBuf, xStride: layer.o.inDim, y: tmp, yStride: H, T: T) }
             if !skipNorm { layer.mlpNorm.encodeAdd(enc, h: h, residual: tmp, normedBy: layer.attnOutNorm, y: xn, dim: H, rows: T) }
 
             // MLP block: [gate|up] → act(gate)·up → down_proj
@@ -1191,6 +1395,56 @@ public final class Transformer {
         }
         enc.endEncoding()
         return cb
+    }
+
+    /// Qwen 3.5 linear attention for T tokens at `offset`: the input projections into `qkvBuf`, then the
+    /// mixer (one `gdn_step` for a single token, `gdn_conv` / `gdn_prep` / `gdn_scan` / `gdn_norm` for a
+    /// batch) writing the gated, normalized values into `attnBuf` ([T][Hv · Dv]).
+    private func encodeGatedDeltaNet(_ enc: MTLComputeCommandEncoder, _ g: GatedDeltaNet, T: Int, offset: Int,
+                                     skipProj: Bool = false, skipMixer: Bool = false) {
+        let d = g.dims, H = config.hiddenSize, cols = g.stride
+        if skipProj {
+        } else if g.projFusable && Linear.canFuse(g.proj, T: T) {
+            Linear.encodeFusedDecode(enc, g.proj, x: xn, xStride: H, y: qkvBuf, yStride: cols, T: T)
+        } else {
+            var col = 0
+            for part in g.proj {
+                part.encode(enc, x: xn, xStride: H, y: qkvBuf, yOffset: col * 4, yStride: cols, T: T)
+                col += part.outDim
+            }
+        }
+        guard !skipMixer, let k = gdnKernels else { return }
+        let p = GDNParams(T: Int32(T), offset: Int32(offset), cols: Int32(cols), Hk: Int32(d.numKeyHeads), Hv: Int32(d.numValueHeads),
+                          convDim: Int32(d.convDim), outStride: Int32(d.valueDim), eps: config.rmsNormEps)
+        let D = d.valueHeadDim
+        if T == 1 {
+            enc.setComputePipelineState(k.step)
+            enc.set(qkvBuf, 0, 0); enc.set(g.convW, 0, 1); enc.set(g.ring, 0, 2); enc.set(g.state, 0, 3)
+            enc.set(g.negA, 0, 4); enc.set(g.dtBias, 0, 5); enc.set(g.normW, 0, 6); enc.set(attnBuf, 0, 7)
+            enc.params(p, 8)
+            enc.dispatchThreadgroups(MTLSize(width: d.numValueHeads, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: D * k.lpr, height: 1, depth: 1))
+            return
+        }
+        enc.setComputePipelineState(k.conv)
+        enc.set(qkvBuf, 0, 0); enc.set(g.convW, 0, 1); enc.set(g.ring, 0, 2)
+        enc.params(p, 3)
+        enc.dispatchThreads(MTLSize(width: d.convDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.setComputePipelineState(k.prep)
+        enc.set(qkvBuf, 0, 0); enc.set(g.negA, 0, 1); enc.set(g.dtBias, 0, 2)
+        enc.params(p, 3)
+        enc.dispatchThreadgroups(MTLSize(width: d.numKeyHeads, height: T, depth: 1), threadsPerThreadgroup: MTLSize(width: 2 * D, height: 1, depth: 1))
+        // Two simdgroups (2 · 32 / LPR state rows) per threadgroup.
+        let rowsPerTG = 2 * 32 / k.lpr
+        enc.setComputePipelineState(k.scan)
+        enc.set(qkvBuf, 0, 0); enc.set(g.state, 0, 1)
+        enc.params(p, 2)
+        enc.dispatchThreadgroups(MTLSize(width: D / rowsPerTG, height: d.numValueHeads, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.setComputePipelineState(k.norm)
+        enc.set(qkvBuf, 0, 0); enc.set(g.normW, 0, 1); enc.set(attnBuf, 0, 2)
+        enc.params(p, 3)
+        enc.dispatchThreadgroups(MTLSize(width: d.numValueHeads, height: T, depth: 1), threadsPerThreadgroup: MTLSize(width: D, height: 1, depth: 1))
     }
 
     /// Gemma 4: per-layer inputs for T tokens into `ple.inputs` ([T][layers][P]):
@@ -1303,6 +1557,15 @@ extension Transformer {
             out += String(format: " %@ -%.1f", cls as NSString, (fullP - stepTime([cls], T: 512)) * 1000)
         }
         out += "\n"
+        // Qwen 3.5: the Gated DeltaNet mixers of every linear-attention layer (each its own state).
+        let mixers = layers.compactMap(\.gdn)
+        if let d = mixers.first?.dims {
+            let state = Double(mixers.count * 2 * d.numValueHeads * d.valueHeadDim * d.keyHeadDim * 4)
+            let t1 = time(5) { enc in for g in mixers { self.encodeGatedDeltaNet(enc, g, T: 1, offset: 16, skipProj: true) } }
+            out += String(format: "gdn_step x%d: %.3f ms (%.0f GB/s of state read + written)\n", mixers.count, t1 * 1000, state / t1 / 1e9)
+            let tP = time(2) { enc in for g in mixers { self.encodeGatedDeltaNet(enc, g, T: 512, offset: 16, skipProj: true) } }
+            out += String(format: "gdn mixers at T=512 x%d: %.2f ms\n", mixers.count, tP * 1000)
+        }
         let l0 = layers[0]
         let tAdd = time(500) { enc in self.add(enc, tmp, xn, H) }
         out += String(format: "tiny dependent dispatch: %.1f us\n", tAdd * 1e6)

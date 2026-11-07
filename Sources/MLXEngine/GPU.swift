@@ -34,7 +34,9 @@ struct MMParams {
     var K: Int32; var O: Int32; var T: Int32; var gs: Int32; var xStride: Int32; var yStride: Int32
     var o1: Int32 = 0; var o2: Int32 = 0; var hasBias: Int32 = 0; var act: Int32 = 0
 }
-struct QKVPostParams { var D: Int32; var nH: Int32; var nKV: Int32; var rowStride: Int32; var offset: Int32; var maxSeq: Int32; var traditional: Int32; var rotDim: Int32; var eps: Float; var hasNorm: Int32; var vNorm: Int32 = 0; var kEqV: Int32 = 0 }
+struct QKVPostParams { var D: Int32; var nH: Int32; var nKV: Int32; var rowStride: Int32; var offset: Int32; var maxSeq: Int32; var traditional: Int32; var rotDim: Int32; var eps: Float; var hasNorm: Int32; var vNorm: Int32 = 0; var kEqV: Int32 = 0; var gateHeads: Int32 = 0 }
+/// Qwen 3.5 Gated DeltaNet kernels (`gdn_*`).
+struct GDNParams { var T: Int32; var offset: Int32; var cols: Int32; var Hk: Int32; var Hv: Int32; var convDim: Int32; var outStride: Int32; var eps: Float }
 struct NormParams { var dim: Int32; var headsPerRow: Int32; var rowStride: Int32; var eps: Float }
 struct AttnParams { var D: Int32; var nH: Int32; var nKV: Int32; var qStride: Int32; var maxSeq: Int32; var offset: Int32; var scale: Float; var outStride: Int32; var T: Int32 = 1; var window: Int32 = 0; var softcap: Float = 0 }
 struct EWParams { var n: Int32; var stride: Int32; var cols: Int32; var pad: Int32 = 0 }
@@ -275,9 +277,11 @@ final class SafeTensorFile {
             mappingOwned = false
             return
         }
-        // Copy in file order (sequential read), one buffer per tensor.
+        // Copy in file order (sequential read), one buffer per tensor. Multimodal exports' vision
+        // towers and multi-token-prediction heads are never used by the engine: they stay on disk.
         buffer = nil
         for (name, i) in infos.sorted(by: { $0.value.start < $1.value.start }) {
+            if Self.unusedPrefixes.contains(where: { name.hasPrefix($0) }) { infos[name] = nil; continue }
             let len = i.end - i.start
             guard let b = device.makeBuffer(bytes: base + i.start, length: max(len, 16), options: .storageModeShared) else {
                 throw EngineError.outOfMemory("could not allocate \(ByteCountFormatter.string(fromByteCount: Int64(len), countStyle: .file)) for \(name) in \(file)")
@@ -287,6 +291,9 @@ final class SafeTensorFile {
             infos[name] = (i.dtype, i.shape, 0, len)
         }
     }
+
+    /// Tensors of a multimodal export that the text model never reads.
+    static let unusedPrefixes = ["vision_tower.", "model.visual.", "visual.", "mtp.", "model.mtp.", "language_model.mtp."]
 
     func tensor(_ name: String) -> Tensor? {
         guard let i = infos[name], let b = buffer ?? buffers[name] else { return nil }

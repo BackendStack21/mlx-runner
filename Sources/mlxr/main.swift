@@ -464,7 +464,8 @@ case "bench":
     }
     // Speculative verification cost: one forward over T tokens with logits for every row.
     // At a short context and after a 1900-token prompt (the attention part grows with the context).
-    for ctx in [64, 1900] {
+    // (A recurrent state cannot rewind to rerun a position: no verification on hybrid models.)
+    for ctx in t.config.isHybrid ? [] : [64, 1900] {
         if ctx > 64 { _ = try t.forward((0..<ctx).map { Int32(100 + $0 % 5000) }, offset: 0) }
         for T in 1...Transformer.maxVerifyTokens {
             let steps = 32
@@ -481,7 +482,7 @@ case "bench":
     }
     for T in [5, 8, 12, 15] {
         let s = Date()
-        for i in 0..<8 { _ = try t.forward((0..<T).map { Int32(600 + $0 + i) }, offset: 64) }
+        for i in 0..<8 { _ = try t.forward((0..<T).map { Int32(600 + $0 + i) }, offset: t.config.isHybrid ? 0 : 64) }
         print(String(format: "prefill T=%d: %6.2f ms", T, Date().timeIntervalSince(s) / 8 * 1000))
     }
     if !longBench.contexts.isEmpty { try benchLongContext(t, dir: dir, bench: longBench) }
