@@ -23,6 +23,9 @@ public enum SupportedArchitectures {
         return !isMoE(config)
     }
 
+    /// Hybrid architectures whose recurrent state cannot drop rejected tokens: no speculative decoding.
+    public static func hasRecurrentState(_ modelType: String?) -> Bool { modelType?.lowercased().hasPrefix("qwen3_5") ?? false }
+
     public static func isMoE(_ config: [String: Any]?) -> Bool {
         guard let c = config else { return false }
         let text = c["text_config"] as? [String: Any]
@@ -327,7 +330,10 @@ public struct ModelConfig {
                                  ("linear_conv_kernel_dim", la.convKernel, 1...LinearAttention.convRing)] where !range.contains(v) {
             throw bad("\(name) = \(v) is out of range")
         }
-        guard la.numValueHeads % la.numKeyHeads == 0 else { throw bad("linear_num_value_heads must be a multiple of linear_num_key_heads") }
+        // gdn_prep computes the gates of a key head's value heads with one thread each (2 · 128 threads).
+        guard la.numValueHeads % la.numKeyHeads == 0, la.numValueHeads / la.numKeyHeads <= 256 else {
+            throw bad("linear_num_value_heads must be a multiple of linear_num_key_heads (at most 256 times)")
+        }
         // The Gated DeltaNet kernels are instantiated for 128-wide heads (every Qwen 3.5 size).
         guard la.keyHeadDim == 128, la.valueHeadDim == 128 else {
             throw EngineError.unsupported("Gated DeltaNet head size \(la.keyHeadDim)/\(la.valueHeadDim)")

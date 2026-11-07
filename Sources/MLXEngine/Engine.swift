@@ -283,10 +283,16 @@ public final class InferenceEngine: @unchecked Sendable {
                     if sparse != nil, !model.sparseAvailable { sparseNote = model.sparseOffReason ?? "unavailable" }
                     var draft: Transformer?
                     if let draftDirectory {
+                        guard !model.config.isHybrid else {
+                            throw EngineError.unsupported("\(directory.lastPathComponent) keeps a recurrent state that cannot drop rejected drafts, so it runs without a draft model")
+                        }
                         guard model.supportsBatchedVerify else {
                             throw EngineError.unsupported("\(directory.lastPathComponent) has no batched verify kernels (4-bit weights are required), so a draft model cannot help")
                         }
                         let d = try Transformer(directory: draftDirectory, contextLength: model.maxSeq, sparse: nil)   // drafts stay dense
+                        guard !d.config.isHybrid else {
+                            throw EngineError.unsupported("draft model \(draftDirectory.lastPathComponent) keeps a recurrent state that cannot roll back rejected drafts")
+                        }
                         guard d.vocabSize >= min(model.vocabSize, tok.vocabularySize) else {
                             throw EngineError.unsupported("draft model \(draftDirectory.lastPathComponent) has a smaller vocabulary than \(directory.lastPathComponent)")
                         }
@@ -361,9 +367,12 @@ public final class InferenceEngine: @unchecked Sendable {
         let defs = (tools?.active ?? false) ? tools?.tools ?? [] : []
         return stream(token, parameters: parameters, revealToolMarkers: !defs.isEmpty, nameChoices: constrainToolNames) { tok, tpl in
             guard let tpl else { throw EngineError.invalidFile("No model loaded") }
-            return self.fitToContext(messages, template: tpl, tokenizer: tok,
-                                     reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking,
-                                     conversationID: conversationID, tools: defs, prefill: prefill)
+            let ids = self.fitToContext(messages, template: tpl, tokenizer: tok,
+                                        reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking,
+                                        conversationID: conversationID, tools: defs, prefill: prefill)
+            // A prompt that opened the reasoning block (Qwen 3.5): the reply text starts with the tag, as
+            // it does for models that write it themselves, so reasoning splitters see it.
+            return (ids, tpl.opensThinking(enableThinking: enableThinking, prefill: prefill) ? "<think>\n" : nil)
         }
     }
 
@@ -374,13 +383,13 @@ public final class InferenceEngine: @unchecked Sendable {
             var ids = tok.encode(prompt)
             // Models such as Llama, Mistral and Gemma expect BOS on raw prompts (`Tokenizer.addBosToken`).
             if tok.addBosToken, let b = tok.bosToken, let id = tok.tokenId(b), ids.first != id { ids.insert(id, at: 0) }
-            return ids
+            return (ids, nil)
         }
     }
 
     private func stream(_ token: CancelToken, parameters: SamplingParameters, revealToolMarkers: Bool = false,
                         nameChoices: [String]? = nil,
-                        _ makeTokens: @escaping (Tokenizer, ChatTemplate?) throws -> [Int]) -> AsyncThrowingStream<GenerationEvent, Error> {
+                        _ makeTokens: @escaping (Tokenizer, ChatTemplate?) throws -> (ids: [Int], lead: String?)) -> AsyncThrowingStream<GenerationEvent, Error> {
         AsyncThrowingStream { cont in
             cont.onTermination = { _ in token.cancel() }
             queue.async {
@@ -392,10 +401,10 @@ public final class InferenceEngine: @unchecked Sendable {
                 self.cancelLock.lock(); self.currentToken = token; self.cancelLock.unlock()
                 defer { self.cancelLock.lock(); self.currentToken = nil; self.cancelLock.unlock() }
                 do {
-                    let tokens = try makeTokens(tok, self.template)
+                    let (tokens, lead) = try makeTokens(tok, self.template)
                     let reveal = revealToolMarkers
                         ? Set((self.template?.toolCallMarkerTokens ?? []).compactMap { tok.tokenId($0) }) : []
-                    try self.run(tokens: tokens, parameters: parameters, reveal: reveal, nameChoices: nameChoices,
+                    try self.run(tokens: tokens, parameters: parameters, reveal: reveal, nameChoices: nameChoices, lead: lead,
                                  token: token) { cont.yield($0) }
                     cont.finish()
                 } catch {
@@ -468,8 +477,9 @@ public final class InferenceEngine: @unchecked Sendable {
     }
 
     /// `reveal`: special tokens whose text is emitted (tool-call markers); others decode to nothing.
+    /// `lead`: text emitted before the first generated token (it is part of the prompt).
     private func run(tokens: [Int], parameters: SamplingParameters, reveal: Set<Int> = [], nameChoices: [String]? = nil,
-                     token: CancelToken, emit: (GenerationEvent) -> Void) throws {
+                     lead: String? = nil, token: CancelToken, emit: (GenerationEvent) -> Void) throws {
         guard let model, let tok = tokenizer else { throw EngineError.invalidFile("No model loaded") }
         var stats = GenerationStats()
         stats.promptTokens = tokens.count
@@ -546,6 +556,7 @@ public final class InferenceEngine: @unchecked Sendable {
         stats.timeToFirstToken = tPrompt
         stats.promptTokensPerSecond = Double(tokens.count - common) / max(tPrompt, 1e-6)
         emit(.promptProcessed(stats))
+        if let lead { emit(.text(lead)) }
 
         var sampler = Sampler(params: parameters, rng: XorShift(seed: seed))
         var shaper = sampler   // builds distributions (no randomness), so verifyDraft can call it
@@ -828,7 +839,8 @@ extension InferenceEngine {
         let t = target.standardizedFileURL
         guard let me = models.first(where: { $0.directory.standardizedFileURL == t })
                 ?? ModelStore.describe(target, repo: target.lastPathComponent, source: .library),
-              me.sizeBytes > 0, let type = me.modelType, let fp = tokenizerFingerprint(target) else { return nil }
+              me.sizeBytes > 0, let type = me.modelType, !SupportedArchitectures.hasRecurrentState(type),
+              let fp = tokenizerFingerprint(target) else { return nil }
         return models
             .filter { $0.isSupported && $0.modelType == type && $0.sizeBytes > 0 && $0.sizeBytes * 4 <= me.sizeBytes
                 && $0.directory.standardizedFileURL != t }

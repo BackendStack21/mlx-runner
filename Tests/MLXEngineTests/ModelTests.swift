@@ -19,6 +19,8 @@ struct ModelTests {
     static let qwen3_14b = "lmstudio-community/Qwen3-14B-MLX-4bit"
     static let large = ProcessInfo.processInfo.environment["MLXR_TEST_LARGE"] == "1" ? [qwen3_14b] : []
     static let qwen25 = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+    /// Hybrid: Gated DeltaNet linear attention with a recurrent state, and gated full attention.
+    static let qwen35 = "mlx-community/Qwen3.5-0.8B-4bit"
     /// Every architecture: sparse attention runs on each one's full-attention layers.
     static let allArchitectures = [qwen3, llama, phi, mistral, qwen25, GemmaModelTests.gemma1, GemmaModelTests.gemma2,
                                    GemmaModelTests.gemma3, GemmaModelTests.gemma4] + large
@@ -43,7 +45,7 @@ struct ModelTests {
 
     /// Prefill (GEMM + flash attention) and token-by-token decode (matvec + decode attention)
     /// must produce the same next-token distribution.
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral] + large)
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, qwen35] + large)
     func prefillMatchesIncrementalDecode(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let model = try Transformer(directory: dir, contextLength: 1024)
@@ -66,7 +68,7 @@ struct ModelTests {
 
     /// A prompt longer than one prefill batch (512 tokens): the 64 × 64 GEMM tiles and flash
     /// attention over many key blocks, then a second batch at offset 512, against token-by-token decode.
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, "mlx-community/Qwen3-8B-4bit"])
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, qwen35, "mlx-community/Qwen3-8B-4bit"])
     func longPrefillMatchesIncrementalDecode(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let model = try Transformer(directory: dir, contextLength: 1024)
@@ -86,6 +88,40 @@ struct ModelTests {
         #expect(argPre == argInc)
         let maxDiff = zip(pre, inc).map { abs($0 - $1) }.max()!
         #expect(maxDiff < 0.1, "max logit difference \(maxDiff)")
+    }
+
+    /// Qwen 3.5's config: hybrid layer layout, Gated DeltaNet geometry, gated attention with partial
+    /// RoPE (64 of 256 dims, base 1e7, from rope_parameters).
+    @Test(.enabled(if: installedModel(qwen35) != nil))
+    func qwen35Config() throws {
+        let c = try ModelConfig(directory: installedModel(Self.qwen35)!)
+        #expect(c.modelType == "qwen3_5_text" && c.isHybrid && c.attnOutputGate)
+        #expect(c.layers.map(\.linear) == (0..<24).map { ($0 + 1) % 4 != 0 })
+        #expect(c.linearAttention == ModelConfig.LinearAttention(numKeyHeads: 16, numValueHeads: 16, keyHeadDim: 128, valueHeadDim: 128, convKernel: 4))
+        let attn = c.layers[3]
+        #expect(attn.headDim == 256 && attn.numKVHeads == 2 && attn.rotDim == 64 && attn.hasOwnKV && !c.layers[0].hasOwnKV)
+        #expect(abs(attn.invFreq[1] - Float(1 / pow(1e7, 2.0 / 64))) < 1e-12)
+        #expect(c.kvCacheBytes(context: 1024) == 6 * 2 * 2 * 256 * 2 * 1024 + 18 * 4 * (16 * 128 * 128 + 4 * 6144))
+    }
+
+    /// A recurrent state cannot be rewound: a step must continue where the state is or restart at 0,
+    /// a cached prefix is reusable only when the new run continues exactly there, and speculative
+    /// verification is off.
+    @Test(.enabled(if: installedModel(qwen35) != nil))
+    func hybridStateOnlyMovesForward() throws {
+        let model = try Transformer(directory: installedModel(Self.qwen35)!, contextLength: 1024)
+        #expect(!model.supportsBatchedVerify)
+        let ids: [Int32] = [760, 3841, 13477, 37550, 33075, 888, 279, 15217]
+        let V = model.vocabSize
+        let first = Array(UnsafeBufferPointer(start: try model.forward(ids, offset: 0), count: V))
+        #expect(model.recurrentPosition == ids.count)
+        _ = try model.forward([5388], offset: ids.count)
+        #expect(throws: EngineError.self) { _ = try model.forward([5388], offset: 3) }
+        #expect(model.reusablePrefix(ids.count, previousLength: ids.count) == 0)
+        #expect(model.reusablePrefix(ids.count + 1, previousLength: ids.count + 1) == ids.count + 1)
+        // Restarting at 0 starts from an empty state: the same prompt gives the same logits.
+        let again = Array(UnsafeBufferPointer(start: try model.forward(ids, offset: 0), count: V))
+        #expect(again == first)
     }
 
     /// The long-context split decode attention (attention_split + attention_combine) must give

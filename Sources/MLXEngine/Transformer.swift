@@ -1702,3 +1702,30 @@ extension RMSNorm {
                                  threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
     }
 }
+
+extension Transformer {
+    /// Hybrid models: a copy of the recurrent state (every linear-attention layer's convolution ring
+    /// and S) at `recurrentPosition`.
+    public struct RecurrentSnapshot {
+        public let position: Int
+        fileprivate let data: [Data]
+    }
+
+    /// Copies the recurrent state, so `restoreRecurrent` can later return to this position (to rerun
+    /// it: benchmarks, tests). Nothing may be in flight. The K/V caches need no copy: rows past the
+    /// position are rewritten before they are read.
+    public func snapshotRecurrent() -> RecurrentSnapshot {
+        RecurrentSnapshot(position: recurrentPosition, data: recurrentBuffers.map { Data(bytes: $0.contents(), count: $0.length) })
+    }
+
+    /// Returns the recurrent state to a snapshot's position (see `snapshotRecurrent`). Nothing may be in flight.
+    public func restoreRecurrent(_ s: RecurrentSnapshot) {
+        for (b, d) in zip(recurrentBuffers, s.data) {
+            d.withUnsafeBytes { b.contents().copyMemory(from: $0.baseAddress!, byteCount: min($0.count, b.length)) }
+        }
+        recurrentPosition = s.position
+        prepared = nil
+    }
+
+    private var recurrentBuffers: [MTLBuffer] { layers.compactMap(\.gdn).flatMap { [$0.ring, $0.state] } }
+}

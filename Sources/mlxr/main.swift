@@ -125,6 +125,14 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
     }
     let original = t.sparse
     defer { t.sparse = original }
+    // Hybrid models (recurrent state): every rerun of a position first restores the state there.
+    var base: Transformer.RecurrentSnapshot?, last: Transformer.RecurrentSnapshot?
+    func mark() { if t.config.isHybrid { last = t.snapshotRecurrent() } }
+    func seek(_ pos: Int) {
+        guard t.config.isHybrid, t.recurrentPosition != pos else { return }
+        guard let s = [base, last].compactMap({ $0 }).first(where: { $0.position == pos }) else { fail("no recurrent snapshot at \(pos)") }
+        t.restoreRecurrent(s)
+    }
     let sparse = t.sparseAvailable ? original : nil
     let steps = LongBench.steps
     func logits(_ tokens: [Int32], offset: Int) throws -> [Float] {
@@ -174,6 +182,7 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
             let s0 = Date()
             let first = try t.prefill(prompt, offset: 0, sample: sp)
             let prefillTime = Date().timeIntervalSince(s0)
+            if t.config.isHybrid { base = t.snapshotRecurrent() }
             print(String(format: "prefill @%d%@: %.1f s (%.0f tok/s)", ctx, at as NSString, prefillTime, Double(ctx) / prefillTime))
             // Each run decodes from the same prompt (positions from ctx on are rewritten, the index with them).
             var dense: [Int] = []
@@ -182,6 +191,7 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
             for (label, mode) in modes {
                 t.sparse = mode
                 t.seedSampler(1)
+                seek(ctx)
                 var tokens: [Int] = []
                 var gpu = 0.0
                 let s = Date()
@@ -209,9 +219,12 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
             // position, so the cache stays dense decode's).
             var match = 0, control = 0
             var input = Int32(first)
+            seek(ctx)
             for i in 0..<steps {
                 t.sparse = sparse
+                mark()
                 if argmax(try logits([input], offset: ctx + i)) == dense[i] { match += 1 }
+                seek(ctx + i)
                 t.sparse = nil
                 if argmax(try logits([input], offset: ctx + i)) == dense[i] { control += 1 }
                 input = Int32(dense[i])
@@ -223,10 +236,13 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
                 var kl: [Double] = [], nllDense = 0.0, nllSparse = 0.0, agree = 0
                 let edges: [Float] = [0.1, 0.5, 1]
                 var bucketTotal = [Int](repeating: 0, count: edges.count + 1), bucketAgree = bucketTotal
+                seek(ctx)
                 for i in 0..<N {
                     let input = text[(off + ctx + i) % text.count], target = Int(text[(off + ctx + i + 1) % text.count])
                     t.sparse = sparse
+                    mark()
                     let ls = try logits([input], offset: ctx + i)
+                    seek(ctx + i)
                     t.sparse = nil
                     let ld = try logits([input], offset: ctx + i)
                     let pd = logSoftmax(ld), ps = logSoftmax(ls)
@@ -254,7 +270,7 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
                 print(String(format: "    top-1 agreement %d/%d (%.1f%%); by dense top-1 margin (nats) %@", agree, N,
                              100 * Double(agree) / Double(N), byMargin as NSString))
             }
-            if oi == 0 {
+            if oi == 0 && !t.config.isHybrid {
                 // A dense verification pass of T tokens at this context (speculative decoding).
                 t.sparse = nil
                 var line: [String] = []
@@ -277,6 +293,7 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
                     let q = tokenizer.encode("\n\nQuestion: What is the passkey for door \(door)?\nAnswer: The passkey for door \(door) is").map { Int32($0) }
                     for (mi, mode) in [nil, sparse].enumerated() {
                         t.sparse = nil
+                        seek(ctx)
                         _ = try t.forward(Array(q.dropLast()), offset: ctx)
                         t.sparse = mode
                         var out: [Int] = []
