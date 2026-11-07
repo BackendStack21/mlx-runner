@@ -31,6 +31,9 @@ final class Linear {
     private(set) var qmvGatePSO: MTLComputePipelineState?  // decode with y = act(y) · e
     private(set) var qmvtPSO: MTLComputePipelineState?  // 4-bit, 2 tokens (speculative verification)
     private(set) var qmvxPSO: MTLComputePipelineState?  // 4-bit, 3...8 tokens (speculative verification, short prompts)
+    /// Decode over interleaved (scale, bias) pairs (`qmvp`; see `makePairs`), nil until made.
+    private(set) var pairs: MTLBuffer?
+    private(set) var qmvpPSO: MTLComputePipelineState?
     private var biasPSO: MTLComputePipelineState?
     let description: String
 
@@ -147,6 +150,30 @@ final class Linear {
                           outDim: a.outDim + b.outDim, name: name)
     }
 
+    /// Developer override of the `qmvp` grid for K = 1024 (MLXR_QMVP_GRID).
+    static let pairsGrid: Int? = Int(ProcessInfo.processInfo.environment["MLXR_QMVP_GRID"] ?? "")
+
+    /// Interleaves the quantization scales and biases into (scale, bias) pairs per group, so decode reads
+    /// them as one stream (`qmvp`, with outputs identical to `qmv`). The original arrays stay for the
+    /// other kernels: costs as much memory again as the scales and biases (1/9 of 4-bit g64 weights).
+    /// Only 4-bit layers without bias whose input size is a multiple of 1024; others are left as they are.
+    func makePairs() throws {
+        guard pairs == nil, bits == 4, bias == nil, inDim % 1024 == 0, groupSize % 32 == 0, qmvPSO != nil,
+              let s = scales, let b = biases, let sfx = s.dtype.suffix, s.dtype.size == b.dtype.size else { return }
+        let size = s.dtype.size, n = s.count
+        guard s.offset >= 0, b.offset >= 0, s.nbytes <= s.buffer.length - s.offset, b.nbytes <= b.buffer.length - b.offset else {
+            throw EngineError.invalidFile("\(description): tensor outside its file")
+        }
+        let buf = try GPU.shared.buffer(2 * n * size)
+        let sp = s.buffer.contents() + s.offset, bp = b.buffer.contents() + b.offset, out = buf.contents()
+        for i in 0..<n {
+            (out + 2 * i * size).copyMemory(from: sp + i * size, byteCount: size)
+            (out + (2 * i + 1) * size).copyMemory(from: bp + i * size, byteCount: size)
+        }
+        pairs = buf
+        qmvpPSO = try GPU.shared.pipeline(inDim == 1024 ? "qmvp1k_\(sfx)" : "qmvp_\(sfx)")
+    }
+
     /// Can these layers be computed by one fused decode dispatch?
     static func fusable(_ parts: [Linear]) -> Bool {
         guard let f = parts.first, parts.count <= 3, let s0 = f.scales else { return false }
@@ -169,11 +196,13 @@ final class Linear {
         // 2 tokens: scalar qmvt4 (per-token FMAs on weights unpacked once); 3...8: qmvx4 (8×8 MMA,
         // tokens padded to 8), whose cost hardly depends on T. Both are ALU-bound on an M2 Pro.
         let scalar = T == 2
-        enc.setComputePipelineState(T == 1 ? f.qmvPSO! : scalar ? f.qmvtPSO! : f.qmvxPSO!)
+        let paired = T == 1 && parts.allSatisfy { $0.qmvpPSO != nil }
+        enc.setComputePipelineState(paired ? f.qmvpPSO! : T == 1 ? f.qmvPSO! : scalar ? f.qmvtPSO! : f.qmvxPSO!)
         for slot in 0..<3 {
             let p = parts[min(slot, parts.count - 1)]
             let base = slot == 0 ? 0 : 3 + slot * 3   // 0, 6, 9
             enc.set(p.weight, base)
+            if paired { enc.set(p.pairs!, 0, base + 1); continue }
             enc.set(p.scales!, base + 1)
             enc.set(p.biases!, base + 2)
             enc.set(p.bias ?? p.scales!, 12 + slot)
@@ -187,6 +216,14 @@ final class Linear {
         enc.params(MMParams(K: Int32(f.inDim), O: Int32(total), T: Int32(T), gs: Int32(f.groupSize), xStride: Int32(xStride), yStride: Int32(yStride),
                             o1: Int32(parts[0].outDim), o2: Int32(parts.count > 1 ? parts[1].outDim : 0),
                             hasBias: f.bias != nil ? 1 : 0), 5)
+        if paired {
+            // K = 1024: a grid of at most max(512, blocks / 16) threadgroups whose simdgroups keep x and loop
+            // over row blocks (lm_head: ~2,000 threadgroups); otherwise one block per simdgroup.
+            let blocks = (total + rowsPerTG - 1) / rowsPerTG
+            let grid = f.inDim == 1024 ? min(blocks, Linear.pairsGrid ?? max(512, blocks / 16)) : blocks
+            enc.dispatchThreadgroups(MTLSize(width: grid, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
+            return
+        }
         enc.dispatchThreadgroups(MTLSize(width: (total + rowsPerTG - 1) / rowsPerTG, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
     }
@@ -535,6 +572,14 @@ final class TransformerLayer {
     }
 }
 
+extension Transformer {
+    /// Decode matvecs over interleaved quantization pairs (`Linear.makePairs`): hybrid (Qwen 3.5) models;
+    /// MLXR_PAIRS=0 turns it off.
+    static func usesPairs(_ c: ModelConfig) -> Bool {
+        c.isHybrid && c.bits == 4 && ProcessInfo.processInfo.environment["MLXR_PAIRS"] != "0"
+    }
+}
+
 extension TransformerLayer {
     /// Row stride of a layer's projection buffer: [q | k | v] ([q | gate | k | v] with Qwen 3.5's
     /// output gate), or a linear-attention layer's input projections.
@@ -762,6 +807,12 @@ public final class Transformer {
             lmHead = embed
         }
         quantDescription = layers.first?.down.description ?? ""
+        if Transformer.usesPairs(c) {
+            for l in layers {
+                for lin in l.qkv + [l.o] + l.gateUp + [l.down] + (l.gdn?.proj ?? []) { try lin.makePairs() }
+            }
+            try lmHead.makePairs()
+        }
         // The fused residual-norm kernels read two norm weights with one dtype.
         let normType = norm.weight.dtype
         for l in layers {
@@ -1524,12 +1575,12 @@ extension Transformer {
         let tLM = time(20) { lmHead.encode($0, x: xn, xStride: H, y: logits, yStride: lmHead.outDim, T: 1) }
         out += String(format: "lm_head matvec: %.3f ms  (%.0f GB/s, cache-warm)\n", tLM * 1000, bytes(lmHead) / tLM / 1e9)
         // Decode step breakdown: the step without each kernel class (its cost includes dispatch gaps).
-        func stepTime(_ skip: Set<String>, T: Int = 1) -> Double {
+        func stepTime(_ skip: Set<String>, T: Int = 1, offset: Int = 16) -> Double {
             profileSkip = skip
             defer { profileSkip = [] }
             var best = Double.infinity
             for _ in 0..<(T == 1 ? 5 : 3) {
-                let cb = try! encode(T: T, offset: T == 1 ? 16 : 0, computeLogits: true, allLogits: false)
+                let cb = try! encode(T: T, offset: T == 1 ? offset : 0, computeLogits: true, allLogits: false)
                 cb.commit(); cb.waitUntilCompleted()
                 best = min(best, cb.gpuEndTime - cb.gpuStartTime)
             }
@@ -1541,6 +1592,11 @@ extension Transformer {
             out += String(format: " %@ -%.3f", cls as NSString, (full - stepTime([cls])) * 1000)
         }
         out += String(format: "; matvecs only %.3f ms\n", stepTime(["post", "attn", "norm", "silu"]) * 1000)
+        if maxSeq > 1100 {
+            let f1k = stepTime([], offset: 1024)
+            out += String(format: "decode step @1024: %.3f ms; without attn -%.3f post -%.3f\n", f1k * 1000,
+                          (f1k - stepTime(["attn"], offset: 1024)) * 1000, (f1k - stepTime(["post"], offset: 1024)) * 1000)
+        }
         // Small-batch step (speculative verification, qmvx4) at T = 4 and 8.
         for vT in [4, Self.maxVerifyTokens] {
             let fullV = stepTime([], T: vT)

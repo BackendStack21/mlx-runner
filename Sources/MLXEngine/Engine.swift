@@ -768,7 +768,9 @@ extension InferenceEngine {
         // Sparse decode attention (on by default) adds its index when the context can reach its
         // minimum context (`Transformer.init` allocates nothing otherwise).
         let index = sparse.map { ctx >= $0.minContext } == true ? Transformer.sparseBytes(config: cfg, context: ctx) : 0
-        return (weights + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg) + index, ctx)
+        // Interleaved quantization pairs (hybrid models) repeat the scales and biases: 1/9 of 4-bit g64 weights.
+        let pairs = Transformer.usesPairs(cfg) ? weights / 9 : 0
+        return (weights + pairs + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg) + index, ctx)
     }
 
     /// Refuses to load models (a target and its draft) whose weights plus KV caches would not fit
