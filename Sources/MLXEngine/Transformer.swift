@@ -653,6 +653,11 @@ public final class Transformer {
     private let sampleDiag: MTLBuffer
     private let samplePSO: MTLComputePipelineState
     private let sampleThreads: Int
+    /// `sample_blocks`: the first pass of the token selection, the maximum of every block of 256
+    /// logits and its index ([blocks] floats, then [blocks] ints), read by `sample_token`.
+    private let sampleBlocksPSO: MTLComputePipelineState
+    private let sampleBlocks: MTLBuffer
+    private let sampleBlockCount: Int
     private let h: MTLBuffer
     let xn: MTLBuffer
     let qkvBuf: MTLBuffer
@@ -832,9 +837,12 @@ public final class Transformer {
         hist = try gpu.buffer((seq + 1) * 4)
         rngState = try gpu.buffer(16)
         sampleStatus = try gpu.buffer((seq + 1) * 4)
-        sampleDiag = try gpu.buffer(16)
+        sampleDiag = try gpu.buffer(32)
         samplePSO = try gpu.pipeline("sample_token")
         sampleThreads = min(1024, samplePSO.maxTotalThreadsPerThreadgroup) / 32 * 32
+        sampleBlocksPSO = try gpu.pipeline("sample_blocks")
+        sampleBlockCount = (lmHead.outDim + 255) / 256
+        sampleBlocks = try gpu.buffer(2 * sampleBlockCount * 4)
         var scratch = 0
         func buffer(_ n: Int) throws -> MTLBuffer { scratch += n; return try gpu.buffer(n) }
         h = try buffer(B * H * 4)
@@ -1447,18 +1455,34 @@ public final class Transformer {
         if var sp = sample {
             sp.V = Int32(min(Int(sp.V), lmHead.outDim))
             sp.pos = Int32(offset + T - 1)
-            enc.setComputePipelineState(samplePSO)
-            enc.set(logits, 0, 0)
-            enc.set(hist, 0, 1)
-            enc.set(rngState, 0, 2)
-            enc.set(sampleStatus, 0, 3)
-            enc.params(sp, 4)
-            enc.set(sampleDiag, 0, 5)
-            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: sampleThreads, height: 1, depth: 1))
+            encodeSample(enc, sp, logits: logits)
         }
         enc.endEncoding()
         return cb
+    }
+
+    /// Token selection on `logits` into hist[sp.pos + 1]: `sample_blocks` (the block maxima, the
+    /// whole GPU) then `sample_token` (one threadgroup over the candidate blocks).
+    private func encodeSample(_ enc: MTLComputeCommandEncoder, _ sp: SampleParams, logits: MTLBuffer) {
+        let blocks = (Int(sp.V) + 255) / 256
+        enc.setComputePipelineState(sampleBlocksPSO)
+        enc.set(logits, 0, 0)
+        enc.params(sp, 4)
+        enc.set(sampleBlocks, 0, 6)
+        enc.set(sampleBlocks, sampleBlockCount * 4, 7)
+        enc.dispatchThreadgroups(MTLSize(width: (blocks + 7) / 8, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.setComputePipelineState(samplePSO)
+        enc.set(logits, 0, 0)
+        enc.set(hist, 0, 1)
+        enc.set(rngState, 0, 2)
+        enc.set(sampleStatus, 0, 3)
+        enc.params(sp, 4)
+        enc.set(sampleDiag, 0, 5)
+        enc.set(sampleBlocks, 0, 6)
+        enc.set(sampleBlocks, sampleBlockCount * 4, 7)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: sampleThreads, height: 1, depth: 1))
     }
 
     /// Qwen 3.5 linear attention for T tokens at `offset`: the input projections into `qkvBuf`, then the
@@ -1653,6 +1677,14 @@ extension Transformer {
 }
 
 extension Transformer {
+    /// Running totals of the GPU sampler since the last call (profiling): pool-pass attempts and pool
+    /// sizes summed over the sampled steps, and the largest attempt count. Nothing may be in flight.
+    public func takeSampleDiagnostics() -> (attempts: Int, pool: Int, maxAttempts: Int) {
+        let d = sampleDiag.contents().bindMemory(to: Int32.self, capacity: 8)
+        defer { d[2] = 0; d[3] = 0; d[4] = 0 }
+        return (Int(d[2]), Int(d[3]), Int(d[4]))
+    }
+
     /// Developer micro-benchmark of the GPU token selection on the current logits (run a forward
     /// pass first): GPU time per dispatch, pool size and attempts for the given parameters.
     public func profileSampler(_ params: SamplingParameters, repeats: Int = 50) -> String {
@@ -1670,11 +1702,7 @@ extension Transformer {
                 blit.endEncoding()
                 guard sample else { continue }
                 let enc = cb.makeComputeCommandEncoder(dispatchType: .serial)!
-                enc.setComputePipelineState(samplePSO)
-                enc.set(scratch, 0, 0); enc.set(hist, 0, 1); enc.set(rngState, 0, 2); enc.set(sampleStatus, 0, 3)
-                enc.params(sp, 4)
-                enc.set(sampleDiag, 0, 5)
-                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: sampleThreads, height: 1, depth: 1))
+                encodeSample(enc, sp, logits: scratch)
                 enc.endEncoding()
             }
             cb.commit(); cb.waitUntilCompleted()

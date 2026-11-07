@@ -2081,12 +2081,54 @@ inline uint smp_key(float f) { const uint u = as_type<uint>(f); return (u & 0x80
 inline float smp_val(ulong key) { const uint u = uint(key >> 32); return as_type<float>((u & 0x80000000u) ? (u & 0x7fffffffu) : ~u); }
 inline int smp_id(ulong key) { return int(~uint(key)); }
 
+#define SMP_BLK 256      // logits per block of the first pass (one simdgroup, 8 contiguous values per lane)
+#define SMP_POOL_MIN 128 // smallest accepted pool-size window top (see `cap` below)
+
+// Maximum of block b of the logits and the lowest index holding it (the whole simdgroup).
+inline void smp_block(device const float* logits, int V, int b, uint lane, thread float& m, thread int& idx) {
+    const int i0 = b * SMP_BLK + int(lane) * 8;
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    if (i0 + 8 <= V) {
+        const float4 a = *(device const float4*)(logits + i0), c = *(device const float4*)(logits + i0 + 4);
+        const float v[8] = {a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w};
+        for (int j = 0; j < 8; j++) if (v[j] > best) { best = v[j]; bi = i0 + j; }
+    } else {
+        for (int i = i0; i < V; i++) { const float v = logits[i]; if (v > best) { best = v; bi = i; } }
+    }
+    m = simd_max(best);
+    idx = simd_min(best == m ? bi : 0x7fffffff);
+}
+
+// First pass of the token selection, one simdgroup per block of SMP_BLK logits, the whole GPU at
+// work: bmax[b] / barg[b] = the block's maximum and its lowest index. `sample_token` reduces the
+// blocks for the maximum and scans only the blocks that can hold a candidate, instead of one
+// threadgroup (one GPU core) reading the whole vocabulary once per pass.
+kernel void sample_blocks(device const float*    logits [[buffer(0)]],
+                          constant SampleParams& p      [[buffer(4)]],
+                          device float*          bmax   [[buffer(6)]],
+                          device int*            barg   [[buffer(7)]],
+                          uint tg   [[threadgroup_position_in_grid]],
+                          uint sgid [[simdgroup_index_in_threadgroup]],
+                          uint nsg  [[simdgroups_per_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    const int nb = (p.V + SMP_BLK - 1) / SMP_BLK;
+    const int b = int(tg) * int(nsg) + int(sgid);
+    if (b >= nb) return;
+    float m; int idx;
+    smp_block(logits, p.V, b, lane, m, idx);
+    if (lane == 0) { bmax[b] = m; barg[b] = idx; }
+}
+
+// Second pass (one threadgroup) after `sample_blocks`: the token for hist[pos + 1].
 kernel void sample_token(device float*          logits [[buffer(0)]],
                          device int*            hist   [[buffer(1)]],
                          device ulong*          rng    [[buffer(2)]],   // [0] xorshift64 state, then the pool-width hint (float)
                          device int*            status [[buffer(3)]],   // status[pos + 1]: 0 ok, 1 non-finite logits
                          constant SampleParams& p      [[buffer(4)]],
                          device int*            diag   [[buffer(5)]],   // [0] pool size, [1] attempts (profiling)
+                         device float*          bmax   [[buffer(6)]],   // sample_blocks: block maxima
+                         device int*            barg   [[buffer(7)]],   //                and their indices
                          uint tid  [[thread_index_in_threadgroup]],
                          uint tsz  [[threads_per_threadgroup]],
                          uint sgid [[simdgroup_index_in_threadgroup]],
@@ -2110,19 +2152,29 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
             if (!dup && t >= 0 && t < V) { const float v = logits[t]; logits[t] = v > 0.0f ? v / p.penalty : v * p.penalty; }
         }
         threadgroup_barrier(mem_flags::mem_device);
+        // The blocks holding a penalized token get their maximum recomputed (one simdgroup per
+        // token; two tokens of one block write the same values).
+        for (int j = int(sgid); j < n; j += int(nsg)) {
+            const int t = hist[pos - j];
+            bool dup = false;
+            for (int j2 = 0; j2 < j; j2++) dup = dup || (hist[pos - j2] == t);
+            if (dup || t < 0 || t >= V) continue;
+            const int b = t / SMP_BLK;
+            float m; int idx;
+            smp_block(logits, V, b, lane, m, idx);
+            if (lane == 0) { bmax[b] = m; barg[b] = idx; }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
     }
 
-    // 2. Max logit and its lowest index. Passes over the logits take 8 contiguous values per lane
-    //    (two vector loads in flight) so they are not bound by load latency.
+    // 2. Max logit and its lowest index, from the block maxima of `sample_blocks` (ascending blocks,
+    //    strictly greater wins: the lowest index of the maximum). Passes over the logits take 8
+    //    contiguous values per lane (two vector loads in flight) so they are not bound by load latency.
     const int V8 = V & ~7;
+    const int nb = (V + SMP_BLK - 1) / SMP_BLK;
     float best = -INFINITY;
     int bi = 0x7fffffff;
-    for (int i0 = int(tid) * 8; i0 < V8; i0 += int(tsz) * 8) {
-        const float4 a = *(device const float4*)(logits + i0), b = *(device const float4*)(logits + i0 + 4);
-        const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-        for (int j = 0; j < 8; j++) if (v[j] > best) { best = v[j]; bi = i0 + j; }
-    }
-    for (int i = V8 + int(tid); i < V; i += int(tsz)) { const float v = logits[i]; if (v > best) { best = v; bi = i; } }
+    for (int b = int(tid); b < nb; b += int(tsz)) { const float v = bmax[b]; if (v > best) { best = v; bi = barg[b]; } }
     const float sm = simd_max(best);
     const int si = simd_min(best == sm ? bi : 0x7fffffff);
     if (lane == 0) { shf[sgid] = sm; shi[sgid] = si; }
@@ -2147,8 +2199,10 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
     //    at the maximum (delta = 0), an index bound is bisected instead, so the lowest ids win.
     //    k is capped at SMP_CAP (the CPU sampler caps a disabled top-k at 512 for the same reason).
     const int k = min(p.topK > 0 ? min(p.topK, V) : min(512, V), SMP_CAP);
-    // Aim for a pool of at most ~2k so sorting it stays cheap (SMP_CAP is the hard limit).
-    const uint cap = uint(min(SMP_CAP, max(2 * k, 128)));
+    // Aim for a pool of at most ~2k so sorting it stays cheap (SMP_CAP is the hard limit). The pool
+    // only has to hold the top k: its size does not change the selection, so the window is a cost
+    // trade-off (wider: fewer attempts, longer sort). SMP_POOL_MIN is a tuning point.
+    const uint cap = uint(min(SMP_CAP, max(2 * k, SMP_POOL_MIN)));
     device float* hint = (device float*)(rng + 1);
     float delta = hint[0];
     if (!(delta > 0.0f) || !(delta < 1.0e6f)) delta = 8.0f;
@@ -2156,13 +2210,34 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
     int limitB = V, loB = 0, hiB = V;   // index bound, used only once delta has reached 0
     uint count = 0;
     int attempts = 0;
+    // An attempt first bounds the pool with the block maxima: every block whose maximum reaches
+    // the threshold holds 1 to SMP_BLK candidates, so a threshold that `above` blocks reach gives
+    // above <= |pool| <= above · SMP_BLK. When that already decides the attempt the scan is skipped;
+    // the pool kept at the end always comes from a real scan (`force` repeats a skipped attempt).
+    bool force = false;
     for (int attempt = 0; attempt < 64; attempt++) {
-        attempts++;
         if (tid == 0) atomic_store_explicit(&np, 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float thr = M - delta;
-        // 256 logits per simdgroup step (8 per lane); one atomic reserves the step's pool slots.
-        for (int base = int(sgid) * 256; base < V8; base += int(nsg) * 256) {
+        int above = -1;
+        if (delta > 0.0f && limitB == V) {
+            uint c = 0;
+            for (int b = int(tid); b < nb; b += int(tsz)) c += bmax[b] >= thr ? 1u : 0u;
+            c = simd_sum(c);
+            if (lane == 0) shi[sgid] = int(c);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            above = 0;
+            for (uint s = 0; s < nsg; s++) above += shi[s];
+        }
+        const bool scanned = force || above < 0 || !(uint(above) > cap || above * SMP_BLK < k);
+        if (!scanned) {
+            count = uint(above) > cap ? uint(above) : uint(above * SMP_BLK);
+        } else {
+        attempts++;   // scans (the bounded attempts cost nothing to speak of)
+        // One SMP_BLK block per simdgroup step (8 per lane), skipping the blocks whose maximum is
+        // below the threshold; one atomic reserves the step's pool slots.
+        for (int base = int(sgid) * SMP_BLK; base < V8; base += int(nsg) * SMP_BLK) {
+            if (bmax[base / SMP_BLK] < thr) continue;
             const int i0 = base + int(lane) * 8;
             float v[8];
             if (i0 < V8) {
@@ -2194,7 +2269,9 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         count = atomic_load_explicit(&np, memory_order_relaxed);
-        if (count >= uint(k) && count <= cap) break;
+        }
+        if (force) break;                                   // the repeated attempt: keep its pool
+        if (count >= uint(k) && count <= cap) break;        // (never true for a skipped attempt)
         if (delta == 0.0f) {                                // ties at the max: bisect the index bound
             if (count > cap) hiB = limitB; else loB = limitB;
             limitB = (loB + hiB) / 2;
@@ -2205,13 +2282,24 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
             // The interval collapsed, or the threshold can no longer move: only the max level fits.
             if (delta <= loD || delta >= hiD || M - delta >= M) delta = 0.0f;
         } else {
-            if (delta >= 1.0e6f) break;                     // fewer than k finite logits: take what there is
+            if (delta >= 1.0e6f) {                          // fewer than k finite logits: take what there is
+                if (scanned) break;
+                force = true; continue;
+            }
+            const float used = delta;
             loD = delta;
             delta = hiD < INFINITY ? 0.5f * (loD + hiD) : 4.0f * max(delta, 0.25f);
-            if (delta <= loD || delta >= hiD) break;        // no float between the bounds: keep this pool
+            if (delta <= loD || delta >= hiD) {             // no float between the bounds: keep this pool
+                if (scanned) break;
+                delta = used; force = true;
+            }
         }
     }
-    if (tid == 0) { if (delta > 0.0f) hint[0] = delta; diag[0] = int(count); diag[1] = attempts; }
+    if (tid == 0) {
+        if (delta > 0.0f) hint[0] = delta;
+        diag[0] = int(count); diag[1] = attempts;
+        diag[2] += attempts; diag[3] += int(min(count, uint(SMP_CAP))); diag[4] = max(diag[4], attempts);   // running totals (profiling)
+    }
     const int pool = int(min(count, uint(SMP_CAP)));
     const int n = min(k, pool);
 

@@ -477,6 +477,10 @@ case "bench":
             }
             let dt = Date().timeIntervalSince(s)
             print(String(format: "%@ @%4d: %6.1f tok/s  (wall %.2f ms, gpu %.2f ms per token)", label as NSString, ctx, Double(steps) / dt, dt / Double(steps) * 1000, gpu / Double(steps) * 1000))
+            let diag = t.takeSampleDiagnostics()
+            if ProcessInfo.processInfo.environment["MLXR_BENCH_SAMPLEDIAG"] != nil, diag.attempts > 0 {
+                print(String(format: "  sampler: %.2f attempts and pool %.0f per token on average, at most %d attempts", Double(diag.attempts) / Double(steps + 1), Double(diag.pool) / Double(steps + 1), diag.maxAttempts))
+            }
         }
     }
     // Speculative verification cost: one forward over T tokens with logits for every row.
