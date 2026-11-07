@@ -21,6 +21,8 @@ struct ModelTests {
     static let qwen25 = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
     /// Hybrid: Gated DeltaNet linear attention with a recurrent state, and gated full attention.
     static let qwen35 = "mlx-community/Qwen3.5-0.8B-4bit"
+    /// Twice as many value heads as key heads in the linear-attention layers, hidden size 2560.
+    static let qwen35_4b = "mlx-community/Qwen3.5-4B-4bit"
     /// Every architecture: sparse attention runs on each one's full-attention layers.
     static let allArchitectures = [qwen3, llama, phi, mistral, qwen25, GemmaModelTests.gemma1, GemmaModelTests.gemma2,
                                    GemmaModelTests.gemma3, GemmaModelTests.gemma4] + large
@@ -45,7 +47,7 @@ struct ModelTests {
 
     /// Prefill (GEMM + flash attention) and token-by-token decode (matvec + decode attention)
     /// must produce the same next-token distribution.
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, qwen35] + large)
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, qwen35, qwen35_4b] + large)
     func prefillMatchesIncrementalDecode(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let model = try Transformer(directory: dir, contextLength: 1024)

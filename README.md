@@ -95,7 +95,7 @@ gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx
 | `gemma3_text`, `gemma3` | gemma-3-1b-it-qat-4bit, gemma-3-270m-it-4bit | q/k norms, 5:1 sliding/global layers with their own RoPE bases; `gemma3` multimodal exports run their language model |
 | `gemma4`, `gemma4_text` | gemma-4-e2b-it-OptiQ-4bit | head dims 256/512, proportional RoPE, KV sharing across layers, per-layer input embeddings, mixed 4/8-bit layers |
 | `gemma4_unified` | gemma-4-12B-it-OptiQ-4bit | as above, K = V in the global layers; the vision part of the export is ignored |
-| `qwen3_5`, `qwen3_5_text` | Qwen3.5-0.8B-4bit | hybrid: Gated DeltaNet linear attention (a recurrent state, no KV cache) in 3 of every 4 layers, gated full attention with partial RoPE in the rest; thinking toggle; the vision part of the export is ignored |
+| `qwen3_5`, `qwen3_5_text` | Qwen3.5-0.8B-4bit, Qwen3.5-2B-4bit, Qwen3.5-4B-4bit | hybrid: Gated DeltaNet linear attention (a recurrent state, no KV cache) in 3 of every 4 layers, gated full attention with partial RoPE in the rest; thinking toggle; the vision part of the export is ignored |
 
 Each checkpoint above passes end-to-end generation and the prefill-versus-decode consistency test; the Gemma and Qwen 3.5 checkpoints also match mlx-lm's logits position by position (teacher-forced: the same argmax at every position, within 0.05 of a float32 mlx-lm run; Qwen3.5-0.8B within 0.004). Other models of the same type, such as larger Qwen3, Qwen2.5-Coder or other Llama 3 fine-tunes, should work too, unless they need a feature that isn't implemented.
 
@@ -142,10 +142,11 @@ Measured with `mlxr bench` on an **M2 Pro (16 GB)**. Decode is measured with gre
 | Mistral 7B | 41.0 | 41.2 | 247 | 305 |
 | Qwen3.5 0.8B ¹ | 271 | 254 | 2,780 | 2,420 |
 | Qwen3.5 2B ¹ | 133 | 136 | 1,158 | 1,030 |
+| Qwen3.5 4B ¹ | 62.3 | 65.7 | | |
 
-¹ Medians of three (0.8B) or two (2B) rounds that alternate the two engines, against `mlx_lm.benchmark` (128 generated tokens after a 16-token prompt; its prefill figure is `prompt_tps` at 512 tokens, which reads higher than a raw forward). At 1,024 tokens of context the 0.8B decodes at 260 tok/s against 245 (+6%), and a 256-token chat reply runs at 269 tok/s against 252 for `mlx_lm.generate` (+7%).
+¹ Medians of three (0.8B), two (2B) or one (4B) rounds that alternate the two engines, against `mlx_lm.benchmark` (128 generated tokens after a 16-token prompt; its prefill figure is `prompt_tps` at 512 tokens, which reads higher than a raw forward). At 1,024 tokens of context the 0.8B decodes at 260 tok/s against 245 (+6%), and a 256-token chat reply runs at 269 tok/s against 252 for `mlx_lm.generate` (+7%).
 
-MLX Runner decodes faster on the smallest Qwen models (Qwen3.5 0.8B by 6–7%) and Phi-3.5, is close on most others (Qwen3.5 2B is 2% behind), and is well behind on Gemma 2. It prefills 512 tokens faster on Qwen3 and Gemma 4 and is behind on Gemma 1.1, Phi-3.5 and Mistral 7B. At 128 tokens, where the 32×32 tile runs, mlx-lm prefills 4–36% faster on every model except Gemma 4, which is level.
+MLX Runner decodes faster on the smallest Qwen models (Qwen3.5 0.8B by 6–7%) and Phi-3.5, is close on most others (Qwen3.5 2B is 2% behind, the 4B 5%), and is well behind on Gemma 2. It prefills 512 tokens faster on Qwen3 and Gemma 4 and is behind on Gemma 1.1, Phi-3.5 and Mistral 7B. At 128 tokens, where the 32×32 tile runs, mlx-lm prefills 4–36% faster on every model except Gemma 4, which is level.
 
 **The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 41.0 tok/s, about 85% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a 3-bit model (which would raise the ceiling to about 60 tok/s, but only 4-bit has an optimized decode kernel so far), or speculative decoding (see Limitations).
 

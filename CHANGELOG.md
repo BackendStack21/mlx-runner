@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-Qwen 3.5 support: the hybrid Gated DeltaNet architecture. Decode is 6–7% ahead of mlx-lm on the 0.8B model and 2% behind on the 2B.
+Qwen 3.5 support: the hybrid Gated DeltaNet architecture. Decode is 6–7% ahead of mlx-lm on the 0.8B model, 2% behind on the 2B and 5% behind on the 4B; prefill is ahead.
 
-- **Qwen 3.5** (`qwen3_5`, `qwen3_5_text`; the dense models, 0.8B to 27B). Three of every four layers are
+- **Qwen 3.5** (`qwen3_5`, `qwen3_5_text`; the dense models; verified on the 0.8B, 2B and 4B 4-bit
+  exports). Three of every four layers are
   Gated DeltaNet linear attention: a causal convolution and a recurrent state per head instead of a
   KV cache. The others are full attention with an output gate and partial RoPE (64 of 256 dims).
   - New Metal kernels: decode runs each linear-attention layer's convolution, q/k normalization,
@@ -27,6 +28,8 @@ Qwen 3.5 support: the hybrid Gated DeltaNet architecture. Decode is 6–7% ahead
     1,024 (+6.3%); a 256-token chat reply 269.4 vs 251.6 tok/s (`mlxr run` vs `mlx_lm.generate`, +7.1%);
     prefill of 512 tokens 2,780 vs 2,420 tok/s.
   - Qwen3.5-2B-4bit: decode 133.1 vs 135.5 tok/s (−1.8%), 130.5 vs 133.7 at 1,024; prefill 1,158 vs 1,030.
+  - Qwen3.5-4B-4bit: decode 62.3 vs 65.7 tok/s (−5%), 61.4 vs 64.5 at 1,024 (hidden size 2,560: none of
+    the K = 1,024 or paired kernels apply; the larger matvecs lag mlx-lm as on 7–14B models).
   - Where the time goes: the linear-attention layers' recurrent state runs at the memory bandwidth floor
     (0.19 ms per token for 18 layers); the rest is the 4-bit matvecs and about 200 dependent dispatches.
 - **Kernels** (hybrid models only unless noted; greedy output unchanged by each):
