@@ -393,6 +393,108 @@ kernel void qmvp(device const uchar* wA [[buffer(0)]],
     }
 }
 
+// Pre-scaled x for the mask-only nibble extraction (qmv): 32 values from x + k and their sum.
+inline void qmv4_loadx(device const float* x, int k, thread float4* xv, thread float& xs) {
+    const float4 sLo = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    const float4 sHi = sLo * (1.0f / 65536.0f);
+    device const float4* xp = (device const float4*)(x + k);
+    xs = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        const float4 v = xp[i];
+        xs += v.x + v.y + v.z + v.w;
+        xv[i] = v * ((i & 1) ? sHi : sLo);
+    }
+}
+
+// 32 weights (one 16-byte load) against pre-scaled x: qmv's per-lane arithmetic.
+inline float qmv4_dot32(uint4 wq, thread const float4* xv) {
+    const uint4 mLo = uint4(0xFu, 0xF0u, 0xF00u, 0xF000u);
+    const uint4 mHi = mLo << 16;
+    float d = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        const uint4 wi = uint4(wq[i]);
+        d += dot(float4(wi & mLo), xv[2 * i]) + dot(float4(wi & mHi), xv[2 * i + 1]);
+    }
+    return d;
+}
+
+// This lane's weight and pair pointers for the block at `row` of the fused [A|B|C] matrix.
+template <typename T>
+inline void qmvq1_locate(int row, constant MMParams& p, device const uchar* wA, device const T* pA,
+                         device const uchar* wB, device const T* pB, device const uchar* wC, device const T* pC,
+                         ulong off, int gpr, int g, thread device const uchar*& wb, thread device const T*& pb) {
+    int rowBase;
+    device const uchar* w; device const T* pq;
+    if (row < p.o1) { w = wA; pq = pA; rowBase = row; }
+    else if (row < p.o1 + p.o2) { w = wB; pq = pB; rowBase = row - p.o1; }
+    else { w = wC; pq = pC; rowBase = row - p.o1 - p.o2; }
+    wb = w + ulong(rowBase) * 512 + off;
+    pb = pq + (ulong(rowBase) * ulong(gpr) + ulong(g)) * 2;
+}
+
+// acc + s · d + b · xs as the compiler contracts it in qmv (checked bit for bit against qmv on every
+// Qwen 3.5 0.8B layer); written out so a different surrounding loop cannot change the rounding.
+inline float qmv4_acc(float acc, float s, float d, float b, float xs) { return fma(s, d, fma(b, xs, acc)); }
+
+// Decode matvec over interleaved pairs for K == 1024 with x held in registers: each simdgroup walks
+// 4-row blocks (gRow, gRow + stride, ...) and loads the next block's weights and pairs before it
+// computes the current one, so a block's memory latency overlaps the previous block's arithmetic.
+// Output rows must be a multiple of 4 ([A|B|C] boundaries are multiples of 8). Per-row arithmetic
+// and reduction are qmv's (TAIL 0, one pass), so outputs are identical.
+template <typename T>
+kernel void qmvq1(device const uchar* wA [[buffer(0)]],
+                  device const T*     pA [[buffer(1)]],
+                  device const float* x  [[buffer(3)]],
+                  device float*       y  [[buffer(4)]],
+                  constant MMParams&  p  [[buffer(5)]],
+                  device const uchar* wB [[buffer(6)]],
+                  device const T*     pB [[buffer(7)]],
+                  device const uchar* wC [[buffer(9)]],
+                  device const T*     pC [[buffer(10)]],
+                  uint2 tgid [[threadgroup_position_in_grid]],
+                  uint2 ntg  [[threadgroups_per_grid]],
+                  uint  sgid [[simdgroup_index_in_threadgroup]],
+                  uint  lane [[thread_index_in_simdgroup]]) {
+    const int gpr = 1024 / p.gs;
+    const int g = int(lane) * 32 / p.gs;
+    int gRow = (int(tgid.x) * QVNSG + int(sgid)) * QROWS;
+    if (gRow >= p.O) return;
+    float4 xv[8];
+    float xs;
+    qmv4_loadx(x, int(lane) * 32, xv, xs);
+    const int stride = int(ntg.x) * QVNSG * QROWS;
+    const ulong off = ulong(lane) * 16;
+    device const uchar* wb; device const T* pb;
+    qmvq1_locate(gRow, p, wA, pA, wB, pB, wC, pC, off, gpr, g, wb, pb);
+    uint4 wq[QROWS];
+    float2 pr[QROWS];
+    for (int r = 0; r < QROWS; r++) {
+        wq[r] = *(device const uint4*)(wb + ulong(r) * 512);
+        pr[r] = float2(pb[ulong(r) * ulong(gpr) * 2], pb[ulong(r) * ulong(gpr) * 2 + 1]);
+    }
+    while (true) {
+        const int gNext = gRow + stride;
+        uint4 wn[QROWS];
+        float2 pn[QROWS];
+        if (gNext < p.O) {
+            qmvq1_locate(gNext, p, wA, pA, wB, pB, wC, pC, off, gpr, g, wb, pb);
+            for (int r = 0; r < QROWS; r++) {
+                wn[r] = *(device const uint4*)(wb + ulong(r) * 512);
+                pn[r] = float2(pb[ulong(r) * ulong(gpr) * 2], pb[ulong(r) * ulong(gpr) * 2 + 1]);
+            }
+        }
+        float acc[QROWS] = {0, 0, 0, 0};
+        for (int r = 0; r < QROWS; r++) acc[r] = qmv4_acc(acc[r], pr[r].x, qmv4_dot32(wq[r], xv), pr[r].y, xs);
+        for (int r = 0; r < QROWS; r++) {
+            const float v = simd_sum(acc[r]);
+            if (lane == 0) y[gRow + r] = v;
+        }
+        if (gNext >= p.O) break;
+        gRow = gNext;
+        for (int r = 0; r < QROWS; r++) { wq[r] = wn[r]; pr[r] = pn[r]; }
+    }
+}
+
 // Small-batch 4-bit matmul (T = 3..8 tokens: speculative verification, short prompts) on
 // simdgroup matrices. Each weight is loaded and dequantized once, independent of T; the
 // per-token work is one 8×8×8 multiply-accumulate per 64 weights, the tokens padded to 8.
@@ -2422,7 +2524,8 @@ INST_QMVT(half, f16) INST_QMVT(bfloat, bf16) INST_QMVT(float, f32)
   template [[host_name("norm_add_rms_norm_" #TN)]] kernel void norm_add_rms_norm<T>(device float*, device const float*, device float*, device const T*, constant NormParams&, device const T*, constant float&, uint, uint, uint, uint, uint, uint); \
   template [[host_name("add_bias_" #TN)]] kernel void add_bias<T>(device float*, device const T*, constant EWParams&, uint2); \
   template [[host_name("qmvp_" #TN)]] kernel void qmvp<T, false>(device const uchar*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const uchar*, device const T*, uint2, uint2, uint, uint); \
-  template [[host_name("qmvp1k_" #TN)]] kernel void qmvp<T, true>(device const uchar*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const uchar*, device const T*, uint2, uint2, uint, uint);
+  template [[host_name("qmvp1k_" #TN)]] kernel void qmvp<T, true>(device const uchar*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const uchar*, device const T*, uint2, uint2, uint, uint); \
+  template [[host_name("qmvq1_" #TN)]] kernel void qmvq1<T>(device const uchar*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const uchar*, device const T*, uint2, uint2, uint, uint);
 
 INST_DENSE(half, f16)
 INST_DENSE(bfloat, bf16)
