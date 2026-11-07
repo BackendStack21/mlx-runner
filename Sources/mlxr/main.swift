@@ -438,9 +438,11 @@ case "bench":
               ? "sparse decode attention: top-k \(sp.topK), window \(sp.window), sink \(sp.sink), from \(sp.minContext) tokens"
               : "sparse decode attention: off (\(t.sparseOffReason ?? "unavailable"))")
     }
+    print("attention: \(t.attentionSummary)")
     let quick = ProcessInfo.processInfo.environment["MLXR_BENCH_DECODE"] != nil
     let noProfile = quick || ProcessInfo.processInfo.environment["MLXR_BENCH_NOPROFILE"] != nil
     if !noProfile { print(try t.profile()) }
+    if ProcessInfo.processInfo.environment["MLXR_BENCH_PROFILE_ONLY"] != nil { exit(0) }
     _ = try t.forward([1], offset: 0)
     for n in (quick ? [] : [128, 512, 2048]) {
         let toks = (0..<n).map { Int32($0 % 1000 + 100) }

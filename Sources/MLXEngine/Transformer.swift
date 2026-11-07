@@ -691,6 +691,46 @@ public final class Transformer {
         /// Sparse decode attention (`attention_sparse`, split's shape; combined by `split.combine`).
         /// Only looked up for a model loaded with sparse attention.
         var sparse: MTLComputePipelineState?
+        /// Hybrid models' decode attention (`attention_hyb`), replacing `decode` / `split` for small batches.
+        var hybrid: HybridAttn?
+    }
+    struct HybridAttn {
+        /// Single-kernel path below `minSplit`; nil leaves short contexts to the generic decode kernel.
+        var fused: MTLComputePipelineState?; var fusedSG: Int
+        var split: MTLComputePipelineState; var splitTG: Int; var splitSG: Int
+        var combine: MTLComputePipelineState; var combineSG: Int
+        /// The kernels apply the sigmoid output gate themselves.
+        var gated: Bool
+        /// Context length from which the split kernel pair is used.
+        var minSplit: Int
+    }
+    /// `attention_hyb` shape: virtual simdgroups V (NSG per threadgroup), U keys in flight, the fused
+    /// kernel's simdgroups and keys in flight (0: the generic kernel serves short contexts), the
+    /// context from which the split pair runs, and the combine kernel's simdgroups. Measured on an
+    /// M2 Pro with Qwen3.5-0.8B: 64 × (8 × 8) with 2 keys in flight and an 8-simdgroup combine took
+    /// decode @1024 from 253.9 to 256.0 tok/s (sampled 246.0 → 247.3), with 128 virtual simdgroups
+    /// or the split pair at every context no better; the fused kernel (2 threadgroups) lost ~2% at
+    /// 16 tokens against the generic kernel, so short contexts keep that one. Only shapes with an
+    /// instantiation work. `MLXR_HYB_ATTN=V,NSG,U,fusedSG,fusedU,minSplit,combineSG` overrides it
+    /// (experiments); "0" disables the kernels.
+    static let hybridAttnShape: (V: Int, NSG: Int, U: Int, fusedSG: Int, fusedU: Int, minSplit: Int, CNSG: Int)? = {
+        if let s = ProcessInfo.processInfo.environment["MLXR_HYB_ATTN"] {
+            if s == "0" { return nil }
+            let v = s.split(separator: ",").compactMap { Int($0) }
+            if v.count == 7 { return (v[0], v[1], v[2], v[3], v[4], v[5], v[6]) }
+        }
+        return (64, 8, 2, 0, 0, 256, 8)
+    }()
+    /// The decode attention kernels in use, per head size (for `mlxr bench` / `run`).
+    public var attentionSummary: String {
+        attnKernels.keys.sorted().map { D in
+            let k = attnKernels[D]!
+            if let h = k.hybrid {
+                let short = h.fused != nil ? "fused \(h.fusedSG) simdgroups" : "generic kernel"
+                return "head_dim \(D): hybrid kernels (\(short) below \(h.minSplit) tokens; split \(h.splitTG) threadgroups × \(h.splitSG), combine \(h.combineSG)\(h.gated ? ", gate folded" : ""))"
+            }
+            return "head_dim \(D): generic decode kernel\(k.split != nil ? " + split from \(attnSplitMinContext) tokens" : "")"
+        }.joined(separator: "; ")
     }
     /// By head size (Gemma 4 mixes 256 and 512).
     private let attnKernels: [Int: AttnKernels]
@@ -911,6 +951,22 @@ public final class Transformer {
                 k.splitGroups = G / gSub
                 partialBytes = max(partialBytes, bytes)
                 if sparse != nil { k.sparse = try? gpu.pipeline("attention_sparse_\(e)_\(gSub)\(cap)") }
+            }
+            // Hybrid models (Qwen 3.5): vectorized decode attention with the output gate folded in.
+            // Its partials (NT rows per head) fit the split buffer (32 rows per head).
+            if c.isHybrid, D == 256, cap.isEmpty, Gs == [4], c.numHeads % 2 == 0,
+               let hyb = Self.hybridAttnShape {
+                let g = c.attnOutputGate ? "_g" : ""
+                let fused = hyb.fusedSG > 0 ? try? gpu.pipeline("attention_hyb_4_\(hyb.fusedSG)_\(hyb.fusedSG)_\(hyb.fusedU)\(g)") : nil
+                if hyb.fusedSG == 0 || (fused.map { $0.maxTotalThreadsPerThreadgroup >= hyb.fusedSG * 32 } ?? false),
+                   let split = try? gpu.pipeline("attention_hyb_4_\(hyb.V)_\(hyb.NSG)_\(hyb.U)\(g)"),
+                   split.maxTotalThreadsPerThreadgroup >= hyb.NSG * 32,
+                   let combine = try? gpu.pipeline("attention_hyb_combine_\(hyb.V / hyb.NSG)_\(hyb.CNSG)\(g)"),
+                   case let (bytes, o) = c.numHeads.multipliedReportingOverflow(by: Self.attnSplitVirtualSG * (D + 2) * 4), !o {
+                    k.hybrid = HybridAttn(fused: fused, fusedSG: hyb.fusedSG, split: split, splitTG: hyb.V / hyb.NSG, splitSG: hyb.NSG,
+                                          combine: combine, combineSG: hyb.CNSG, gated: c.attnOutputGate, minSplit: hyb.minSplit)
+                    partialBytes = max(partialBytes, bytes)
+                }
             }
             kernels[D] = k
         }
@@ -1323,6 +1379,7 @@ public final class Transformer {
                                         maxSeq: Int32(kv.cacheLen), offset: Int32(offset), scale: c.ropeAttentionFactor * c.ropeAttentionFactor * c.queryScale,
                                         outStride: Int32(nH * D), T: Int32(T), window: Int32(spec.sliding ? c.slidingWindow : 0),
                                         softcap: c.attnLogitSoftcap)
+            var gateDone = false   // the attention kernel applied the output gate itself
             if skipAttn {
             } else if let plan = sparsePlan, !spec.sliding, kv.spec.numKVHeads == nKV, kv.spec.headDim == D,   // a KV-shared layer reads its source's index
                       let index = sparseIndex[spec.hasOwnKV ? li : spec.kvSource],
@@ -1363,6 +1420,33 @@ public final class Transformer {
                 enc.dispatchThreadgroups(MTLSize(width: nH, height: 1, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                 sparseLayerSteps += 1
+            } else if smallT, let hyb = kernels.hybrid, qkvCols % 4 == 0, offset + 1 >= hyb.minSplit || hyb.fused != nil {
+                // Hybrid models: split + combine from `minSplit` (the gate folded into the combine);
+                // below it the fused kernel when configured, else the generic path with its gate dispatch.
+                enc.set(qkvBuf, 0, 0)
+                enc.set(kv.kCache!, 0, 1)
+                enc.set(kv.vCache!, 0, 2)
+                enc.params(attnParams, 4)
+                if offset + 1 >= hyb.minSplit, let partials = attnPartials {
+                    // Partials are reused by every layer: the serial encoder orders the dispatches.
+                    enc.setComputePipelineState(hyb.split)
+                    enc.set(partials, 0, 3)
+                    enc.dispatchThreadgroups(MTLSize(width: nKV * T, height: hyb.splitTG, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: hyb.splitSG * 32, height: 1, depth: 1))
+                    enc.setComputePipelineState(hyb.combine)
+                    enc.set(partials, 0, 0)
+                    enc.set(attnBuf, 0, 1)
+                    enc.params(attnParams, 2)
+                    enc.set(qkvBuf, 0, 3)
+                    enc.dispatchThreadgroups(MTLSize(width: nH, height: T, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: hyb.combineSG * 32, height: 1, depth: 1))
+                } else {
+                    enc.setComputePipelineState(hyb.fused!)
+                    enc.set(attnBuf, 0, 3)
+                    enc.dispatchThreadgroups(MTLSize(width: nKV * T, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: hyb.fusedSG * 32, height: 1, depth: 1))
+                }
+                gateDone = hyb.gated
             } else if smallT, offset + 1 >= attnSplitMinContext, let (split, combine) = kernels.split, let partials = attnPartials {
                 // Partials are reused by every layer: the serial encoder orders the dispatches.
                 enc.setComputePipelineState(split)
@@ -1390,7 +1474,7 @@ public final class Transformer {
                 enc.dispatchThreadgroups(MTLSize(width: nH, height: smallT ? T : (T + kernels.prefillQB - 1) / kernels.prefillQB, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: attnThreads, height: 1, depth: 1))
             }
-            if let gatePSO = gateSigmoidPSO, !skipAttn {
+            if let gatePSO = gateSigmoidPSO, !skipAttn, !gateDone {
                 // Qwen 3.5: attn · sigmoid(gate), the gate sitting after the q section of the projection row.
                 enc.setComputePipelineState(gatePSO)
                 enc.set(attnBuf, 0, 0)
