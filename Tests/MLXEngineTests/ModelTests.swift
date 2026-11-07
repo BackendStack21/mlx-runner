@@ -252,6 +252,37 @@ struct ModelTests {
         #expect(cached > 10, "second turn should reuse the KV cache prefix")
     }
 
+    /// Qwen 3.5: the follow-up turn resumes from the recurrent checkpoint taken just before the first
+    /// prompt's generation opener, and answers exactly as a fresh engine processing the whole prompt.
+    @Test(.enabled(if: installedModel(qwen35) != nil), arguments: [false, true])
+    func hybridFollowUpResumesFromCheckpoint(thinking: Bool) async throws {
+        var p = SamplingParameters()
+        p.temperature = 0
+        p.maxTokens = thinking ? 48 : 24
+        func reply(_ engine: InferenceEngine, _ msgs: [ChatMessage]) async throws -> (text: String, cached: Int) {
+            var text = "", cached = -1
+            for try await ev in engine.chat(msgs, parameters: p, enableThinking: thinking) {
+                if case .text(let t) = ev { text += t }
+                if case .promptProcessed(let s) = ev { cached = s.cachedPromptTokens }
+            }
+            return (text, cached)
+        }
+        let engine = InferenceEngine()
+        _ = try await engine.load(directory: installedModel(Self.qwen35)!, contextLength: 2048)
+        var msgs = [ChatMessage(role: .system, content: "You answer in one short sentence."),
+                    ChatMessage(role: .user, content: "What is the capital of France?")]
+        let first = try await reply(engine, msgs)
+        #expect(thinking ? first.text.hasPrefix("<think>\n") : first.text.contains("Paris"))
+        msgs.append(ChatMessage(role: .assistant, content: first.text))
+        msgs.append(ChatMessage(role: .user, content: "And of Italy?"))
+        let second = try await reply(engine, msgs)
+        #expect(second.cached > 10, "the follow-up should resume from the checkpoint")
+        let fresh = InferenceEngine()
+        _ = try await fresh.load(directory: installedModel(Self.qwen35)!, contextLength: 2048)
+        let reference = try await reply(fresh, msgs)
+        #expect(reference.cached == 0 && second.text == reference.text)
+    }
+
     @Test(.enabled(if: installedModel(qwen3) != nil))
     func cancellingOneRequestDoesNotAffectAnother() async throws {
         let engine = InferenceEngine()

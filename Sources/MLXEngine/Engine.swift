@@ -477,6 +477,10 @@ public final class InferenceEngine: @unchecked Sendable {
     }
 
     /// `reveal`: special tokens whose text is emitted (tool-call markers); others decode to nothing.
+    /// Prompt tokens after a hybrid model's checkpoint (see `run`): covers the generation prompts that
+    /// a following turn renders differently (Qwen 3.5: `<|im_start|>assistant\n<think>\n\n</think>\n\n`).
+    static let checkpointTail = 8
+
     /// `lead`: text emitted before the first generated token (it is part of the prompt).
     private func run(tokens: [Int], parameters: SamplingParameters, reveal: Set<Int> = [], nameChoices: [String]? = nil,
                      lead: String? = nil, token: CancelToken, emit: (GenerationEvent) -> Void) throws {
@@ -535,13 +539,24 @@ public final class InferenceEngine: @unchecked Sendable {
         var logits: UnsafeMutablePointer<Float>?   // CPU sampling only
         var firstToken: Int?
         do {
-            let prompt = tokens[common...].map { Int32($0) }
+            var prompt = tokens[common...].map { Int32($0) }
+            var at = common
+            // Hybrid models (a recurrent state that cannot rewind): checkpoint the state a few tokens before
+            // the prompt's end. The next turn re-renders this prompt's tail differently (the generation
+            // prompt becomes the assistant turn), so it resumes from there instead of from the start.
+            if model.config.isHybrid, prompt.count > Self.checkpointTail + 8 {
+                let head = prompt.count - Self.checkpointTail
+                _ = try model.forward(Array(prompt[..<head]), offset: at, dense: true, isCancelled: { token.isCancelled })
+                model.recurrentCheckpoint = model.snapshotRecurrent()
+                at += head
+                prompt.removeFirst(head)
+            }
             if gpuSampling {
                 model.seedSampler(seed)
-                firstToken = try model.prefill(prompt, offset: common, sample: gpuParams, isCancelled: { token.isCancelled })
+                firstToken = try model.prefill(prompt, offset: at, sample: gpuParams, isCancelled: { token.isCancelled })
             } else {
                 // A prompt is a prefill: dense even when only its last token is new.
-                logits = try model.forward(prompt, offset: common, dense: true, isCancelled: { token.isCancelled })
+                logits = try model.forward(prompt, offset: at, dense: true, isCancelled: { token.isCancelled })
             }
             // The draft model catches up on the prompt lazily (`proposeFromModel`, after the first
             // token is out), so the time to first token stays the target's own.

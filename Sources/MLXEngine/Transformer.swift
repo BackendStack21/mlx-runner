@@ -720,6 +720,10 @@ public final class Transformer {
     }
     private let gdnKernels: GDNKernels?
     static let gdnDefaultLPR = 8
+    /// Hybrid models: a saved recurrent state (`snapshotRecurrent`) that `reusablePrefix` may return to,
+    /// so a run sharing at least its positions resumes there. Dropped as soon as a step rewrites an
+    /// earlier position (its K/V rows and tokens would no longer match).
+    public var recurrentCheckpoint: RecurrentSnapshot?
     /// Hybrid models: the position the recurrent state has reached (the end of the last committed
     /// step), or -1 when it is unknown (a failed step). Unlike a KV cache it cannot be rewound, so a
     /// step must start there or at 0.
@@ -1061,8 +1065,10 @@ public final class Transformer {
         }
     }
 
-    /// Hybrid models: a step must continue the recurrent state where it is, or restart at 0.
+    /// Hybrid models: a step must continue the recurrent state where it is, or restart at 0. A step
+    /// that rewrites positions before the checkpoint invalidates it.
     private func checkRecurrent(_ offset: Int) throws {
+        if let cp = recurrentCheckpoint, offset < cp.position { recurrentCheckpoint = nil }
         guard config.isHybrid, offset != 0, offset != recurrentPosition else { return }
         throw EngineError.unsupported("the recurrent state is at position \(recurrentPosition) and cannot resume at \(offset)")
     }
@@ -1087,9 +1093,16 @@ public final class Transformer {
     /// prompt is processed from the start. `previousLength` is the caller's own count, used
     /// when it is larger (it never should be).
     public func reusablePrefix(_ common: Int, previousLength: Int) -> Int {
-        // A recurrent state holds exactly the positions processed so far: it is reusable only when the
-        // new run continues right where it stopped.
-        if config.isHybrid { return common > 0 && common == recurrentPosition ? common : 0 }
+        // A recurrent state holds exactly the positions processed so far: it is reusable when the new run
+        // continues right where it stopped, or from the checkpoint (restored here) if it shares that much.
+        if config.isHybrid {
+            if common > 0 && common == recurrentPosition { return common }
+            if let cp = recurrentCheckpoint, cp.position > 0, cp.position <= common {
+                restoreRecurrent(cp)
+                return cp.position
+            }
+            return 0
+        }
         let written = max(previousLength, writtenHigh)
         for l in layers where l.spec.hasOwnKV && l.cacheLen < maxSeq {
             if written - common > l.cacheLen - config.slidingWindow + 1 { return 0 }
