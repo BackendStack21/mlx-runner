@@ -220,11 +220,12 @@ final class Linear {
                             o1: Int32(parts[0].outDim), o2: Int32(parts.count > 1 ? parts[1].outDim : 0),
                             hasBias: f.bias != nil ? 1 : 0), 5)
         if paired {
-            // K = 1024: a grid of at most max(2048, blocks / 16) threadgroups whose simdgroups keep x and loop
+            // K = 1024: a grid of at most max(4096, blocks / 16) threadgroups whose simdgroups keep x and loop
             // over row blocks, prefetching the next (qmvq1): the layer matrices get one block per simdgroup
-            // (at most 1,028 threadgroups), lm_head ~3,900; otherwise one block per simdgroup.
+            // (at most 1,028 threadgroups), lm_head 4,096 (~15 blocks each; 3,880 and 2,048 measured ~1%
+            // slower in the full step); otherwise one block per simdgroup.
             let blocks = (total + rowsPerTG - 1) / rowsPerTG
-            let grid = f.inDim == 1024 ? min(blocks, Linear.pairsGrid ?? max(2048, blocks / 16)) : blocks
+            let grid = f.inDim == 1024 ? min(blocks, Linear.pairsGrid ?? max(4096, blocks / 16)) : blocks
             enc.dispatchThreadgroups(MTLSize(width: grid, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
             return
         }
