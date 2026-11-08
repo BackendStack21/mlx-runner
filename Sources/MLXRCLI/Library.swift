@@ -118,7 +118,10 @@ public struct ModelResolver: Sendable {
             return make(.huggingFace, repo)
         }
         if let repo = catalog.repo(forAlias: name) { return make(.catalog, repo) }
-        if let p = presets.load(name) { return make(.preset, p.repo, preset: p) }
+        if let p = presets.load(name) {
+            try validateRepo(p.repo)
+            return make(.preset, p.repo, preset: p)
+        }
         let named = models.filter { $0.name.lowercased() == lower }
         if named.count > 1 {
             throw CLIError.failure("'\(name)' is ambiguous; matches: " + named.map(\.repo).joined(separator: ", "))
