@@ -7,7 +7,7 @@ extension CLI {
     static func pullCommand(library: ModelLibrary, presets: PresetStore, catalog: Catalog, hub: HubServices) -> Command {
         let resolver = ModelResolver(library: library, presets: presets, catalog: catalog)
         return Command(
-            name: "download", aliases: ["pull"], summary: "Download a model from Hugging Face", args: [Arg("MODEL", kind: .model)],
+            name: "pull", aliases: ["download"], summary: "Download a model from Hugging Face", args: [Arg("MODEL", kind: .model)],
             options: [Opt(long: "insecure", help: "accepted for Ollama compatibility; has no effect")],
             run: { inv, console in
                 if inv.bool("insecure") { console.err("warning: --insecure has no effect: mlxr always verifies Hugging Face downloads\n") }
@@ -74,7 +74,7 @@ extension CLI {
                 case "parameters":
                     console.out(info.parameters.map { $0.key.padding(toLength: 30, withPad: " ", startingAt: 0) + " " + $0.value + "\n" }.joined())
                 case "modelfile": console.out(info.modelfile())
-                default: console.out(info.tables())
+                default: console.out(info.tables(verbose: inv.bool("verbose")))
                 }
             })
     }
@@ -97,6 +97,8 @@ struct ShowInfo {
     var template: String?
     var license: String?
     var warnings: [String]
+    /// Scalar top-level config.json entries, sorted by key (shown with -v).
+    var metadata: [(key: String, value: String)] = []
 
     private static let fileLimit = 8 << 20
 
@@ -104,6 +106,11 @@ struct ShowInfo {
         guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue,
               size <= fileLimit else { return nil }
         return try? Data(contentsOf: url)
+    }
+
+    /// Removes terminal control characters (C0 except newline and tab, DEL): model files are untrusted.
+    static func clean(_ s: String) -> String {
+        String(String.UnicodeScalarView(s.unicodeScalars.filter { ($0.value >= 0x20 && $0.value != 0x7F) || $0 == "\n" || $0 == "\t" }))
     }
 
     private static func text(_ url: URL) -> String? { readFile(url).flatMap { String(data: $0, encoding: .utf8) } }
@@ -153,7 +160,7 @@ struct ShowInfo {
         if let v = g.topP { params["top_p"] = "\(v)" }
         if let v = g.minP { params["min_p"] = "\(v)" }
         if let v = g.repetitionPenalty { params["repeat_penalty"] = "\(v)" }
-        for (k, v) in preset?.parameters ?? [:] { params[k] = v }
+        for (k, v) in (preset?.parameters ?? [:]).sorted(by: { $0.key < $1.key }) { params[clean(k)] = clean(v) }
 
         var license: String?
         for name in ["LICENSE", "LICENSE.md", "LICENSE.txt"] {
@@ -162,10 +169,22 @@ struct ShowInfo {
             }
         }
         let system = preset?.system.flatMap { $0.isEmpty ? nil : $0 }
-        return ShowInfo(repo: repo, directory: directory, architecture: modelType, contextLength: int("max_position_embeddings"),
+        var metadata: [(key: String, value: String)] = []
+        for (k, v) in config.sorted(by: { $0.key < $1.key }).prefix(200) {
+            var value: String?
+            if let s = v as? String { value = String(clean(s).prefix(200)) }
+            else if let n = v as? NSNumber {
+                value = CFGetTypeID(n) == CFBooleanGetTypeID() ? (n.boolValue ? "true" : "false")
+                    : (n.doubleValue == n.doubleValue.rounded() && abs(n.doubleValue) < 1e15 ? "\(n.int64Value)" : "\(n.doubleValue)")
+            }
+            if let value { metadata.append((clean(k), value)) }
+        }
+        var info = ShowInfo(repo: repo, directory: directory, architecture: clean(modelType), contextLength: int("max_position_embeddings"),
                         embeddingLength: int("hidden_size"), quantization: bits.map { "\($0)-bit" }, capabilities: capabilities,
-                        parameters: params.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }, system: system,
-                        template: template, license: license, warnings: g.warnings)
+                        parameters: params.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }, system: system.map(clean),
+                        template: template.map(clean), license: license.map(clean), warnings: g.warnings)
+        info.metadata = metadata
+        return info
     }
 
     private func section(_ title: String, _ rows: [String]) -> String {
@@ -184,13 +203,14 @@ struct ShowInfo {
         return trimmed.count > 2 ? Array(trimmed.prefix(2)) + ["..."] : trimmed
     }
 
-    func tables() -> String {
+    func tables(verbose: Bool = false) -> String {
         var model: [(String, String)] = [("architecture", architecture)]
         if let contextLength { model.append(("context length", "\(contextLength)")) }
         if let embeddingLength { model.append(("embedding length", "\(embeddingLength)")) }
         if let quantization { model.append(("quantization", quantization)) }
         var out = section("Model", table(model)) + section("Capabilities", capabilities)
         if !parameters.isEmpty { out += section("Parameters", table(parameters.map { ($0.key, $0.value) })) }
+        if verbose, !metadata.isEmpty { out += section("Metadata", table(metadata.map { ($0.key, $0.value) })) }
         if let system { out += section("System", excerpt(system)) }
         if let license { out += section("License", excerpt(license)) }
         return out

@@ -53,7 +53,7 @@ struct ParserTests {
 
     @Test func realTableResolvesLsAndPull() throws {
         #expect(try CLI.parse(["ls"]).command.name == "list")
-        #expect(try CLI.parse(["pull", "a/b"]).command.name == "download")
+        #expect(try CLI.parse(["pull", "a/b"]).command.name == "pull")
     }
 
     @Test func invalidValuesNameTheFlag() async {

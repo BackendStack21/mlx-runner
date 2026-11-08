@@ -22,7 +22,7 @@ struct HelpTests {
                        "Use \"mlxr [command] --help\" for more information about a command."] {
             #expect(bare.out.contains(needle), "\(needle)")
         }
-        for cmd in ["run", "serve", "download", "list", "show"] {
+        for cmd in ["run", "serve", "pull", "list", "show"] {
             #expect(bare.out.contains("\n  \(cmd) "), "\(cmd)")
         }
     }
