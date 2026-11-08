@@ -13,7 +13,8 @@ extension CLI {
                                 catalog: Catalog = .standard, now: @escaping @Sendable () -> Date = { Date() },
                                 hub: HubServices = .live, engine: GenerationEngine = LiveGenerationEngine(),
                                 interrupts: Interrupts = .shared, lineSource: LineSource? = nil,
-                                chatHistory: ChatHistory = .live) -> [Command] {
+                                chatHistory: ChatHistory = .live,
+                                updater: @escaping @Sendable () -> Updater = { CLI.liveUpdater() }) -> [Command] {
         let runDeps = RunDependencies(resolver: ModelResolver(library: library, presets: presets, catalog: catalog), hub: hub,
                                       engine: engine, interrupts: interrupts, lineSource: lineSource, history: chatHistory)
         let ctxRange = SamplingLimits.context
@@ -101,7 +102,7 @@ extension CLI {
                     group: "Developer", run: { inv, console in
                         try await services.bench(BenchOptions(model: inv.positionals[0], decodeOnly: inv.bool("decode"), contexts: inv.string("ctx")), console)
                     }),
-        ] + modelCommands(library: library, presets: presets, catalog: catalog, now: now)
+        ] + modelCommands(library: library, presets: presets, catalog: catalog, now: now) + [upgradeCommand(updater: updater)]
         return table + [completionCommand(table: table)]
     }
 }
