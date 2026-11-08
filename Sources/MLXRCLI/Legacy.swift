@@ -306,14 +306,6 @@ func legacyDownload(_ repo: String) async throws {
 
 }
 
-func legacyList() {
-    for m in ModelStore.scan() {
-        print(String(format: "%-60@ %10@  %@%@", m.repo as NSString, formatBytes(m.sizeBytes) as NSString,
-                     (m.modelType ?? "?") as NSString, m.isSupported ? "" : " (unsupported)"))
-    }
-
-}
-
 func legacyTokenize(_ model: String, _ text: String, idsOnly: Bool = false) throws {
     let tok = try Tokenizer(directory: try resolveModel(model))
     let ids = tok.encode(text)

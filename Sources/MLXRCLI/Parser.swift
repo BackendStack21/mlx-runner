@@ -65,6 +65,8 @@ public final class Console: @unchecked Sendable {
     public var stdinIsTTY: Bool
     public var width: Int
     public var env: [String: String]
+    /// Reads one line of input (a confirmation answer); nil at end of input.
+    public var readLine: () -> String? = { Swift.readLine() }
 
     public init(out: @escaping (String) -> Void, err: @escaping (String) -> Void,
                 stdoutIsTTY: Bool = false, stderrIsTTY: Bool = false, stdinIsTTY: Bool = false,

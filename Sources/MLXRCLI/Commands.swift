@@ -6,10 +6,11 @@ extension CLI {
     static let draftHelp = "draft model for speculative decoding: a model or auto"
 
     /// The command table of `mlxr`.
-    public static var commands: [Command] { commands(services: .live) }
+    public static var commands: [Command] { commands() }
 
     /// The command table with its outside world injected.
-    public static func commands(services: CLIServices) -> [Command] {
+    public static func commands(services: CLIServices = .live, library: ModelLibrary = .live, presets: PresetStore = .live,
+                                catalog: Catalog = .standard, now: @escaping @Sendable () -> Date = { Date() }) -> [Command] {
         let ctxRange = SamplingLimits.context
         return [
             Command(name: "run", summary: "Run a model", args: [Arg("MODEL", kind: .model), Arg("PROMPT", optional: true, variadic: true)],
@@ -48,7 +49,7 @@ extension CLI {
                             minP: inv.double("min-p").map { Float($0) }, repeatPenalty: inv.double("repeat-penalty").map { Float($0) },
                             repeatLastN: inv.int("repeat-last-n"), seed: inv.string("seed").flatMap { UInt64($0) }))
                     }),
-            Command(name: "serve", aliases: ["start"], summary: "Start the OpenAI-compatible server", args: [Arg("MODEL", kind: .model)],
+            Command(name: "serve", aliases: ["start"], summary: "Start the OpenAI-compatible server", args: [Arg("MODEL", kind: .model, optional: true)],
                     options: [
                         Opt(long: "port", value: .int(SamplingLimits.port), defaultText: "1234", help: "port to listen on"),
                         Opt(long: "ctx", value: .int(ctxRange), defaultText: "8192", help: "context length"),
@@ -59,13 +60,15 @@ extension CLI {
                     ],
                     environment: [("MLXR_API_KEY", "API key, when --api-key is not given")],
                     run: { inv, _ in
-                        try await legacyServe(model: inv.positionals[0], port: UInt16(inv.int("port") ?? 1234),
+                        guard let model = inv.positionals.first else {
+                            throw CLIError.failure("serve needs a model for now: mlxr serve MODEL (serving without a model comes with the background server in a later release)")
+                        }
+                        try await legacyServe(model: model, port: UInt16(inv.int("port") ?? 1234),
                                               ctx: inv.int("ctx") ?? 8192, lan: inv.bool("lan"), apiKey: inv.string("api-key"),
                                               draft: inv.string("draft"), sparse: inv.string("sparse"))
                     }),
             Command(name: "download", aliases: ["pull"], summary: "Download a model from Hugging Face", args: [Arg("MODEL", kind: .model)],
                     run: { inv, _ in try await legacyDownload(inv.positionals[0]) }),
-            Command(name: "list", aliases: ["ls"], summary: "List installed models", run: { _, _ in legacyList() }),
             Command(name: "show", summary: "Show information for a model", args: [Arg("MODEL", kind: .model)],
                     run: { _, _ in throw CLIError.failure("show is not available yet") }),
             Command(name: "search", summary: "Search Hugging Face for MLX models", args: [Arg("QUERY", variadic: true)],
@@ -92,7 +95,7 @@ extension CLI {
                     group: "Developer", run: { inv, console in
                         try await services.bench(BenchOptions(model: inv.positionals[0], decodeOnly: inv.bool("decode"), contexts: inv.string("ctx")), console)
                     }),
-        ]
+        ] + modelCommands(library: library, presets: presets, catalog: catalog, now: now)
     }
 }
 
