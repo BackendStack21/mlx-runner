@@ -349,13 +349,14 @@ public actor Updater {
 
     /// Downloads, verifies and installs the latest release, reporting each phase. Returns the
     /// installed version; the caller restarts the app (`Updater.relaunch`).
-    public func apply(progress: @escaping @Sendable (UpdatePhase) -> Void = { _ in }) async throws -> AppliedUpdate {
+    /// - Parameter reuseCheck: use the release found by a recent `check()` instead of asking GitHub again.
+    public func apply(reuseCheck: Bool = false, progress: @escaping @Sendable (UpdatePhase) -> Void = { _ in }) async throws -> AppliedUpdate {
         guard !busy else { throw UpdateError("An update is already being installed.") }
         busy = true
         defer { busy = false }
 
         progress(.checking)
-        let info = try await check(force: true)
+        let info = try await check(force: !reuseCheck)
         guard info.available, let release = cached?.release else { throw UpdateError(install.isCommandLine ? "mlxr is already up to date." : "MLX Runner is already up to date.") }
         guard info.canInstall else { throw UpdateError(info.reason ?? "This update can't be installed automatically.") }
         let name = UpdateInstall.assetName(for: release.version, kind: install.kind)

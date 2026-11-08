@@ -31,16 +31,42 @@ extension CLI {
             console.out("mlxr \(latest) is available (you have \(current))\n")
             return
         }
-        let renderer = PullRenderer(console: console, label: "upgrading mlxr:")
-        defer { renderer.finish() }
-        let applied: AppliedUpdate
-        do {
-            applied = try await updater.apply(progress: { phase in
-                if console.stderrIsTTY, case .download(let f) = phase {
-                    renderer.update(done: Int64(min(max(f, 0), 1) * 1000), total: 1000, speed: 0)
-                }
-            })
-        } catch { renderer.finish(); throw error }
+        // The updater reports a percentage only, so the bar shows no sizes or speed.
+        let bar = UpgradeBar(console: console)
+        defer { bar.finish() }
+        let applied = try await updater.apply(reuseCheck: true, progress: { phase in
+            if case .download(let f) = phase { bar.update(f) }
+        })
         console.out("upgraded mlxr \(current) -> \(applied.version)\n")
+    }
+}
+
+/// A percentage-only progress bar on stderr, drawn only when stderr is a terminal.
+final class UpgradeBar: @unchecked Sendable {
+    private let console: Console
+    private let lock = NSLock()
+    private var drawn = false
+
+    init(console: Console) { self.console = console }
+
+    static func line(_ fraction: Double, width: Int = 10) -> String {
+        let f = fraction.isFinite ? min(max(fraction, 0), 1) : 0
+        let filled = Int(Double(width) * f)
+        return "upgrading mlxr: " + String(format: "%3.0f%%", f * 100) + " \u{2595}"
+            + String(repeating: "\u{2588}", count: filled) + String(repeating: " ", count: width - filled) + "\u{258F}"
+    }
+
+    func update(_ fraction: Double) {
+        guard console.stderrIsTTY else { return }
+        lock.withLock {
+            console.err("\r" + Self.line(fraction) + "\u{1B}[K")
+            drawn = true
+        }
+    }
+
+    func finish() {
+        lock.withLock {
+            if drawn { console.err("\n"); drawn = false }
+        }
     }
 }
