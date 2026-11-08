@@ -29,7 +29,7 @@ extension CLI {
                 if parts.count == 2 { inline = String(parts[1]) }
                 if name == "help" { inv.helpRequested = true; continue }
                 guard let o = option(long: name) else { throw CLIError.usage("unknown flag: --\(name)") }
-                opt = o; shown = "--\(o.long)"
+                opt = o; shown = "--\(name)"
             } else {
                 let chars = Array(a.dropFirst())
                 let c = chars[0]
@@ -95,6 +95,7 @@ extension CLI {
         let required = command.args.filter { !$0.optional }.count
         let variadic = command.args.contains { $0.variadic }
         if variadic {
+            if n < required && command.exactArgWording { throw CLIError.usage("accepts \(required) arg(s), received \(n)") }
             if n < required { throw CLIError.usage("requires at least \(required) arg(s), only received \(n)") }
         } else if required == command.args.count {
             if n != required { throw CLIError.usage("accepts \(required) arg(s), received \(n)") }

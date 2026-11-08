@@ -37,7 +37,7 @@ struct ReleaseDocsTests {
 
     @Test func readmeAndAgentsGiveTheGreedyFlags() {
         for f in ["README.md", "AGENTS.md"] {
-            #expect(Self.read(f).contains("--temp 0 --seed 42 --max 256"), "\(f) lacks '--temp 0 --seed 42 --max 256'")
+            #expect(Self.read(f).contains("--temp 0 --repeat-penalty 1 --seed 42 --max 256"), "\(f) lacks the greedy flags")
         }
     }
 

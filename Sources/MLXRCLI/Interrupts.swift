@@ -40,6 +40,16 @@ public struct InterruptMachine: Sendable {
     }
 }
 
+/// Set by the cancel action of a phase: true only when the user interrupted (the engine also
+/// cancels its token whenever a stream ends, so the token cannot tell).
+public final class UserCancel: @unchecked Sendable {
+    private let lock = NSLock()
+    private var set = false
+    public init() {}
+    public func mark() { lock.lock(); set = true; lock.unlock() }
+    public var isSet: Bool { lock.lock(); defer { lock.unlock() }; return set }
+}
+
 /// Routes Ctrl-C to the running phase. The live `SIGINT` source (Signals.swift) calls `fire()`;
 /// tests call it directly. `exit` is `_exit` in the real process.
 public final class Interrupts: @unchecked Sendable {

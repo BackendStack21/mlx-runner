@@ -196,8 +196,8 @@ mlxr run mlx-community/Qwen3-8B-4bit --draft mlx-community/Qwen3-0.6B-4bit   # s
 mlxr completion zsh                         # shell completions (zsh, bash)
 ```
 
-Reproducible output (greedy): `mlxr run <model> "Explain RoPE" --temp 0 --seed 42 --max 256`. Use these
-flags for every benchmark or correctness comparison.
+Reproducible output (greedy): `mlxr run <model> "Explain RoPE" --temp 0 --repeat-penalty 1 --seed 42 --max 256`. Use these
+flags for every benchmark or correctness comparison. `--repeat-penalty 1` matters: 1.x forced a repetition penalty of 1.0, while 2.0 uses the model's or the app's default (1.05) unless you pass it.
 
 Developer commands:
 
@@ -205,7 +205,7 @@ Developer commands:
 mlxr bench mlx-community/Qwen3-4B-4bit      # prefill/decode throughput, verification cost at short and 1,900-token contexts, kernel profile (MLXR_BENCH_NOPROFILE=1 skips it)
 mlxr tokenize <model> "some text"
 MLXR_BENCH_CTX=8192,30000 MLXR_BENCH_TEXT=book.txt mlxr bench <model>   # adds dense vs sparse decode after long prompts, with agreement on the text
-mlxr run <model> "Explain RoPE" --temp 0 --seed 42 --max 256 --sparse off   # sparse decode attention is on from 5,128 tokens of context; off, on or a key budget (N)
+mlxr run <model> "Explain RoPE" --temp 0 --repeat-penalty 1 --seed 42 --max 256 --sparse off   # sparse decode attention is on from 5,128 tokens of context; off, on or a key budget (N)
 ```
 
 Differences from Ollama: thinking follows each model's own template default (`--think` and `--no-think`

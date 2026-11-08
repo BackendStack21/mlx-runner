@@ -116,15 +116,17 @@ public struct Command {
     public var environment: [(name: String, help: String)] = []
     /// Help heading in the root command list; nil means the main list.
     public var group: String? = nil
+    /// Report a missing variadic argument as `accepts N arg(s), received M` instead of `requires at least`.
+    public var exactArgWording = false
     public var hidden = false
     public var run: (Invocation, Console) async throws -> Void
 
     public init(name: String, aliases: [String] = [], summary: String, args: [Arg] = [],
                 options: [Opt] = [], examples: [String] = [],
                 environment: [(name: String, help: String)] = [], group: String? = nil,
-                hidden: Bool = false, run: @escaping (Invocation, Console) async throws -> Void = { _, _ in }) {
+                hidden: Bool = false, exactArgWording: Bool = false, run: @escaping (Invocation, Console) async throws -> Void = { _, _ in }) {
         self.name = name; self.aliases = aliases; self.summary = summary; self.args = args
         self.options = options; self.examples = examples; self.environment = environment
-        self.group = group; self.hidden = hidden; self.run = run
+        self.group = group; self.hidden = hidden; self.exactArgWording = exactArgWording; self.run = run
     }
 }

@@ -80,6 +80,6 @@ struct LegacyErrorTests {
         #expect(cap.stderr.hasPrefix("Error: invalid argument \"abc\" for \"-n, --max-tokens\" flag"), "\(cap.stderr)")
         let cap2 = Capture()
         #expect(await CLI.run(["run", "m", "--max", "abc"], console: cap2.console()) == 1)
-        #expect(cap2.stderr.hasPrefix("Error: invalid argument \"abc\" for \"--max-tokens\" flag"), "\(cap2.stderr)")
+        #expect(cap2.stderr.hasPrefix("Error: invalid argument \"abc\" for \"--max\" flag"), "\(cap2.stderr)")
     }
 }

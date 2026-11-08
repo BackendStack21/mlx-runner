@@ -23,8 +23,8 @@ struct OptionValidationTests {
     }
 
     @Test func maxTokens() {
-        rejected(["run", "m", "--max", "abc"], flag: "--max-tokens")
-        for bad in ["0", "-1", "32769"] { rejected(["run", "m", "--max", bad], flag: "--max-tokens") }
+        rejected(["run", "m", "--max", "abc"], flag: "--max")
+        for bad in ["0", "-1", "32769"] { rejected(["run", "m", "--max", bad], flag: "--max") }
         for ok in ["1", "32768"] { accepted(["run", "m", "--max", ok]) }
     }
 

@@ -245,7 +245,8 @@ public final class ChatSession {
         messages.append(ChatMessage(role: .user, content: text))
         let request = (settings.system.map { [ChatMessage(role: .system, content: $0)] } ?? []) + messages
         let token = CancelToken()
-        interrupts.enter(.generating, onCancel: { token.cancel() })
+        let userCancel = UserCancel()
+        interrupts.enter(.generating, onCancel: { userCancel.mark(); token.cancel() })
         let stream = engine.chat(request, parameters: settings.parameters, enableThinking: settings.thinking, token: token)
         let renderer = ResponseRenderer(console: console, hideThinking: settings.hideThinking, wordWrap: settings.wordWrap)
         var splitter = ReasoningSplitter(enabled: settings.thinking != false)
@@ -268,7 +269,7 @@ public final class ChatSession {
             }
         } catch { failure = error }
         interrupts.enter(.idle)
-        let cancelled = token.isCancelled || final?.stopReason == "cancelled"
+        let cancelled = userCancel.isSet || final?.stopReason == "cancelled"
         if failure == nil && !cancelled { emit(splitter.flush()) }
         if cancelled || failure != nil {
             if !cancelled { messages.removeLast() }  // a cancelled turn keeps the user message

@@ -81,6 +81,7 @@ extension CLI {
                         Opt(long: "limit", value: .int(1...100), defaultText: "25", help: "maximum number of results"),
                         Opt(long: "json", help: "print the results as JSON"),
                     ],
+                    exactArgWording: true,
                     run: { inv, console in
                         let models = try await services.search(inv.positionals.joined(separator: " "), inv.int("limit") ?? 25)
                         console.out(renderSearch(models, json: inv.bool("json")))

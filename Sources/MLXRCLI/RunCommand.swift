@@ -132,7 +132,8 @@ extension CLI {
             console.err("prompt ids: \(engine.encode(raw ? prompt : engine.renderChat(messages, enableThinking: thinking)))\n")
         }
         let token = CancelToken()
-        interrupts.enter(.generating, onCancel: { token.cancel() })
+        let userCancel = UserCancel()
+        interrupts.enter(.generating, onCancel: { userCancel.mark(); token.cancel() })
         let stream = raw ? engine.complete(prompt, parameters: params, token: token)
             : engine.chat(messages, parameters: params, enableThinking: thinking, token: token)
         let renderer = ResponseRenderer(console: console, hideThinking: inv.bool("hidethinking"), wordWrap: !inv.bool("nowordwrap"))
@@ -153,12 +154,12 @@ extension CLI {
             }
         } catch {
             interrupts.enter(.idle)
-            if token.isCancelled || interrupts.wasInterrupted { throw CLIError.interrupted }
+            if userCancel.isSet { throw CLIError.interrupted }
             throw error
         }
         interrupts.enter(.idle)
         emit(splitter.flush())
-        if token.isCancelled || interrupts.wasInterrupted || final?.stopReason == "cancelled" { throw CLIError.interrupted }
+        if userCancel.isSet || final?.stopReason == "cancelled" { throw CLIError.interrupted }
         console.out("\n\n")
         if inv.bool("verbose"), let final {
             console.err(StatsFormat.block(RunStats(loadSeconds: info.loadSeconds, stats: final)))
