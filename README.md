@@ -157,6 +157,16 @@ Measured with `mlxr bench` on an **M2 Pro (16 GB)**. Decode is measured with gre
 
 MLX Runner decodes faster on the smallest Qwen models (Qwen3.5 0.8B by 6–7%) and Phi-3.5, is close on most others (Qwen3.5 2B is 2% behind, the 4B 5%), and is well behind on Gemma 2. It prefills 512 tokens faster on Qwen3 and Gemma 4 and is behind on Gemma 1.1, Phi-3.5 and Mistral 7B. At 128 tokens, where the 32×32 tile runs, mlx-lm prefills 4–36% faster on every model except Gemma 4, which is level.
 
+**Against Ollama and mlx-lm.** `swift scripts/bench-compare.swift` runs the same prompt through the release `mlxr`, a running Ollama server and an mlx-lm install, all on MLX with the same weights (it imports the MLX model directory into Ollama once, which keeps the quantization and uses Ollama's MLX runner), and prints prefill and decode speeds: the median of three runs, greedy, no repetition penalty. `--help` lists the options. Qwen 3.5 4B (mlx-community 4-bit, 3.03 GB), 490-token prompt, 256 generated tokens, M2 Pro (16 GB):
+
+| Engine | Prefill tok/s | Decode tok/s |
+|---|---:|---:|
+| MLX Runner 2.0.0 | 403 | 62.1 |
+| Ollama 0.40.15 (MLX runner) | 378 | 64.4 |
+| mlx-lm 0.32.2 (mlx 0.32.4) | 375 | 64.3 |
+
+Ollama's own `qwen3.5:4b` build uses nvfp4 weights (3.97 GB) and decodes at 45.9 tok/s on the same machine (`--ollama-model qwen3.5:4b`). Each tool reports its own figures.
+
 **The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 41.0 tok/s, about 85% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a 3-bit model (which would raise the ceiling to about 60 tok/s, but only 4-bit has an optimized decode kernel so far), or speculative decoding (see Limitations).
 
 Loading copies the weights once, in file order, into a page-aligned Metal buffer (MLX writes `safetensors` without the 16-byte alignment the kernels' vector loads need), then releases the file mapping, so the GPU holds exactly one copy: about 0.5 s for the small models, 3 s for Mistral 7B and 11 s for the 9 GB Gemma 4 12B from the page cache (25 s from disk). Those figures include a warm-up pass.

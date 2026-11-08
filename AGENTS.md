@@ -30,7 +30,8 @@ How to work on MLX Runner (a native macOS app by 21no.de).
 - `Sources/MLXRunner/` — SwiftUI app. `MLXRUNNER_SNAPSHOT=<dir>` renders screens headlessly.
 - `Sources/mlxr/` — CLI.
 - `site/` — landing page (mlx-runner.21no.de, Cloudflare Workers static assets via `wrangler.jsonc`).
-- `scripts/` — `bundle.sh` (app/DMG/CLI/SHA256SUMS), `sign.swift`, `release-key.swift`, `make-icon.swift`.
+- `scripts/` — `bundle.sh` (app/DMG/CLI/SHA256SUMS), `sign.swift`, `release-key.swift`, `make-icon.swift`,
+  `bench-compare.swift` (generation speed against Ollama and mlx-lm on one model).
 
 ## Releasing
 
