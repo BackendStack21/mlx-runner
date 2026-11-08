@@ -75,6 +75,9 @@ public final class Console: @unchecked Sendable {
         self.stdoutIsTTY = stdoutIsTTY; self.stderrIsTTY = stderrIsTTY; self.stdinIsTTY = stdinIsTTY
         self.width = width; self.env = env
     }
+
+    /// Reads everything piped to stdin (only called when stdin is not a terminal).
+    public var readAllStdin: () -> String = { String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self) }
 }
 
 /// The validated result of parsing one command line.

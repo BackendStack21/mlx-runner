@@ -1480,7 +1480,7 @@ final class OnceFlag: @unchecked Sendable {
 
 /// Separates a leading `<think>…</think>` block from the reply while streaming, holding back
 /// partial tags across chunks. Output that does not start with `<think>` is passed through.
-struct ReasoningSplitter {
+public struct ReasoningSplitter {
     private enum State { case start, thinking, content }
     static let open = "<think>"
     static let close = "</think>"
@@ -1489,9 +1489,9 @@ struct ReasoningSplitter {
     private var trimContentLead = false
     private var trimReasoningLead = true
 
-    init(enabled: Bool) { state = enabled ? .start : .content }
+    public init(enabled: Bool) { state = enabled ? .start : .content }
 
-    mutating func feed(_ t: String) -> (reasoning: String, content: String) {
+    public mutating func feed(_ t: String) -> (reasoning: String, content: String) {
         var reasoning = ""
         var content = ""
         pending += t
@@ -1539,7 +1539,7 @@ struct ReasoningSplitter {
         return (reasoning, content)
     }
 
-    mutating func flush() -> (reasoning: String, content: String) {
+    public mutating func flush() -> (reasoning: String, content: String) {
         defer { pending = "" }
         switch state {
         case .thinking:

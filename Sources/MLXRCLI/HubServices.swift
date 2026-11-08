@@ -31,6 +31,6 @@ public struct HubServices: Sendable {
             let dl = ModelDownload(details: details, destination: destination)
             dl.onProgress = { _, done, total, speed in hooks.progress(done, total, speed) }
             dl.onEvent = hooks.event
-            return try await dl.start()
+            return try await withTaskCancellationHandler { try await dl.start() } onCancel: { dl.cancel() }
         })
 }

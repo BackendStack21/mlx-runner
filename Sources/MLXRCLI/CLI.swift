@@ -65,6 +65,7 @@ public enum CLI {
     /// Entry point of the `mlxr` executable.
     public static func main(_ args: [String]) async -> Int32 {
         setvbuf(stdout, nil, _IONBF, 0)
+        Signals.install()
         let console = Console(
             out: { FileHandle.standardOutput.write(Data($0.utf8)) },
             err: { FileHandle.standardError.write(Data($0.utf8)) },

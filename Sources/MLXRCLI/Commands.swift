@@ -11,14 +11,17 @@ extension CLI {
     /// The command table with its outside world injected.
     public static func commands(services: CLIServices = .live, library: ModelLibrary = .live, presets: PresetStore = .live,
                                 catalog: Catalog = .standard, now: @escaping @Sendable () -> Date = { Date() },
-                                hub: HubServices = .live) -> [Command] {
+                                hub: HubServices = .live, engine: GenerationEngine = LiveGenerationEngine(),
+                                interrupts: Interrupts = .shared) -> [Command] {
+        let runDeps = RunDependencies(resolver: ModelResolver(library: library, presets: presets, catalog: catalog), hub: hub,
+                                      engine: engine, interrupts: interrupts)
         let ctxRange = SamplingLimits.context
         return [
             Command(name: "run", summary: "Run a model", args: [Arg("MODEL", kind: .model), Arg("PROMPT", optional: true, variadic: true)],
                     options: [
                         Opt(long: "prompt", short: "p", value: .text, help: "prompt"),
-                        Opt(long: "max-tokens", aliases: ["max"], short: "n", value: .int(1...SamplingLimits.maxTokens), defaultText: "256", help: "maximum tokens to generate"),
-                        Opt(long: "temp", aliases: ["temperature"], value: .real(SamplingLimits.temperature), defaultText: "0", help: "sampling temperature"),
+                        Opt(long: "max-tokens", aliases: ["max"], short: "n", value: .int(1...SamplingLimits.maxTokens), help: "maximum tokens to generate (default: until the model stops)"),
+                        Opt(long: "temp", aliases: ["temperature"], value: .real(SamplingLimits.temperature), help: "sampling temperature (default: the model's)"),
                         Opt(long: "top-p", value: .realAboveZero(max: SamplingLimits.topPMax), help: "nucleus sampling probability"),
                         Opt(long: "top-k", value: .int(SamplingLimits.topK), help: "sample from the k likeliest tokens (0 turns it off)"),
                         Opt(long: "min-p", value: .real(SamplingLimits.minP), help: "minimum probability relative to the likeliest token"),
@@ -34,22 +37,24 @@ extension CLI {
                         Opt(long: "draft", value: .model, help: draftHelp),
                         Opt(long: "sparse", value: .text, help: sparseHelp),
                         Opt(long: "spec", help: "speculative decoding with n-gram drafts"),
+                        Opt(long: "verbose", help: "print timing statistics to stderr"),
+                        Opt(long: "hidethinking", help: "do not show the model's thinking"),
+                        Opt(long: "nowordwrap", help: "do not wrap words to the next line automatically"),
+                        Opt(long: "keepalive", value: .text, help: "accepted for Ollama compatibility; has no effect"),
+                        Opt(long: "insecure", help: "accepted for Ollama compatibility; has no effect"),
+                        Opt(long: "format", value: .text, help: "not supported by the engine"),
+                        Opt(long: "truncate", help: "not supported (embedding models)"),
+                        Opt(long: "dimensions", value: .int(0...Int.max), help: "not supported (embedding models)"),
+                        Opt(long: "voice", value: .text, help: "not supported (speech models)"),
+                        Opt(long: "ask", value: .text, repeatable: true, help: "not supported"),
+                        Opt(long: "choice", value: .text, repeatable: true, help: "not supported"),
+                        Opt(long: "level", value: .text, repeatable: true, help: "not supported"),
+                        Opt(long: "presence-penalty", value: .text, help: "not supported by the engine"),
+                        Opt(long: "frequency-penalty", value: .text, help: "not supported by the engine"),
                     ],
                     examples: ["  mlxr run mlx-community/Qwen3-4B-4bit -p \"Hello\" --temp 0"],
                     environment: [("MLXR_SPARSE_ATTN", "sparse decode attention default (0 turns it off)")],
-                    run: { inv, _ in
-                        let words = inv.positionals.dropFirst().joined(separator: " ")
-                        let thinking: Bool? = inv.bool("no-think") ? false : inv.has("think") ? inv.string("think") != "false" : nil
-                        try await legacyRun(LegacyRun(
-                            model: inv.positionals[0],
-                            prompt: inv.string("prompt") ?? (words.isEmpty ? "Write a haiku about Apple Silicon." : words),
-                            maxTokens: inv.int("max-tokens") ?? 256, temp: Float(inv.double("temp") ?? 0),
-                            ctx: inv.int("ctx") ?? 4096, raw: inv.bool("raw"), thinking: thinking, showIds: inv.bool("ids"),
-                            draft: inv.string("draft"), sparse: inv.string("sparse"), spec: inv.bool("spec"),
-                            system: inv.string("system"), topP: inv.double("top-p").map { Float($0) }, topK: inv.int("top-k"),
-                            minP: inv.double("min-p").map { Float($0) }, repeatPenalty: inv.double("repeat-penalty").map { Float($0) },
-                            repeatLastN: inv.int("repeat-last-n"), seed: inv.string("seed").flatMap { UInt64($0) }))
-                    }),
+                    run: { inv, console in try await executeRun(inv, console, runDeps) }),
             Command(name: "serve", aliases: ["start"], summary: "Start the OpenAI-compatible server", args: [Arg("MODEL", kind: .model, optional: true)],
                     options: [
                         Opt(long: "port", value: .int(SamplingLimits.port), defaultText: "1234", help: "port to listen on"),

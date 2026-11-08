@@ -6,7 +6,7 @@ import MLXEngine
 /// `--draft <model|auto>`: the draft model for speculative decoding.
 func draftDirectory(_ s: String?, target: URL) throws -> URL? {
     guard let s else { return nil }
-    guard s == "auto" else { return try resolveModel(s) }
+    guard s == "auto" else { return try installedModelDirectory(s, resolver: .live) }
     guard let m = InferenceEngine.autoDraft(for: target) else {
         print("no installed draft model pairs with \(target.lastPathComponent); running without one")
         return nil
@@ -307,7 +307,7 @@ func legacyDownload(_ repo: String) async throws {
 }
 
 func legacyTokenize(_ model: String, _ text: String, idsOnly: Bool = false) throws {
-    let tok = try Tokenizer(directory: try resolveModel(model))
+    let tok = try Tokenizer(directory: try installedModelDirectory(model, resolver: .live))
     let ids = tok.encode(text)
     print(ids)
     if idsOnly { return }
@@ -317,7 +317,7 @@ func legacyTokenize(_ model: String, _ text: String, idsOnly: Bool = false) thro
 }
 
 func legacyBench(_ model: String) throws {
-    let dir = try resolveModel(model)
+    let dir = try installedModelDirectory(model, resolver: .live)
     // Long-context decode (opt-in): MLXR_BENCH_CTX=8192,32768 adds a section at the end.
     let longBench = LongBench(env: ProcessInfo.processInfo.environment)
     let t = try Transformer(directory: dir, contextLength: max(4096, (longBench.contexts.max() ?? 0) + longBench.margin + 64))
@@ -400,77 +400,12 @@ func legacyBench(_ model: String) throws {
     if !longBench.contexts.isEmpty { try benchLongContext(t, dir: dir, bench: longBench) }
 
 }
-
-struct LegacyRun {
-    var model: String
-    var prompt: String
-    var maxTokens = 256
-    var temp: Float = 0
-    var ctx = 4096
-    var raw = false
-    /// nil: the template's default (Qwen 3.5 0.8B and 2B answer directly, Qwen3 thinks).
-    var thinking: Bool?
-    var showIds = false
-    var draft: String?
-    var sparse: String?
-    var spec = false
-    var system: String?
-    var topP: Float?
-    var topK: Int?
-    var minP: Float?
-    var repeatPenalty: Float?
-    var repeatLastN: Int?
-    var seed: UInt64?
-}
-
-func legacyRun(_ o: LegacyRun) async throws {
-    let sparseArg = try sparseSetting(o.sparse)
-    let engine = InferenceEngine.shared
-    let dir = try resolveModel(o.model)
-    let info = try await engine.load(directory: dir, draftDirectory: try draftDirectory(o.draft, target: dir), contextLength: o.ctx, sparse: sparseArg)
-    print("Loaded \(info.name) [\(info.modelType), \(info.quantization), \(info.layers) layers, \(info.chatFormat)]\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s")
-    print(sparseSummary(info))
-    var params = SamplingParameters()
-    params.temperature = o.temp
-    params.maxTokens = o.maxTokens
-    params.repetitionPenalty = 1.0
-    params.seed = o.seed ?? 42
-    if let v = o.topP { params.topP = v }
-    if let v = o.topK { params.topK = v }
-    if let v = o.minP { params.minP = v }
-    if let v = o.repeatPenalty { params.repetitionPenalty = v }
-    if let v = o.repeatLastN { params.repetitionWindow = v }
-    let system = o.system.map { [ChatMessage(role: .system, content: $0)] } ?? []
-    if o.spec { params.speculative = true }
-    let prompt = o.prompt
-    let stream = o.raw ? engine.complete(prompt, parameters: params)
-        : engine.chat(system + [ChatMessage(role: .user, content: prompt)], parameters: params, enableThinking: o.thinking)
-    if o.showIds {
-        let p = o.raw ? prompt : engine.renderChat(system + [ChatMessage(role: .user, content: prompt)], enableThinking: o.thinking)
-        print("prompt ids:", engine.encode(p))
-    }
-    for try await ev in stream {
-        switch ev {
-        case .promptProcessed(let s):
-            print(String(format: "[prompt: %d tokens, %.0f tok/s, ttft %.3fs]", s.promptTokens, s.promptTokensPerSecond, s.timeToFirstToken))
-        case .text(let t): print(t, terminator: "")
-        case .finished(let s):
-            let model = s.modelDraftTokens.map { String(format: " (draft model %d/%d)", s.acceptedModelDraftTokens ?? 0, $0) } ?? ""
-            print(String(format: "\n[generated %d tokens at %.1f tok/s, stop: %@, drafts accepted %d/%d%@]", s.generatedTokens, s.tokensPerSecond, s.stopReason, s.acceptedDraftTokens ?? 0, s.draftTokens ?? 0, model))
-            if let c = s.draftCycles, c > 0, let dt = s.draftSeconds, let vt = s.verifySeconds {
-                print(String(format: "[draft model: %d cycles, %.2f tokens/cycle, draft %.1f ms + verify %.1f ms per cycle]", c,
-                             Double(s.acceptedModelDraftTokens ?? 0) / Double(c) + 1, dt / Double(c) * 1000, vt / Double(c) * 1000))
-            }
-        }
-    }
-}
-
 func legacyServe(model: String, port: UInt16, ctx: Int, lan: Bool, apiKey: String?, draft: String?, sparse: String?) async throws {
     let sparseArg = try sparseSetting(sparse)
     // LAN mode always needs a key: use --api-key / MLXR_API_KEY, or generate one.
     var key = apiKey ?? ProcessInfo.processInfo.environment["MLXR_API_KEY"]
     if lan && key == nil { key = OpenAIServer.generateAPIKey() }
-    let dir = try resolveModel(model)
+    let dir = try installedModelDirectory(model, resolver: .live)
     let info = try await InferenceEngine.shared.load(directory: dir, draftDirectory: try draftDirectory(draft, target: dir), contextLength: ctx, sparse: sparseArg)
     print("Loaded \(info.name)\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s")
     print(sparseSummary(info))
