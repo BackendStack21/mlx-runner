@@ -19,6 +19,10 @@ struct ModelTests {
     static let qwen3_14b = "lmstudio-community/Qwen3-14B-MLX-4bit"
     static let large = ProcessInfo.processInfo.environment["MLXR_TEST_LARGE"] == "1" ? [qwen3_14b] : []
     static let qwen25 = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+    /// Hybrid: Gated DeltaNet linear attention with a recurrent state, and gated full attention.
+    static let qwen35 = "mlx-community/Qwen3.5-0.8B-4bit"
+    /// Twice as many value heads as key heads in the linear-attention layers, hidden size 2560.
+    static let qwen35_4b = "mlx-community/Qwen3.5-4B-4bit"
     /// Every architecture: sparse attention runs on each one's full-attention layers.
     static let allArchitectures = [qwen3, llama, phi, mistral, qwen25, GemmaModelTests.gemma1, GemmaModelTests.gemma2,
                                    GemmaModelTests.gemma3, GemmaModelTests.gemma4] + large
@@ -43,7 +47,7 @@ struct ModelTests {
 
     /// Prefill (GEMM + flash attention) and token-by-token decode (matvec + decode attention)
     /// must produce the same next-token distribution.
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral] + large)
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, qwen35, qwen35_4b] + large)
     func prefillMatchesIncrementalDecode(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let model = try Transformer(directory: dir, contextLength: 1024)
@@ -66,7 +70,7 @@ struct ModelTests {
 
     /// A prompt longer than one prefill batch (512 tokens): the 64 × 64 GEMM tiles and flash
     /// attention over many key blocks, then a second batch at offset 512, against token-by-token decode.
-    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, "mlx-community/Qwen3-8B-4bit"])
+    @Test(.enabled(if: installedModel(qwen3) != nil), arguments: [qwen3, llama, phi, mistral, qwen35, "mlx-community/Qwen3-8B-4bit"])
     func longPrefillMatchesIncrementalDecode(repo: String) throws {
         guard let dir = installedModel(repo) else { return }
         let model = try Transformer(directory: dir, contextLength: 1024)
@@ -86,6 +90,40 @@ struct ModelTests {
         #expect(argPre == argInc)
         let maxDiff = zip(pre, inc).map { abs($0 - $1) }.max()!
         #expect(maxDiff < 0.1, "max logit difference \(maxDiff)")
+    }
+
+    /// Qwen 3.5's config: hybrid layer layout, Gated DeltaNet geometry, gated attention with partial
+    /// RoPE (64 of 256 dims, base 1e7, from rope_parameters).
+    @Test(.enabled(if: installedModel(qwen35) != nil))
+    func qwen35Config() throws {
+        let c = try ModelConfig(directory: installedModel(Self.qwen35)!)
+        #expect(c.modelType == "qwen3_5_text" && c.isHybrid && c.attnOutputGate)
+        #expect(c.layers.map(\.linear) == (0..<24).map { ($0 + 1) % 4 != 0 })
+        #expect(c.linearAttention == ModelConfig.LinearAttention(numKeyHeads: 16, numValueHeads: 16, keyHeadDim: 128, valueHeadDim: 128, convKernel: 4))
+        let attn = c.layers[3]
+        #expect(attn.headDim == 256 && attn.numKVHeads == 2 && attn.rotDim == 64 && attn.hasOwnKV && !c.layers[0].hasOwnKV)
+        #expect(abs(attn.invFreq[1] - Float(1 / pow(1e7, 2.0 / 64))) < 1e-12)
+        #expect(c.kvCacheBytes(context: 1024) == 6 * 2 * 2 * 256 * 2 * 1024 + 18 * 4 * (16 * 128 * 128 + 4 * 6144))
+    }
+
+    /// A recurrent state cannot be rewound: a step must continue where the state is or restart at 0,
+    /// a cached prefix is reusable only when the new run continues exactly there, and speculative
+    /// verification is off.
+    @Test(.enabled(if: installedModel(qwen35) != nil))
+    func hybridStateOnlyMovesForward() throws {
+        let model = try Transformer(directory: installedModel(Self.qwen35)!, contextLength: 1024)
+        #expect(!model.supportsBatchedVerify)
+        let ids: [Int32] = [760, 3841, 13477, 37550, 33075, 888, 279, 15217]
+        let V = model.vocabSize
+        let first = Array(UnsafeBufferPointer(start: try model.forward(ids, offset: 0), count: V))
+        #expect(model.recurrentPosition == ids.count)
+        _ = try model.forward([5388], offset: ids.count)
+        #expect(throws: EngineError.self) { _ = try model.forward([5388], offset: 3) }
+        #expect(model.reusablePrefix(ids.count, previousLength: ids.count) == 0)
+        #expect(model.reusablePrefix(ids.count + 1, previousLength: ids.count + 1) == ids.count + 1)
+        // Restarting at 0 starts from an empty state: the same prompt gives the same logits.
+        let again = Array(UnsafeBufferPointer(start: try model.forward(ids, offset: 0), count: V))
+        #expect(again == first)
     }
 
     /// The long-context split decode attention (attention_split + attention_combine) must give
@@ -214,6 +252,41 @@ struct ModelTests {
             if case .promptProcessed(let s) = ev { cached = s.cachedPromptTokens }
         }
         #expect(cached > 10, "second turn should reuse the KV cache prefix")
+    }
+
+    /// Qwen 3.5 (0.8B and 4B, whose templates differ in their thinking default): the follow-up turn
+    /// resumes from the recurrent checkpoint taken just before the first prompt's generation opener,
+    /// and answers exactly as a fresh engine processing the whole prompt.
+    @Test(.enabled(if: installedModel(qwen35) != nil), arguments: [qwen35, qwen35_4b], [false, true])
+    func hybridFollowUpResumesFromCheckpoint(repo: String, thinking: Bool) async throws {
+        guard let dir = installedModel(repo) else { return }
+        var p = SamplingParameters()
+        p.temperature = 0
+        p.maxTokens = thinking ? 48 : 24
+        func reply(_ engine: InferenceEngine, _ msgs: [ChatMessage]) async throws -> (text: String, cached: Int) {
+            var text = "", cached = -1
+            for try await ev in engine.chat(msgs, parameters: p, enableThinking: thinking) {
+                if case .text(let t) = ev { text += t }
+                if case .promptProcessed(let s) = ev { cached = s.cachedPromptTokens }
+            }
+            return (text, cached)
+        }
+        let engine = InferenceEngine()
+        let info = try await engine.load(directory: dir, contextLength: 2048)
+        // The 0.8B template thinks only when asked, the 4B template unless told not to.
+        #expect(info.supportsThinking && info.thinksByDefault == (repo == Self.qwen35_4b))
+        var msgs = [ChatMessage(role: .system, content: "You answer in one short sentence."),
+                    ChatMessage(role: .user, content: "What is the capital of France?")]
+        let first = try await reply(engine, msgs)
+        #expect(thinking ? first.text.hasPrefix("<think>\n") : first.text.contains("Paris"))
+        msgs.append(ChatMessage(role: .assistant, content: first.text))
+        msgs.append(ChatMessage(role: .user, content: "And of Italy?"))
+        let second = try await reply(engine, msgs)
+        #expect(second.cached > 10, "the follow-up should resume from the checkpoint")
+        let fresh = InferenceEngine()
+        _ = try await fresh.load(directory: dir, contextLength: 2048)
+        let reference = try await reply(fresh, msgs)
+        #expect(reference.cached == 0 && second.text == reference.text)
     }
 
     @Test(.enabled(if: installedModel(qwen3) != nil))

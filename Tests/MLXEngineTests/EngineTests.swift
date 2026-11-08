@@ -23,6 +23,35 @@ struct TextTests {
         #expect(s == "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
     }
 
+    /// Qwen 3.5 templates come in two forms that differ only in their default: 0.8B and 2B think only
+    /// when asked (`enable_thinking is true`), 4B and larger unless told not to. Both are Qwen 3.5
+    /// templates (the prompt opens the reasoning block); unset thinking renders the template's default.
+    @Test(arguments: [true, false])
+    func qwen35TemplateThinkingDefault(optIn: Bool) {
+        let opener = "{{- '<think>\\n' }}", closed = "{{- '<think>\\n\\n</think>\\n\\n' }}"
+        let generation = optIn
+            ? "{%- if enable_thinking is defined and enable_thinking is true %}\(opener){%- else %}\(closed){%- endif %}"
+            : "{%- if enable_thinking is defined and enable_thinking is false %}\(closed){%- else %}\(opener){%- endif %}"
+        let t = ChatTemplate(template: "<|im_start|><tool_call>\n<function=example>\(generation)", modelType: "qwen3_5_text", bosToken: nil)
+        #expect(t.format == .chatML && t.supportsThinkingToggle && t.qwen35 && !t.supportsTools)
+        #expect(t.thinksByDefault == !optIn)
+        let msgs = [ChatMessage(role: .user, content: " Hi ")]
+        let head = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        #expect(t.render(msgs, enableThinking: true) == head + "<think>\n")
+        #expect(t.render(msgs, enableThinking: false) == head + "<think>\n\n</think>\n\n")
+        #expect(t.render(msgs) == head + (optIn ? "<think>\n\n</think>\n\n" : "<think>\n"))
+        #expect(t.opensThinking(enableThinking: nil) == !optIn && t.opensThinking(enableThinking: true))
+    }
+
+    /// Qwen3 templates think by default and are not Qwen 3.5 templates (the model writes `<think>`).
+    @Test func qwen3TemplateThinksByDefault() {
+        let t = ChatTemplate(template: "<|im_start|>{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\\n\\n</think>\\n\\n' }}{%- endif %}",
+                             modelType: "qwen3", bosToken: nil)
+        #expect(t.thinksByDefault && !t.qwen35)
+        #expect(t.render([ChatMessage(role: .user, content: "Hi")]) == "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n")
+        #expect(!ChatTemplate(template: "<|start_header_id|>", modelType: "llama", bosToken: nil).thinksByDefault)
+    }
+
     @Test func llama3Template() {
         let t = ChatTemplate(template: "<|start_header_id|>", modelType: "llama", bosToken: "<|begin_of_text|>")
         let s = t.render([ChatMessage(role: .user, content: "Hi")])

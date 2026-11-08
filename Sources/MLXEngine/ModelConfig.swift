@@ -2,11 +2,14 @@ import Foundation
 
 /// Architectures the engine can run. All are pre-norm decoder-only transformers
 /// with RMSNorm, RoPE, grouped-query attention and a gated MLP (SwiGLU, or GeGLU for Gemma).
-/// `gemma3` is the multimodal export: only its language model is used.
+/// `gemma3` is the multimodal export: only its language model is used. Qwen 3.5 (`qwen3_5`, also a
+/// multimodal export) is a hybrid: most layers are Gated DeltaNet linear attention (a recurrent
+/// state instead of a KV cache), every `full_attention_interval`-th layer is gated full attention.
 public enum SupportedArchitectures {
     public static let modelTypes: Set<String> = ["llama", "mistral", "qwen2", "qwen3", "phi3",
                                                  "gemma", "gemma2", "gemma3", "gemma3_text",
-                                                 "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"]
+                                                 "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text",
+                                                 "qwen3_5", "qwen3_5_text"]
 
     public static func isSupported(_ modelType: String?) -> Bool {
         guard let t = modelType?.lowercased() else { return false }
@@ -20,10 +23,15 @@ public enum SupportedArchitectures {
         return !isMoE(config)
     }
 
+    /// Hybrid architectures whose recurrent state cannot drop rejected tokens: no speculative decoding.
+    public static func hasRecurrentState(_ modelType: String?) -> Bool { modelType?.lowercased().hasPrefix("qwen3_5") ?? false }
+
     public static func isMoE(_ config: [String: Any]?) -> Bool {
         guard let c = config else { return false }
         let text = c["text_config"] as? [String: Any]
+        func experts(_ d: [String: Any]?) -> Bool { ((d?["num_experts"] as? NSNumber)?.intValue ?? 0) > 0 }
         return (c["enable_moe_block"] as? Bool) == true || (text?["enable_moe_block"] as? Bool) == true
+            || experts(c) || experts(text)
     }
 }
 
@@ -89,9 +97,32 @@ public struct ModelConfig {
         /// Inverse RoPE frequencies (rotDim / 2 entries) and the number of rotated dims.
         public var invFreq: [Float]
         public var rotDim: Int
-        public var hasOwnKV: Bool { kvSource < 0 }
+        /// A Gated DeltaNet (linear attention) layer: no KV cache, a recurrent state instead.
+        public var linear = false
+        /// The layer has a K/V cache of its own (not KV-shared, not linear attention).
+        public var hasOwnKV: Bool { kvSource < 0 && !linear }
     }
     public private(set) var layers: [LayerSpec] = []
+
+    /// Qwen 3.5 Gated DeltaNet geometry (nil for models without linear attention).
+    public struct LinearAttention: Equatable {
+        public var numKeyHeads: Int, numValueHeads: Int, keyHeadDim: Int, valueHeadDim: Int, convKernel: Int
+        public var keyDim: Int { numKeyHeads * keyHeadDim }
+        public var valueDim: Int { numValueHeads * valueHeadDim }
+        /// Channels of the causal depthwise convolution: [q | k | v].
+        public var convDim: Int { 2 * keyDim + valueDim }
+        /// One token's input projections, as the engine lays them out: [q | k | v | z | b | a].
+        public var projCols: Int { convDim + valueDim + 2 * numValueHeads }
+        /// Rows of the convolution input ring (position p lives at row p mod convRing).
+        public static let convRing = 4
+        /// Recurrent state of one layer: S [Hv][Dv][Dk] and the convolution ring, both f32.
+        public var stateBytes: Int { 4 * (numValueHeads * valueHeadDim * keyHeadDim + Self.convRing * convDim) }
+    }
+    public private(set) var linearAttention: LinearAttention?
+    /// Qwen 3.5 full attention: q_proj also yields a per-head output gate, o_proj(attn · sigmoid(gate)).
+    public private(set) var attnOutputGate = false
+    /// Has layers with recurrent state (which, unlike a KV cache, cannot be rewound).
+    public var isHybrid: Bool { linearAttention != nil }
     /// Gemma 4: per-layer input embeddings (`hidden_size_per_layer_input`, 0 = none) and the
     /// weightless RMSNorm on V.
     public var perLayerInputSize = 0
@@ -108,9 +139,11 @@ public struct ModelConfig {
     }
     func cacheRows(_ spec: LayerSpec, context: Int) -> Int { Self.cacheRows(spec, context: context, window: slidingWindow) }
 
-    /// KV cache bytes for a context (f16 K and V, layers with their own cache).
+    /// KV cache bytes for a context (f16 K and V, layers with their own cache), plus the recurrent
+    /// state of linear-attention layers (independent of the context).
     public func kvCacheBytes(context: Int) -> Int {
-        layers.reduce(0) { $0 + ($1.hasOwnKV ? 2 * $1.numKVHeads * $1.headDim * 2 * cacheRows($1, context: context) : 0) }
+        layers.reduce(0) { $0 + ($1.hasOwnKV ? 2 * $1.numKVHeads * $1.headDim * 2 * cacheRows($1, context: context) : 0)
+            + ($1.linear ? linearAttention?.stateBytes ?? 0 : 0) }
     }
 
     public init(directory: URL) throws {
@@ -153,6 +186,11 @@ public struct ModelConfig {
             }
             if let local = (rp["sliding_attention"] as? [String: Any])?["rope_theta"], obj["rope_local_base_freq"] == nil {
                 obj["rope_local_base_freq"] = local
+            }
+            // Qwen 3.5 keeps its partial rotation there too (mlx-lm reads it from rope_parameters).
+            // Its multimodal RoPE sections rotate text positions like plain RoPE (all three axes equal).
+            if type.hasPrefix("qwen3_5"), obj["partial_rotary_factor"] == nil, let f = full["partial_rotary_factor"] {
+                obj["partial_rotary_factor"] = f
             }
         }
         if type == "gemma3_text" { obj.merge(["rope_theta": 1_000_000.0]) { old, _ in old } }
@@ -257,13 +295,53 @@ public struct ModelConfig {
         groupSize = (q?["group_size"] as? NSNumber)?.intValue
 
         if modelType.hasPrefix("gemma4") { try parseGemma4(obj) }
+        var linearLayers = [Bool](repeating: false, count: numLayers)
+        if modelType.hasPrefix("qwen3_5") { linearLayers = try parseQwen35(obj) }
         if layers.isEmpty {
             let global = inverseFrequencies(), local = ropeLocalTheta != nil ? inverseFrequencies(local: true) : global
             layers = (0..<numLayers).map { i in
                 LayerSpec(headDim: headDim, numKVHeads: numKVHeads, sliding: isSliding(i), kvSource: -1,
-                          invFreq: isSliding(i) ? local : global, rotDim: rotaryDim)
+                          invFreq: isSliding(i) ? local : global, rotDim: rotaryDim, linear: linearLayers[i])
             }
         }
+    }
+
+    /// Qwen 3.5 (`qwen3_5`, `qwen3_5_text`): which layers are Gated DeltaNet, and their geometry.
+    /// The full-attention layers have an output gate. Mixture-of-experts variants are not supported.
+    private mutating func parseQwen35(_ obj: [String: Any]) throws -> [Bool] {
+        func int(_ k: String) -> Int? { (obj[k] as? NSNumber)?.intValue }
+        func bad(_ what: String) -> EngineError { .invalidFile("config.json: \(what)") }
+        if (int("num_experts") ?? 0) > 0 { throw EngineError.unsupported("Qwen 3.5 mixture-of-experts models are not supported yet") }
+        let types: [String]
+        if let t = obj["layer_types"] as? [String] {
+            guard t.count == numLayers else { throw bad("layer_types has \(t.count) entries for \(numLayers) layers") }
+            types = t
+        } else {
+            let interval = int("full_attention_interval") ?? 4
+            guard (1...numLayers).contains(interval) else { throw bad("full_attention_interval = \(interval) is out of range") }
+            types = (0..<numLayers).map { ($0 + 1) % interval == 0 ? "full_attention" : "linear_attention" }
+        }
+        guard types.allSatisfy({ $0 == "full_attention" || $0 == "linear_attention" }) else { throw bad("unknown layer type") }
+        let la = LinearAttention(numKeyHeads: int("linear_num_key_heads") ?? 16, numValueHeads: int("linear_num_value_heads") ?? 32,
+                                 keyHeadDim: int("linear_key_head_dim") ?? 128, valueHeadDim: int("linear_value_head_dim") ?? 128,
+                                 convKernel: int("linear_conv_kernel_dim") ?? 4)
+        for (name, v, range) in [("linear_num_key_heads", la.numKeyHeads, 1...1024), ("linear_num_value_heads", la.numValueHeads, 1...1024),
+                                 ("linear_key_head_dim", la.keyHeadDim, 1...1024), ("linear_value_head_dim", la.valueHeadDim, 1...1024),
+                                 ("linear_conv_kernel_dim", la.convKernel, 1...LinearAttention.convRing)] where !range.contains(v) {
+            throw bad("\(name) = \(v) is out of range")
+        }
+        // gdn_prep computes the gates of a key head's value heads with one thread each (2 · 128 threads).
+        guard la.numValueHeads % la.numKeyHeads == 0, la.numValueHeads / la.numKeyHeads <= 256 else {
+            throw bad("linear_num_value_heads must be a multiple of linear_num_key_heads (at most 256 times)")
+        }
+        // The Gated DeltaNet kernels are instantiated for 128-wide heads (every Qwen 3.5 size).
+        guard la.keyHeadDim == 128, la.valueHeadDim == 128 else {
+            throw EngineError.unsupported("Gated DeltaNet head size \(la.keyHeadDim)/\(la.valueHeadDim)")
+        }
+        let linear = types.map { $0 == "linear_attention" }
+        if linear.contains(true) { linearAttention = la }
+        attnOutputGate = (obj["attn_output_gate"] as? Bool) ?? true
+        return linear
     }
 
     /// Gemma 4 (`gemma4_text`, and `gemma4_unified_text` which mlx-lm runs with the same model).

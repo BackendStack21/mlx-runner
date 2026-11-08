@@ -129,7 +129,21 @@ final class AppState {
     var contextLength: Int = 8192 { didSet { saveSettings() } }
     /// Speculative decoding draft model: "" off, "auto", or a model directory path.
     var draftModel: String = "" { didSet { saveSettings() } }
-    var enableThinking: Bool = true { didSet { saveSettings() } }
+    /// The Think toggle, per model (keyed by directory path). A model without a choice follows its
+    /// template: Qwen3 thinks, Qwen 3.5 0.8B and 2B answer directly (thinking often loops on them).
+    var thinkingChoices: [String: Bool] = [:] { didSet { saveSettings() } }
+    /// Settings saved before choices were per model had thinking off for every model: still the fallback.
+    private var thinkingOffEverywhere = false
+    var enableThinking: Bool {
+        get {
+            guard let info = loadedInfo else { return false }
+            return thinkingChoices[info.directory.path] ?? (!thinkingOffEverywhere && info.thinksByDefault)
+        }
+        set {
+            guard let info = loadedInfo else { return }
+            thinkingChoices[info.directory.path] = newValue
+        }
+    }
     /// Sparse decode attention for long contexts (on by default), its long-range key budget, and
     /// whether each KV head selects its own keys or every head shares one selection.
     var sparseAttention: Bool = true { didSet { saveSettings() } }
@@ -209,14 +223,15 @@ final class AppState {
         Task {
             do {
                 // Resolved off the main actor (tokenizer hashing). A saved pick that no longer fits the
-                // model being loaded (another family, or removed) is dropped rather than failing the load.
+                // model being loaded (another family, removed, or a target with a recurrent state, which
+                // cannot drop rejected drafts) is dropped rather than failing the load.
                 let draft: URL? = await Task.detached(priority: .userInitiated) {
                     switch draftSetting {
                     case "": return nil
                     case "auto": return InferenceEngine.autoDraft(for: model.directory, among: models)?.directory
                     default:
                         guard let d = models.first(where: { $0.directory.path == draftSetting }), d.isSupported, d.directory != model.directory,
-                              d.modelType == model.modelType,
+                              d.modelType == model.modelType, !SupportedArchitectures.hasRecurrentState(model.modelType),
                               let fp = InferenceEngine.tokenizerFingerprint(model.directory), InferenceEngine.tokenizerFingerprint(d.directory) == fp
                         else { return nil }
                         return d.directory
@@ -521,13 +536,20 @@ final class AppState {
         }
     }
 
+    /// Set while `loadSettings` runs: each assignment there fires `didSet`, and saving then would write
+    /// the defaults of the settings not read yet over their stored values.
+    @ObservationIgnored private var loadingSettings = false
+
     private func loadSettings() {
+        loadingSettings = true
+        defer { loadingSettings = false }
         let d = UserDefaults.standard
         if let data = d.data(forKey: "sampling"), let s = try? JSONDecoder().decode(SamplingParameters.self, from: data) { sampling = s }
         systemPrompt = d.string(forKey: "systemPrompt") ?? ""
         contextLength = d.object(forKey: "contextLength") as? Int ?? 8192
         draftModel = d.string(forKey: "draftModel") ?? ""
-        enableThinking = d.object(forKey: "enableThinking") as? Bool ?? true
+        thinkingChoices = d.dictionary(forKey: "thinkingChoices") as? [String: Bool] ?? [:]
+        thinkingOffEverywhere = d.object(forKey: "enableThinking") as? Bool == false
         sparseAttention = d.object(forKey: "sparseAttention") as? Bool ?? true
         sparseKeys = d.object(forKey: "sparseKeys") as? Int ?? SparseAttention.standard.topK
         sparsePerHead = d.object(forKey: "sparsePerHead") as? Bool ?? true
@@ -535,13 +557,13 @@ final class AppState {
     }
 
     private func saveSettings() {
-        guard !DevSnapshot.isActive else { return }
+        guard !DevSnapshot.isActive, !loadingSettings else { return }
         let d = UserDefaults.standard
         if let data = try? JSONEncoder().encode(sampling) { d.set(data, forKey: "sampling") }
         d.set(systemPrompt, forKey: "systemPrompt")
         d.set(contextLength, forKey: "contextLength")
         d.set(draftModel, forKey: "draftModel")
-        d.set(enableThinking, forKey: "enableThinking")
+        d.set(thinkingChoices, forKey: "thinkingChoices")
         d.set(sparseAttention, forKey: "sparseAttention")
         d.set(sparseKeys, forKey: "sparseKeys")
         d.set(sparsePerHead, forKey: "sparsePerHead")

@@ -54,6 +54,8 @@ public struct LoadedModelInfo: Sendable, Hashable {
     public let chatFormat: String
     public let supportsThinking: Bool
     public let loadSeconds: Double
+    /// The template thinks when chat requests leave `enableThinking` unset (see `ChatTemplate.thinksByDefault`).
+    public var thinksByDefault: Bool = false
     /// The chat template defines native tool calling.
     public var supportsTools: Bool = false
     /// Layers that decode with sparse attention from `sparseMinContext` tokens on (0: dense decode).
@@ -283,10 +285,16 @@ public final class InferenceEngine: @unchecked Sendable {
                     if sparse != nil, !model.sparseAvailable { sparseNote = model.sparseOffReason ?? "unavailable" }
                     var draft: Transformer?
                     if let draftDirectory {
+                        guard !model.config.isHybrid else {
+                            throw EngineError.unsupported("\(directory.lastPathComponent) keeps a recurrent state that cannot drop rejected drafts, so it runs without a draft model")
+                        }
                         guard model.supportsBatchedVerify else {
                             throw EngineError.unsupported("\(directory.lastPathComponent) has no batched verify kernels (4-bit weights are required), so a draft model cannot help")
                         }
                         let d = try Transformer(directory: draftDirectory, contextLength: model.maxSeq, sparse: nil)   // drafts stay dense
+                        guard !d.config.isHybrid else {
+                            throw EngineError.unsupported("draft model \(draftDirectory.lastPathComponent) keeps a recurrent state that cannot roll back rejected drafts")
+                        }
                         guard d.vocabSize >= min(model.vocabSize, tok.vocabularySize) else {
                             throw EngineError.unsupported("draft model \(draftDirectory.lastPathComponent) has a smaller vocabulary than \(directory.lastPathComponent)")
                         }
@@ -312,7 +320,8 @@ public final class InferenceEngine: @unchecked Sendable {
                         parameterBytes: model.weightBytes, contextLength: model.maxSeq,
                         layers: model.config.numLayers, hiddenSize: model.config.hiddenSize,
                         chatFormat: tpl.format.rawValue, supportsThinking: tpl.supportsThinkingToggle,
-                        loadSeconds: Date().timeIntervalSince(start), supportsTools: tpl.supportsTools,
+                        loadSeconds: Date().timeIntervalSince(start), thinksByDefault: tpl.thinksByDefault,
+                        supportsTools: tpl.supportsTools,
                         sparseLayers: model.sparseAvailable ? model.sparseLayerCount : 0,
                         sparseTopK: model.sparseAvailable ? sparse?.topK ?? 0 : 0,
                         sparseMinContext: model.sparseAvailable ? sparse?.minContext ?? 0 : 0,
@@ -353,17 +362,21 @@ public final class InferenceEngine: @unchecked Sendable {
     /// (from `ChatTemplate.toolCallPrefill`) starts the assistant turn.
     /// `constrainToolNames`: the reply continues a prefill that ends inside a function name
     /// (`tool_choice: required`); until the name is complete, only tokens that keep it one of
-    /// these names can be sampled.
-    public func chat(_ messages: [ChatMessage], parameters: SamplingParameters = .init(), enableThinking: Bool = true,
+    /// these names can be sampled. `enableThinking` nil: the template's default (`thinksByDefault`).
+    public func chat(_ messages: [ChatMessage], parameters: SamplingParameters = .init(), enableThinking: Bool? = nil,
                      conversationID: String? = nil, tools: ToolRequest? = nil, prefill: String? = nil,
                      constrainToolNames: [String]? = nil,
                      token: CancelToken = CancelToken()) -> AsyncThrowingStream<GenerationEvent, Error> {
         let defs = (tools?.active ?? false) ? tools?.tools ?? [] : []
         return stream(token, parameters: parameters, revealToolMarkers: !defs.isEmpty, nameChoices: constrainToolNames) { tok, tpl in
             guard let tpl else { throw EngineError.invalidFile("No model loaded") }
-            return self.fitToContext(messages, template: tpl, tokenizer: tok,
-                                     reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking,
-                                     conversationID: conversationID, tools: defs, prefill: prefill)
+            let enableThinking = enableThinking ?? tpl.thinksByDefault
+            let ids = self.fitToContext(messages, template: tpl, tokenizer: tok,
+                                        reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking,
+                                        conversationID: conversationID, tools: defs, prefill: prefill)
+            // A prompt that opened the reasoning block (Qwen 3.5): the reply text starts with the tag, as
+            // it does for models that write it themselves, so reasoning splitters see it.
+            return (ids, tpl.opensThinking(enableThinking: enableThinking, prefill: prefill) ? "<think>\n" : nil)
         }
     }
 
@@ -374,13 +387,13 @@ public final class InferenceEngine: @unchecked Sendable {
             var ids = tok.encode(prompt)
             // Models such as Llama, Mistral and Gemma expect BOS on raw prompts (`Tokenizer.addBosToken`).
             if tok.addBosToken, let b = tok.bosToken, let id = tok.tokenId(b), ids.first != id { ids.insert(id, at: 0) }
-            return ids
+            return (ids, nil)
         }
     }
 
     private func stream(_ token: CancelToken, parameters: SamplingParameters, revealToolMarkers: Bool = false,
                         nameChoices: [String]? = nil,
-                        _ makeTokens: @escaping (Tokenizer, ChatTemplate?) throws -> [Int]) -> AsyncThrowingStream<GenerationEvent, Error> {
+                        _ makeTokens: @escaping (Tokenizer, ChatTemplate?) throws -> (ids: [Int], lead: String?)) -> AsyncThrowingStream<GenerationEvent, Error> {
         AsyncThrowingStream { cont in
             cont.onTermination = { _ in token.cancel() }
             queue.async {
@@ -392,10 +405,10 @@ public final class InferenceEngine: @unchecked Sendable {
                 self.cancelLock.lock(); self.currentToken = token; self.cancelLock.unlock()
                 defer { self.cancelLock.lock(); self.currentToken = nil; self.cancelLock.unlock() }
                 do {
-                    let tokens = try makeTokens(tok, self.template)
+                    let (tokens, lead) = try makeTokens(tok, self.template)
                     let reveal = revealToolMarkers
                         ? Set((self.template?.toolCallMarkerTokens ?? []).compactMap { tok.tokenId($0) }) : []
-                    try self.run(tokens: tokens, parameters: parameters, reveal: reveal, nameChoices: nameChoices,
+                    try self.run(tokens: tokens, parameters: parameters, reveal: reveal, nameChoices: nameChoices, lead: lead,
                                  token: token) { cont.yield($0) }
                     cont.finish()
                 } catch {
@@ -408,7 +421,7 @@ public final class InferenceEngine: @unchecked Sendable {
     /// Token-level API used by the CLI and tests. Must not be called concurrently with generation.
     public func encode(_ text: String) -> [Int] { queue.sync { tokenizer?.encode(text) ?? [] } }
     public func decode(_ ids: [Int]) -> String { queue.sync { tokenizer?.decode(ids) ?? "" } }
-    public func renderChat(_ messages: [ChatMessage], enableThinking: Bool = true) -> String {
+    public func renderChat(_ messages: [ChatMessage], enableThinking: Bool? = nil) -> String {
         queue.sync { template?.render(messages, enableThinking: enableThinking) ?? "" }
     }
 
@@ -468,8 +481,13 @@ public final class InferenceEngine: @unchecked Sendable {
     }
 
     /// `reveal`: special tokens whose text is emitted (tool-call markers); others decode to nothing.
+    /// Prompt tokens after a hybrid model's checkpoint (see `run`): covers the generation prompts that
+    /// a following turn renders differently (Qwen 3.5: `<|im_start|>assistant\n<think>\n\n</think>\n\n`).
+    static let checkpointTail = 8
+
+    /// `lead`: text emitted before the first generated token (it is part of the prompt).
     private func run(tokens: [Int], parameters: SamplingParameters, reveal: Set<Int> = [], nameChoices: [String]? = nil,
-                     token: CancelToken, emit: (GenerationEvent) -> Void) throws {
+                     lead: String? = nil, token: CancelToken, emit: (GenerationEvent) -> Void) throws {
         guard let model, let tok = tokenizer else { throw EngineError.invalidFile("No model loaded") }
         var stats = GenerationStats()
         stats.promptTokens = tokens.count
@@ -525,13 +543,24 @@ public final class InferenceEngine: @unchecked Sendable {
         var logits: UnsafeMutablePointer<Float>?   // CPU sampling only
         var firstToken: Int?
         do {
-            let prompt = tokens[common...].map { Int32($0) }
+            var prompt = tokens[common...].map { Int32($0) }
+            var at = common
+            // Hybrid models (a recurrent state that cannot rewind): checkpoint the state a few tokens before
+            // the prompt's end. The next turn re-renders this prompt's tail differently (the generation
+            // prompt becomes the assistant turn), so it resumes from there instead of from the start.
+            if model.config.isHybrid, prompt.count > Self.checkpointTail + 8 {
+                let head = prompt.count - Self.checkpointTail
+                _ = try model.forward(Array(prompt[..<head]), offset: at, dense: true, isCancelled: { token.isCancelled })
+                model.recurrentCheckpoint = model.snapshotRecurrent()
+                at += head
+                prompt.removeFirst(head)
+            }
             if gpuSampling {
                 model.seedSampler(seed)
-                firstToken = try model.prefill(prompt, offset: common, sample: gpuParams, isCancelled: { token.isCancelled })
+                firstToken = try model.prefill(prompt, offset: at, sample: gpuParams, isCancelled: { token.isCancelled })
             } else {
                 // A prompt is a prefill: dense even when only its last token is new.
-                logits = try model.forward(prompt, offset: common, dense: true, isCancelled: { token.isCancelled })
+                logits = try model.forward(prompt, offset: at, dense: true, isCancelled: { token.isCancelled })
             }
             // The draft model catches up on the prompt lazily (`proposeFromModel`, after the first
             // token is out), so the time to first token stays the target's own.
@@ -546,6 +575,7 @@ public final class InferenceEngine: @unchecked Sendable {
         stats.timeToFirstToken = tPrompt
         stats.promptTokensPerSecond = Double(tokens.count - common) / max(tPrompt, 1e-6)
         emit(.promptProcessed(stats))
+        if let lead { emit(.text(lead)) }
 
         var sampler = Sampler(params: parameters, rng: XorShift(seed: seed))
         var shaper = sampler   // builds distributions (no randomness), so verifyDraft can call it
@@ -768,7 +798,9 @@ extension InferenceEngine {
         // Sparse decode attention (on by default) adds its index when the context can reach its
         // minimum context (`Transformer.init` allocates nothing otherwise).
         let index = sparse.map { ctx >= $0.minContext } == true ? Transformer.sparseBytes(config: cfg, context: ctx) : 0
-        return (weights + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg) + index, ctx)
+        // Interleaved quantization pairs (hybrid models) repeat the scales and biases: 1/9 of 4-bit g64 weights.
+        let pairs = Transformer.usesPairs(cfg) ? weights / 9 : 0
+        return (weights + pairs + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg) + index, ctx)
     }
 
     /// Refuses to load models (a target and its draft) whose weights plus KV caches would not fit
@@ -826,7 +858,8 @@ extension InferenceEngine {
         let t = target.standardizedFileURL
         guard let me = models.first(where: { $0.directory.standardizedFileURL == t })
                 ?? ModelStore.describe(target, repo: target.lastPathComponent, source: .library),
-              me.sizeBytes > 0, let type = me.modelType, let fp = tokenizerFingerprint(target) else { return nil }
+              me.sizeBytes > 0, let type = me.modelType, !SupportedArchitectures.hasRecurrentState(type),
+              let fp = tokenizerFingerprint(target) else { return nil }
         return models
             .filter { $0.isSupported && $0.modelType == type && $0.sizeBytes > 0 && $0.sizeBytes * 4 <= me.sizeBytes
                 && $0.directory.standardizedFileURL != t }

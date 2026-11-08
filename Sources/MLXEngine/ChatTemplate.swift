@@ -45,6 +45,10 @@ public struct ChatTemplate: Sendable {
     public let format: ChatFormat
     /// The template supports Qwen3-style `enable_thinking`.
     public let supportsThinkingToggle: Bool
+    /// What the template does when `enable_thinking` is not given: Qwen3 and Qwen 3.5 4B+ think,
+    /// Qwen 3.5 0.8B and 2B (`enable_thinking is true` templates) answer directly. Their model
+    /// cards warn that thinking mode often loops on those two sizes. False without a toggle.
+    public let thinksByDefault: Bool
     let bos: String
     /// System prompt the template injects when the conversation has none (Qwen2.5).
     let defaultSystem: String?
@@ -59,6 +63,11 @@ public struct ChatTemplate: Sendable {
     /// Gemma 4 templates that close an empty thought channel after the model turn opener when
     /// thinking is off (the 12B), so the model answers directly.
     let emptyThoughtPrefill: Bool
+    /// Qwen 3.5 templates: the generation prompt opens `<think>\n` when thinking is on (and closes an
+    /// empty block when it is off), message content is trimmed, and assistant turns before the last
+    /// user message drop their reasoning. Their tool calls use an XML format (`<function=…>`), which
+    /// is not wired up: such templates report no tool support.
+    let qwen35: Bool
 
     /// `toolTemplate`: a separate tool-use template, when the model ships one (checked for tool support).
     public init(template: String?, modelType: String, bosToken: String?, toolTemplate: String? = nil) {
@@ -73,8 +82,12 @@ public struct ChatTemplate: Sendable {
         let t = (template ?? "") + (toolTemplate ?? "")
         hermesDoubleBraces = t.contains("{{\\\"name\\\": <function-name>")
         emptyThoughtPrefill = format == .gemma4 && (template ?? "").contains("'<|channel>thought\\n<channel|>'")
+        // Qwen 3.5 templates open the reasoning block on their own (`{{- '<think>\n' }}`); the
+        // opt-in form (thinking only when asked, 0.8B/2B) and opt-out form (4B+) differ only there.
+        qwen35 = format == .chatML && supportsThinkingToggle && (template ?? "").contains("{{- '<think>\\n' }}")
+        thinksByDefault = supportsThinkingToggle && !(template ?? "").contains("enable_thinking is true")
         switch format {
-        case .chatML: supportsTools = t.contains("<tool_call>")
+        case .chatML: supportsTools = t.contains("<tool_call>") && !t.contains("<function=")
         case .llama3: supportsTools = llamaDatePreamble && t.contains("ipython")
         case .mistral: supportsTools = t.contains("[AVAILABLE_TOOLS]")
         case .phi3, .gemma, .gemma4, .plain: supportsTools = false
@@ -83,6 +96,13 @@ public struct ChatTemplate: Sendable {
 
     /// Special tokens that start a tool call and must reach the output parser.
     public var toolCallMarkerTokens: [String] { ToolCallParser.revealedMarkers(format) }
+
+    /// The rendered prompt ends inside an opened reasoning block (Qwen 3.5 with thinking on): the
+    /// reply is reasoning until `</think>`, without the model writing `<think>` itself.
+    /// `enableThinking` nil: the template's default.
+    public func opensThinking(enableThinking: Bool?, prefill: String? = nil) -> Bool {
+        qwen35 && (enableThinking ?? thinksByDefault) && prefill == nil
+    }
 
     /// Text that starts the assistant turn so the reply must be a tool call: any call for
     /// `.required`, a call to the named function for `.function`. nil otherwise.
@@ -105,8 +125,9 @@ public struct ChatTemplate: Sendable {
         return f.string(from: Date())
     }
 
-    /// Renders messages as a prompt ending with the assistant turn opener.
-    public func render(_ messages: [ChatMessage], enableThinking: Bool = true, tools: [ToolDefinition] = [],
+    /// Renders messages as a prompt ending with the assistant turn opener. `enableThinking` nil
+    /// renders what the template does when it is not given (`thinksByDefault`).
+    public func render(_ messages: [ChatMessage], enableThinking: Bool? = nil, tools: [ToolDefinition] = [],
                        prefill: String? = nil) -> String {
         renderMarked(messages, enableThinking: enableThinking, tools: tools, prefill: prefill).text
     }
@@ -115,8 +136,9 @@ public struct ChatTemplate: Sendable {
     /// tokenized as plain text so a message cannot inject control tokens (forged turns).
     /// `tools` are rendered the way the model's own template does; `prefill` (see
     /// `toolCallPrefill`) is appended after the assistant turn opener.
-    public func renderMarked(_ messages: [ChatMessage], enableThinking: Bool = true, tools: [ToolDefinition] = [],
+    public func renderMarked(_ messages: [ChatMessage], enableThinking: Bool? = nil, tools: [ToolDefinition] = [],
                              prefill: String? = nil) -> (text: String, content: [NSRange]) {
+        let enableThinking = enableThinking ?? thinksByDefault
         var s = ""
         var len = 0
         var ranges: [NSRange] = []
@@ -127,6 +149,40 @@ public struct ChatTemplate: Sendable {
             s += x; len += n
         }
         switch format {
+        case .chatML where qwen35:
+            func trim(_ x: String) -> String { x.trimmingCharacters(in: .whitespacesAndNewlines) }
+            var rest = messages[...]
+            if rest.first?.role == .system {
+                lit("<|im_start|>system\n"); content(trim(rest.removeFirst().content)); lit("<|im_end|>\n")
+            }
+            let lastQuery = messages.lastIndex { $0.role == .user } ?? -1
+            for i in rest.indices {
+                let m = messages[i]
+                switch m.role {
+                case .tool:
+                    if i == rest.startIndex || messages[i - 1].role != .tool { lit("<|im_start|>user") }
+                    lit("\n<tool_response>\n"); content(trim(m.content)); lit("\n</tool_response>")
+                    if i == messages.count - 1 || messages[i + 1].role != .tool { lit("<|im_end|>\n") }
+                case .assistant:
+                    // As the template: reasoning is what precedes the first </think>, content what follows the last.
+                    var text = trim(m.content), reasoning = ""
+                    if text.contains("</think>") {
+                        let parts = text.components(separatedBy: "</think>")
+                        var r = parts[0]
+                        while r.hasSuffix("\n") { r.removeLast() }
+                        r = r.components(separatedBy: "<think>").last ?? r
+                        reasoning = trim(r)
+                        text = String((parts.last ?? "").drop(while: { $0 == "\n" }))
+                    }
+                    lit("<|im_start|>assistant\n")
+                    if i > lastQuery { lit("<think>\n"); content(reasoning); lit("\n</think>\n\n") }
+                    content(text); lit("<|im_end|>\n")
+                default:
+                    lit("<|im_start|>\(m.role.rawValue)\n"); content(trim(m.content)); lit("<|im_end|>\n")
+                }
+            }
+            lit("<|im_start|>assistant\n")
+            lit(opensThinking(enableThinking: enableThinking, prefill: prefill) ? "<think>\n" : "<think>\n\n</think>\n\n")
         case .chatML:
             var rest = messages[...]
             if !tools.isEmpty {

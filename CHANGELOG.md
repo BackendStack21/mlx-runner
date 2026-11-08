@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.5.0
+
+Qwen 3.5 support: the hybrid Gated DeltaNet architecture. Decode is 6–7% ahead of mlx-lm on the 0.8B model, 2% behind on the 2B and 5% behind on the 4B; prefill is ahead. Thinking now follows each model's own default, and the app keeps its settings across relaunches.
+
+- **Qwen 3.5** (`qwen3_5`, `qwen3_5_text`; the dense models; verified on the 0.8B, 2B and 4B 4-bit
+  exports). Three of every four layers are
+  Gated DeltaNet linear attention: a causal convolution and a recurrent state per head instead of a
+  KV cache. The others are full attention with an output gate and partial RoPE (64 of 256 dims).
+  - New Metal kernels: decode runs each linear-attention layer's convolution, q/k normalization,
+    gates, recurrence and gated output norm in one dispatch; prefill uses four batch kernels with the
+    same arithmetic, so prefill and token-by-token decode agree bit for bit in those layers.
+  - Logits match mlx-lm (float32) within 0.004 at every position of a 70-token text, with the same
+    argmax everywhere; the tokenizer and the chat template match transformers.
+  - Thinking toggle: with thinking on, the prompt opens the `<think>` block and the reply starts with
+    the tag, so the app's "Thought for N s" block and the API's `reasoning_content` work as for Qwen3.
+  - Thinking follows each model's own default: the 0.8B and 2B answer directly unless thinking is
+    turned on (their templates make it opt-in, and Qwen's model cards warn that it often loops on them:
+    with the app's default sampling, 4 of 6 seeded replies on the 0.8B and 5 of 6 on the 2B were still
+    thinking after 4,096 tokens; mlx-lm: 3 and 6 of 6). The 4B and larger think unless it is turned off.
+  - Chat follow-ups: the recurrent state cannot be rolled back like a KV cache, so the engine saves a
+    checkpoint of it 8 tokens before the end of each prompt (before the part the next turn renders
+    differently) and the next turn resumes there, with output identical to a fresh run.
+  - Long contexts: sparse decode attention runs on the full-attention layers. On real text at 16K
+    tokens decode goes from 151 to 215 tok/s with a mean KL of 0.003 nats to dense decode and 5/5
+    passkeys found.
+  - Not yet: tool calling (Qwen 3.5 uses an XML `<function=…>` format; tool requests get a 400),
+    mixture-of-experts variants, multi-token prediction. Speculative decoding is off for these models.
+- **Speed** on an M2 Pro against mlx-lm 0.32.2 (alternating runs of `mlx_lm.benchmark` and `mlxr bench`):
+  - Qwen3.5-0.8B-4bit: decode 270.5 vs 253.5 tok/s at 16 tokens of context (+6.7%), 260.0 vs 244.5 at
+    1,024 (+6.3%); a 256-token chat reply 269.4 vs 251.6 tok/s (`mlxr run` vs `mlx_lm.generate`, +7.1%);
+    prefill of 512 tokens 2,780 vs 2,420 tok/s.
+  - Qwen3.5-2B-4bit: decode 133.1 vs 135.5 tok/s (−1.8%), 130.5 vs 133.7 at 1,024; prefill 1,158 vs 1,030.
+  - Qwen3.5-4B-4bit: decode 62.3 vs 65.7 tok/s (−5%), 61.4 vs 64.5 at 1,024 (hidden size 2,560: none of
+    the K = 1,024 or paired kernels apply; the larger matvecs lag mlx-lm as on 7–14B models).
+  - Where the time goes: the linear-attention layers' recurrent state runs at the memory bandwidth floor
+    (0.19 ms per token for 18 layers); the rest is the 4-bit matvecs and about 200 dependent dispatches.
+- **Kernels** (hybrid models only unless noted; greedy output unchanged by each):
+  - The 4-bit decode matvecs read each row's quantization scales and biases as interleaved pairs built at
+    load (one stream instead of two arrays); for the hidden-size projections (K = 1,024) a kernel issues
+    a block's loads before its arithmetic and the next block's before finishing the current one.
+  - Long-context decode attention for head size 256 with 4 query heads per KV head: each lane reads 8
+    contiguous dims (one 16-byte load per key), 64 virtual simdgroups per KV head, and the output gate
+    applied in the combine kernel (+1–3% at 1,024 tokens).
+  - GPU token selection, every model: a first pass over blocks of 256 logits on the whole GPU, so the
+    one-threadgroup selection scans only the blocks that can hold a candidate (the default sampler went
+    from 3.7 to about 2.2 vocabulary scans per token on Qwen 3.5's 248K vocabulary). The selected tokens
+    are unchanged.
+- Multimodal exports no longer copy their vision tower or multi-token-prediction weights into GPU
+  memory (201 MB less for Qwen3.5-0.8B; Gemma 3 4B also benefits).
+- **Thinking default per model.** A chat that doesn't say whether to think gets the template's
+  default, as with transformers and mlx-lm: an API request without `enable_thinking`,
+  `chat_template_kwargs` or a reasoning effort, `mlxr run` without `--think`/`--no-think` (new), and
+  the app's Think toggle, which now remembers its setting per model. Settings saved by earlier
+  versions with thinking off keep it off for every model. Qwen3 thinks by default, as before. A
+  `reasoning_effort` other than `none` now turns thinking on.
+- **App settings survive a relaunch.** Loading the saved settings at launch wrote defaults over the
+  ones not read yet (system prompt, context length, draft model, sparse attention, last model), so only
+  the sampling settings were kept.
+
 ## 1.4.0
 
 Sparse decode attention for long contexts, on by default; faster long-context decode on Qwen3 14B; and

@@ -300,17 +300,33 @@ struct MatmulKernelTests {
 struct SampleKernelTests {
     /// Runs `sample_token` `draws` times over the same logits and history; returns the drawn tokens
     /// and the final pool size / attempt count.
+    /// Token selection as `Transformer.encodeSample` encodes it: `sample_blocks` (block maxima of 256
+    /// logits) into `blocks`, then the one-threadgroup `sample_token`.
+    func encodeSample(_ enc: MTLComputeCommandEncoder, logits: MTLBuffer, hist: MTLBuffer, state: MTLBuffer, status: MTLBuffer,
+                      diag: MTLBuffer, blocks: MTLBuffer, _ sp: SampleParams, threads: Int) throws {
+        let n = (Int(sp.V) + 255) / 256
+        enc.setComputePipelineState(try GPU.shared.pipeline("sample_blocks"))
+        enc.set(logits, 0, 0); enc.params(sp, 4); enc.set(blocks, 0, 6); enc.set(blocks, n * 4, 7)
+        enc.dispatchThreadgroups(MTLSize(width: (n + 7) / 8, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.setComputePipelineState(try GPU.shared.pipeline("sample_token"))
+        enc.set(logits, 0, 0); enc.set(hist, 0, 1); enc.set(state, 0, 2); enc.set(status, 0, 3)
+        enc.params(sp, 4)
+        enc.set(diag, 0, 5); enc.set(blocks, 0, 6); enc.set(blocks, n * 4, 7)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
+    }
+
     func gpuSample(_ logits: [Float], _ params: SamplingParameters, history: [Int32] = [], draws: Int = 1,
                    seed: UInt64 = 1) throws -> (tokens: [Int], pool: Int, attempts: Int) {
         let pso = try GPU.shared.pipeline("sample_token")
         let threads = min(1024, pso.maxTotalThreadsPerThreadgroup) / 32 * 32
+        let blocks = try GPU.shared.buffer(2 * ((logits.count + 255) / 256) * 4)
         let hist = try GPU.shared.buffer((history.count + 2) * 4)
         history.withUnsafeBytes { hist.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
         let state = try GPU.shared.buffer(16)
         state.contents().storeBytes(of: seed, as: UInt64.self)
         state.contents().storeBytes(of: Float(8), toByteOffset: 8, as: Float.self)
         let status = try GPU.shared.buffer((history.count + 2) * 4)
-        let diag = try GPU.shared.buffer(16)
+        let diag = try GPU.shared.buffer(32)
         var tokens: [Int] = []
         let pos = max(0, history.count - 1)
         for _ in 0..<draws {
@@ -318,11 +334,7 @@ struct SampleKernelTests {
             var sp = SampleParams(params, vocab: logits.count)
             sp.pos = Int32(pos)
             runGPU { enc in
-                enc.setComputePipelineState(pso)
-                enc.set(lb, 0, 0); enc.set(hist, 0, 1); enc.set(state, 0, 2); enc.set(status, 0, 3)
-                enc.params(sp, 4)
-                enc.set(diag, 0, 5)
-                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
+                try! encodeSample(enc, logits: lb, hist: hist, state: state, status: status, diag: diag, blocks: blocks, sp, threads: threads)
             }
             #expect(status.contents().load(fromByteOffset: (pos + 1) * 4, as: Int32.self) == 0, "status")
             tokens.append(Int(hist.contents().load(fromByteOffset: (pos + 1) * 4, as: Int32.self)))
@@ -365,17 +377,13 @@ struct SampleKernelTests {
     @Test func nonFiniteLogitsAreReported() throws {
         var l = testLogits(4096)
         l[7] = .infinity
-        let pso = try GPU.shared.pipeline("sample_token")
-        let hist = try GPU.shared.buffer(64), state = try GPU.shared.buffer(16), status = try GPU.shared.buffer(64), diag = try GPU.shared.buffer(16)
+        let hist = try GPU.shared.buffer(64), state = try GPU.shared.buffer(16), status = try GPU.shared.buffer(64), diag = try GPU.shared.buffer(32)
+        let blocks = try GPU.shared.buffer(2 * ((l.count + 255) / 256) * 4)
         var sp = SampleParams(SamplingParameters(), vocab: l.count)
         sp.pos = 0
         let lb = makeBuffer(l)
         runGPU { enc in
-            enc.setComputePipelineState(pso)
-            enc.set(lb, 0, 0); enc.set(hist, 0, 1); enc.set(state, 0, 2); enc.set(status, 0, 3)
-            enc.params(sp, 4)
-            enc.set(diag, 0, 5)
-            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            try! encodeSample(enc, logits: lb, hist: hist, state: state, status: status, diag: diag, blocks: blocks, sp, threads: 256)
         }
         #expect(status.contents().load(fromByteOffset: 4, as: Int32.self) == 1)
         #expect(hist.contents().load(fromByteOffset: 4, as: Int32.self) == 0, "a valid id is left for the queued next step")

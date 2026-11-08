@@ -10,6 +10,7 @@ struct RecommendedModel: Identifiable, Hashable {
 
     static let all: [RecommendedModel] = [
         .init(id: "mlx-community/Qwen3-0.6B-4bit", title: "Qwen3 0.6B", blurb: "Tiny and blazing fast, with thinking mode", gigabytes: 0.35, icon: "hare.fill"),
+        .init(id: "mlx-community/Qwen3.5-0.8B-4bit", title: "Qwen3.5 0.8B", blurb: "Newest tiny Qwen: hybrid linear attention, quick direct answers", gigabytes: 0.65, icon: "bolt.horizontal.fill"),
         .init(id: "mlx-community/Llama-3.2-3B-Instruct-4bit", title: "Llama 3.2 3B", blurb: "Meta's compact all-rounder", gigabytes: 1.8, icon: "bolt.fill"),
         .init(id: "mlx-community/Qwen3-4B-4bit", title: "Qwen3 4B", blurb: "Strong reasoning in a small footprint", gigabytes: 2.3, icon: "brain.head.profile"),
         .init(id: "mlx-community/Phi-3.5-mini-instruct-4bit", title: "Phi-3.5 mini", blurb: "Microsoft's efficient 3.8B model", gigabytes: 2.2, icon: "graduationcap.fill"),

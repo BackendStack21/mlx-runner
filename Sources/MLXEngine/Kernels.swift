@@ -317,6 +317,184 @@ kernel void qmv(device const uchar* wA [[buffer(0)]],
     }
 }
 
+// Decode matvec (4-bit, T = 1, K % 1024 == 0) over repacked quantization data: each row's (scale,
+// bias) pairs interleaved in one [O][K/gs][2] array (built at load, `Linear.pairs`), so a row's
+// quantization data is one contiguous read instead of two from distant arrays. The per-row arithmetic
+// is qmv's (TAIL 0), so outputs are identical. Simdgroups loop over 4-row blocks (gRow, gRow + stride,
+// ...) of a grid that may be smaller than the matrix; with K == 1024 (K1) x is loaded once per simdgroup.
+// Same fused [A|B|C] arguments as qmv, pairs in the scale slots; no bias.
+template <typename T, bool K1>
+kernel void qmvp(device const uchar* wA [[buffer(0)]],
+                 device const T*     pA [[buffer(1)]],
+                 device const float* x  [[buffer(3)]],
+                 device float*       y  [[buffer(4)]],
+                 constant MMParams&  p  [[buffer(5)]],
+                 device const uchar* wB [[buffer(6)]],
+                 device const T*     pB [[buffer(7)]],
+                 device const uchar* wC [[buffer(9)]],
+                 device const T*     pC [[buffer(10)]],
+                 uint2 tgid [[threadgroup_position_in_grid]],
+                 uint2 ntg  [[threadgroups_per_grid]],
+                 uint  sgid [[simdgroup_index_in_threadgroup]],
+                 uint  lane [[thread_index_in_simdgroup]]) {
+    const float4 sLo = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    const float4 sHi = sLo * (1.0f / 65536.0f);
+    const uint4 mLo = uint4(0xFu, 0xF0u, 0xF00u, 0xF000u);
+    const uint4 mHi = mLo << 16;
+    const ulong rowBytes = ulong(p.K) / 2;
+    const int gpr = p.K / p.gs;
+    float4 xv[8];
+    float xs = 0.0f;
+    if (K1) {
+        device const float4* xp = (device const float4*)(x + int(lane) * 32);
+        for (int i = 0; i < 8; i++) {
+            const float4 v = xp[i];
+            xs += v.x + v.y + v.z + v.w;
+            xv[i] = v * ((i & 1) ? sHi : sLo);
+        }
+    }
+    const int stride = int(ntg.x) * QVNSG * QROWS;
+    for (int gRow = (int(tgid.x) * QVNSG + int(sgid)) * QROWS; gRow < p.O; gRow += stride) {
+        device const uchar* w; device const T* pq; int rowBase;
+        if (gRow < p.o1) { w = wA; pq = pA; rowBase = gRow; }
+        else if (gRow < p.o1 + p.o2) { w = wB; pq = pB; rowBase = gRow - p.o1; }
+        else { w = wC; pq = pC; rowBase = gRow - p.o1 - p.o2; }
+        const int nr = min(QROWS, p.O - gRow);
+        device const uchar* wb = w + ulong(rowBase) * rowBytes;
+        device const T* pb = pq + ulong(rowBase) * ulong(gpr) * 2;
+        float acc[QROWS] = {0, 0, 0, 0};
+        for (int k = int(lane) * 32; k < p.K; k += 1024) {
+            if (!K1) {
+                device const float4* xp = (device const float4*)(x + k);
+                xs = 0.0f;
+                for (int i = 0; i < 8; i++) {
+                    const float4 v = xp[i];
+                    xs += v.x + v.y + v.z + v.w;
+                    xv[i] = v * ((i & 1) ? sHi : sLo);
+                }
+            }
+            const int g = k / p.gs;
+            const ulong off = ulong(k) >> 1;
+            for (int r = 0; r < nr; r++) {
+                const uint4 wq = *(device const uint4*)(wb + ulong(r) * rowBytes + off);
+                device const T* pr = pb + (ulong(r) * ulong(gpr) + ulong(g)) * 2;
+                float d = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const uint4 wi = uint4(wq[i]);
+                    d += dot(float4(wi & mLo), xv[2 * i]) + dot(float4(wi & mHi), xv[2 * i + 1]);
+                }
+                acc[r] += float(pr[0]) * d + float(pr[1]) * xs;
+            }
+        }
+        for (int r = 0; r < nr; r++) {
+            const float v = simd_sum(acc[r]);
+            if (lane == 0) y[gRow + r] = v;
+        }
+    }
+}
+
+// Pre-scaled x for the mask-only nibble extraction (qmv): 32 values from x + k and their sum.
+inline void qmv4_loadx(device const float* x, int k, thread float4* xv, thread float& xs) {
+    const float4 sLo = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    const float4 sHi = sLo * (1.0f / 65536.0f);
+    device const float4* xp = (device const float4*)(x + k);
+    xs = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        const float4 v = xp[i];
+        xs += v.x + v.y + v.z + v.w;
+        xv[i] = v * ((i & 1) ? sHi : sLo);
+    }
+}
+
+// 32 weights (one 16-byte load) against pre-scaled x: qmv's per-lane arithmetic.
+inline float qmv4_dot32(uint4 wq, thread const float4* xv) {
+    const uint4 mLo = uint4(0xFu, 0xF0u, 0xF00u, 0xF000u);
+    const uint4 mHi = mLo << 16;
+    float d = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        const uint4 wi = uint4(wq[i]);
+        d += dot(float4(wi & mLo), xv[2 * i]) + dot(float4(wi & mHi), xv[2 * i + 1]);
+    }
+    return d;
+}
+
+// This lane's weight and pair pointers for the block at `row` of the fused [A|B|C] matrix.
+template <typename T>
+inline void qmvq1_locate(int row, constant MMParams& p, device const uchar* wA, device const T* pA,
+                         device const uchar* wB, device const T* pB, device const uchar* wC, device const T* pC,
+                         ulong off, int gpr, int g, thread device const uchar*& wb, thread device const T*& pb) {
+    int rowBase;
+    device const uchar* w; device const T* pq;
+    if (row < p.o1) { w = wA; pq = pA; rowBase = row; }
+    else if (row < p.o1 + p.o2) { w = wB; pq = pB; rowBase = row - p.o1; }
+    else { w = wC; pq = pC; rowBase = row - p.o1 - p.o2; }
+    wb = w + ulong(rowBase) * 512 + off;
+    pb = pq + (ulong(rowBase) * ulong(gpr) + ulong(g)) * 2;
+}
+
+// acc + s · d + b · xs as the compiler contracts it in qmv (checked bit for bit against qmv on every
+// Qwen 3.5 0.8B layer); written out so a different surrounding loop cannot change the rounding.
+inline float qmv4_acc(float acc, float s, float d, float b, float xs) { return fma(s, d, fma(b, xs, acc)); }
+
+// Decode matvec over interleaved pairs for K == 1024 with x held in registers: each simdgroup walks
+// 4-row blocks (gRow, gRow + stride, ...) and loads the next block's weights and pairs before it
+// computes the current one, so a block's memory latency overlaps the previous block's arithmetic.
+// Output rows must be a multiple of 4 ([A|B|C] boundaries are multiples of 8). Per-row arithmetic
+// and reduction are qmv's (TAIL 0, one pass), so outputs are identical.
+template <typename T>
+kernel void qmvq1(device const uchar* wA [[buffer(0)]],
+                  device const T*     pA [[buffer(1)]],
+                  device const float* x  [[buffer(3)]],
+                  device float*       y  [[buffer(4)]],
+                  constant MMParams&  p  [[buffer(5)]],
+                  device const uchar* wB [[buffer(6)]],
+                  device const T*     pB [[buffer(7)]],
+                  device const uchar* wC [[buffer(9)]],
+                  device const T*     pC [[buffer(10)]],
+                  uint2 tgid [[threadgroup_position_in_grid]],
+                  uint2 ntg  [[threadgroups_per_grid]],
+                  uint  sgid [[simdgroup_index_in_threadgroup]],
+                  uint  lane [[thread_index_in_simdgroup]]) {
+    const int gpr = 1024 / p.gs;
+    const int g = int(lane) * 32 / p.gs;
+    int gRow = (int(tgid.x) * QVNSG + int(sgid)) * QROWS;
+    if (gRow >= p.O) return;
+    float4 xv[8];
+    float xs;
+    qmv4_loadx(x, int(lane) * 32, xv, xs);
+    const int stride = int(ntg.x) * QVNSG * QROWS;
+    const ulong off = ulong(lane) * 16;
+    device const uchar* wb; device const T* pb;
+    qmvq1_locate(gRow, p, wA, pA, wB, pB, wC, pC, off, gpr, g, wb, pb);
+    uint4 wq[QROWS];
+    float2 pr[QROWS];
+    for (int r = 0; r < QROWS; r++) {
+        wq[r] = *(device const uint4*)(wb + ulong(r) * 512);
+        pr[r] = float2(pb[ulong(r) * ulong(gpr) * 2], pb[ulong(r) * ulong(gpr) * 2 + 1]);
+    }
+    while (true) {
+        const int gNext = gRow + stride;
+        uint4 wn[QROWS];
+        float2 pn[QROWS];
+        if (gNext < p.O) {
+            qmvq1_locate(gNext, p, wA, pA, wB, pB, wC, pC, off, gpr, g, wb, pb);
+            for (int r = 0; r < QROWS; r++) {
+                wn[r] = *(device const uint4*)(wb + ulong(r) * 512);
+                pn[r] = float2(pb[ulong(r) * ulong(gpr) * 2], pb[ulong(r) * ulong(gpr) * 2 + 1]);
+            }
+        }
+        float acc[QROWS] = {0, 0, 0, 0};
+        for (int r = 0; r < QROWS; r++) acc[r] = qmv4_acc(acc[r], pr[r].x, qmv4_dot32(wq[r], xv), pr[r].y, xs);
+        for (int r = 0; r < QROWS; r++) {
+            const float v = simd_sum(acc[r]);
+            if (lane == 0) y[gRow + r] = v;
+        }
+        if (gNext >= p.O) break;
+        gRow = gNext;
+        for (int r = 0; r < QROWS; r++) { wq[r] = wn[r]; pr[r] = pn[r]; }
+    }
+}
+
 // Small-batch 4-bit matmul (T = 3..8 tokens: speculative verification, short prompts) on
 // simdgroup matrices. Each weight is loaded and dequantized once, independent of T; the
 // per-token work is one 8×8×8 multiply-accumulate per 64 weights, the tokens padded to 8.
@@ -898,7 +1076,7 @@ kernel void rms_norm(device const float* x [[buffer(0)]],
 //            read the raw k head (Gemma 4 global layers without v_proj)
 // D <= 1024 (checked on the host). Dispatch only the nH q heads for a layer that reuses
 // another layer's KV cache.
-struct QKVPostParams { int D; int nH; int nKV; int rowStride; int offset; int maxSeq; int traditional; int rotDim; float eps; int hasNorm; int vNorm; int kEqV; };
+struct QKVPostParams { int D; int nH; int nKV; int rowStride; int offset; int maxSeq; int traditional; int rotDim; float eps; int hasNorm; int vNorm; int kEqV; int gateHeads; };
 
 template <typename T>
 kernel void qkv_post(device float*       qkv     [[buffer(0)]],
@@ -914,7 +1092,8 @@ kernel void qkv_post(device float*       qkv     [[buffer(0)]],
                      uint  nsg  [[simdgroups_per_threadgroup]],
                      uint  lane [[thread_index_in_simdgroup]]) {
     const int h = int(tg.x), t = int(tg.y), i = int(tid);
-    device float* base = qkv + t * p.rowStride + h * p.D;
+    // gateHeads: Qwen 3.5 rows hold [q | output gate | k | v]; k and v sit gateHeads heads further on.
+    device float* base = qkv + t * p.rowStride + (h + (h >= p.nH ? p.gateHeads : 0)) * p.D;
     const int pos = p.offset + t;
     const int row = kv_slot(pos, p.maxSeq);
     const bool isV = h >= p.nH + p.nKV;
@@ -1192,6 +1371,159 @@ kernel void attention_combine(device const float* part [[buffer(0)]],
     device const float* pt = part + ulong(t) * ulong(rows) * ulong(2 + p.D);
     attn_merge<E, ASPLIT_V>((device const float*)(pt + r), (device const float*)(pt + rows + r),
                             (device const float*)(pt + 2 * rows + r * p.D), lane, out + t * p.outStride + h * p.D);
+}
+
+// ---------------------------------------------------------------------------
+// Decode attention of the hybrid models (Qwen 3.5: head_dim 256, few KV heads, an output gate).
+// Not bit-identical to `attention` / `attention_split` (the lane sums are ordered differently), so
+// it is only selected for `isHybrid` models. One simdgroup takes the G query heads of a KV head
+// (each K/V row is read once per group); a lane owns 8 contiguous dims, so a key costs one 16-byte
+// K load and one V load, and U keys are in flight per iteration (the serial chain over the keys,
+// whose memory latency bounds the old kernel, is HV·U times shorter than the context). Virtual
+// simdgroup v (HNSG per threadgroup, HV per KV head) takes keys v, v + HV, ... The threadgroup
+// merges its simdgroups' partials; with one threadgroup per KV head (HV == HNSG) it writes the
+// output row directly, times sigmoid(gate) (GATE: the gate follows the q section of the projection
+// row), else one partial per threadgroup for attention_hyb_combine, which also applies the gate.
+// Partials (floats), per token: pm[nH·NT] | pl[nH·NT] | pa[nH·NT·D], row = h·NT + n (NT = HV/HNSG).
+// A small batch (T = 2..8) runs every token t as its own step: tg.x = kvh·T + t.
+// ---------------------------------------------------------------------------
+inline float hyb_gate(device const float* qkv, constant AttnParams& p, int t, int h, int i) {
+    return 1.0f / (1.0f + exp(-qkv[t * p.qStride + p.nH * p.D + h * p.D + i]));
+}
+// One online-softmax step for one key of head g: k0/k1, v0/v1 are this lane's 8 dims.
+inline void hyb_update(float4 q0, float4 q1, thread float4& a0, thread float4& a1, thread float& m, thread float& l,
+                       float4 k0, float4 k1, float4 v0, float4 v1) {
+    const float s = simd_sum(dot(q0, k0) + dot(q1, k1));
+    const float mn = max(m, s);
+    const float cr = exp(m - mn), pe = exp(s - mn);
+    l = l * cr + pe;
+    a0 = a0 * cr + pe * v0;
+    a1 = a1 * cr + pe * v1;
+    m = mn;
+}
+template <int G, int HV, int HNSG, int U, bool GATE>
+kernel void attention_hyb(device const float* qkv  [[buffer(0)]],
+                          device const half*  kc   [[buffer(1)]],
+                          device const half*  vc   [[buffer(2)]],
+                          device float*       out  [[buffer(3)]],
+                          constant AttnParams& p   [[buffer(4)]],
+                          uint2 tg   [[threadgroup_position_in_grid]],
+                          uint  sg   [[simdgroup_index_in_threadgroup]],
+                          uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr int NT = HV / HNSG;   // threadgroups per KV head
+    const int t = int(tg.x) % p.T, kvh = int(tg.x) / p.T;
+    const int v = int(tg.y) * HNSG + int(sg);
+    const int h0 = kvh * (p.nH / p.nKV);
+    float4 q0[G], q1[G], a0[G], a1[G];
+    float m[G], l[G];
+    for (int g = 0; g < G; g++) {
+        device const float4* q = (device const float4*)(qkv + t * p.qStride + (h0 + g) * p.D + int(lane) * 8);
+        q0[g] = q[0] * p.scale; q1[g] = q[1] * p.scale;
+        a0[g] = float4(0.0f); a1[g] = float4(0.0f);
+        m[g] = -1e30f; l[g] = 0.0f;
+    }
+    const int L = p.offset + t + 1;
+    device const half* kb = kc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
+    device const half* vb = vc + ulong(kvh) * ulong(p.maxSeq) * ulong(p.D);
+    for (int j0 = attn_first_key(p, L - 1) + v; j0 < L; j0 += HV * U) {
+        uint4 kw[U], vw[U];
+        for (int u = 0; u < U; u++) {
+            const int j = kv_slot(min(j0 + u * HV, L - 1), p.maxSeq);   // clamped: rows past L are loaded but unused
+            kw[u] = ((device const uint4*)(kb + ulong(j) * ulong(p.D)))[lane];
+            vw[u] = ((device const uint4*)(vb + ulong(j) * ulong(p.D)))[lane];
+        }
+        for (int u = 0; u < U; u++) {
+            if (j0 + u * HV >= L) break;
+            const float4 k0 = float4(as_type<half4>(kw[u].xy)), k1 = float4(as_type<half4>(kw[u].zw));
+            const float4 v0 = float4(as_type<half4>(vw[u].xy)), v1 = float4(as_type<half4>(vw[u].zw));
+            for (int g = 0; g < G; g++) hyb_update(q0[g], q1[g], a0[g], a1[g], m[g], l[g], k0, k1, v0, v1);
+        }
+    }
+    // Merge the threadgroup's HNSG partials, one head per round (bounded threadgroup memory).
+    threadgroup float tm[HNSG], tl[HNSG];
+    threadgroup float4 ta[HNSG * 64];
+    for (int g = 0; g < G; g++) {
+        if (g > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) { tm[sg] = m[g]; tl[sg] = l[g]; }
+        ta[sg * 64 + lane * 2] = a0[g]; ta[sg * 64 + lane * 2 + 1] = a1[g];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg != 0) continue;
+        float M = -1e30f;
+        for (int s = 0; s < HNSG; s++) M = max(M, tm[s]);
+        float Ls = 0.0f;
+        float4 o0 = float4(0.0f), o1 = float4(0.0f);
+        for (int s = 0; s < HNSG; s++) {
+            const float f = exp(tm[s] - M);
+            Ls += tl[s] * f;
+            o0 += ta[s * 64 + lane * 2] * f; o1 += ta[s * 64 + lane * 2 + 1] * f;
+        }
+        const int h = h0 + g;
+        if (NT == 1) {
+            const float inv = 1.0f / Ls;
+            float4 g0 = float4(1.0f), g1 = float4(1.0f);
+            if (GATE) {
+                for (int e = 0; e < 4; e++) { g0[e] = hyb_gate(qkv, p, t, h, int(lane) * 8 + e); g1[e] = hyb_gate(qkv, p, t, h, int(lane) * 8 + 4 + e); }
+            }
+            device float4* op = (device float4*)(out + t * p.outStride + h * p.D + int(lane) * 8);
+            op[0] = o0 * inv * g0; op[1] = o1 * inv * g1;
+        } else {
+            const int rows = p.nH * NT, r = h * NT + int(tg.y);
+            device float* pt = out + ulong(t) * ulong(rows) * ulong(2 + p.D);
+            if (lane == 0) { pt[r] = M; pt[rows + r] = Ls; }
+            device float4* pa = (device float4*)(pt + 2 * rows + r * p.D + int(lane) * 8);
+            pa[0] = o0; pa[1] = o1;
+        }
+    }
+}
+
+// One threadgroup of CNSG simdgroups per (head, token): simdgroup s merges partials s, s + CNSG, ...
+// of attention_hyb, the threadgroup merges those CNSG results, and the gate is applied.
+template <int NT, int CNSG, bool GATE>
+kernel void attention_hyb_combine(device const float* part [[buffer(0)]],
+                                  device float*       out  [[buffer(1)]],
+                                  constant AttnParams& p   [[buffer(2)]],
+                                  device const float* qkv  [[buffer(3)]],
+                                  uint2 tg  [[threadgroup_position_in_grid]],
+                                  uint  sg   [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    const int h = int(tg.x), t = int(tg.y);
+    const int rows = p.nH * NT, r = h * NT;
+    device const float* pt = part + ulong(t) * ulong(rows) * ulong(2 + p.D);
+    device const float* tm = pt + r;
+    device const float* tl = pt + rows + r;
+    device const float4* ta = (device const float4*)(pt + 2 * rows + r * p.D + int(lane) * 8);
+    float M = -1e30f;
+    for (int s = int(sg); s < NT; s += CNSG) M = max(M, tm[s]);
+    float Ls = 0.0f;
+    float4 o0 = float4(0.0f), o1 = float4(0.0f);
+    for (int s = int(sg); s < NT; s += CNSG) {
+        const float f = exp(tm[s] - M);
+        Ls += tl[s] * f;
+        o0 += ta[s * (p.D / 4)] * f; o1 += ta[s * (p.D / 4) + 1] * f;
+    }
+    if (CNSG > 1) {
+        threadgroup float cm[CNSG], cl[CNSG];
+        threadgroup float4 ca[CNSG * 64];
+        if (lane == 0) { cm[sg] = M; cl[sg] = Ls; }
+        ca[sg * 64 + lane * 2] = o0; ca[sg * 64 + lane * 2 + 1] = o1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg != 0) return;
+        M = -1e30f;
+        for (int s = 0; s < CNSG; s++) M = max(M, cm[s]);
+        Ls = 0.0f; o0 = float4(0.0f); o1 = float4(0.0f);
+        for (int s = 0; s < CNSG; s++) {
+            const float f = exp(cm[s] - M);
+            Ls += cl[s] * f;
+            o0 += ca[s * 64 + lane * 2] * f; o1 += ca[s * 64 + lane * 2 + 1] * f;
+        }
+    }
+    const float inv = 1.0f / Ls;
+    float4 g0 = float4(1.0f), g1 = float4(1.0f);
+    if (GATE) {
+        for (int e = 0; e < 4; e++) { g0[e] = hyb_gate(qkv, p, t, h, int(lane) * 8 + e); g1[e] = hyb_gate(qkv, p, t, h, int(lane) * 8 + 4 + e); }
+    }
+    device float4* op = (device float4*)(out + t * p.outStride + h * p.D + int(lane) * 8);
+    op[0] = o0 * inv * g0; op[1] = o1 * inv * g1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1757,6 +2089,237 @@ kernel void add_bias(device float*      y [[buffer(0)]],
     y[t * p.stride + o] += float(b[o]);
 }
 
+// a[t, i] *= sigmoid(g[t * stride + i])   (Qwen 3.5 attention output gate)
+kernel void sigmoid_gate(device float*       a [[buffer(0)]],
+                         device const float* g [[buffer(1)]],
+                         constant EWParams&  p [[buffer(2)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    const int i = int(gid.x), t = int(gid.y);
+    if (i >= p.cols) return;
+    a[t * p.cols + i] *= 1.0f / (1.0f + exp(-g[t * p.stride + i]));
+}
+
+// ---------------------------------------------------------------------------
+// Qwen 3.5 Gated DeltaNet (linear attention). A token's projections are laid out
+// [q (Hk·D) | k (Hk·D) | v (Hv·D) | z (Hv·D) | b (Hv) | a (Hv)], `cols` floats per row, D = 128.
+// q, k and v go through a causal depthwise convolution (up to 4 taps) and SiLU. The convolution
+// input of position p is kept at row p mod 4 of a ring, so position p reads p-3..p-1 from it
+// (zero before position 0: a pass at offset 0 starts from an empty state). q and k are scaled
+// L2-normalized, g = exp(-exp(A_log) · softplus(a + dt_bias)), beta = sigmoid(b), and each value
+// head h (key head h / (Hv / Hk)) updates its f32 state S [D][D] (row = value channel):
+//   S = g · S;  delta = (v - S k) · beta;  S += delta kᵀ;  y = S q
+// y is RMS-normalized per head, times the norm weight and silu(z).
+// Decode runs all of it in one dispatch (`gdn_step`); a batch runs `gdn_conv`, `gdn_prep`,
+// `gdn_scan` and `gdn_norm`. Both use the helpers below with the same lane layout, so a prefill
+// and token-by-token decode give bit-identical results.
+// ---------------------------------------------------------------------------
+#define GDN_D 128
+struct GDNParams { int T; int offset; int cols; int Hk; int Hv; int convDim; int outStride; float eps; };
+
+inline float gdn_silu(float x) { return x / (1.0f + exp(-x)); }
+
+// Causal convolution of positions p-3..p (x3 is p's input; w.w multiplies it), then SiLU.
+inline float gdn_conv4(float4 w, float x0, float x1, float x2, float x3) {
+    return gdn_silu(fma(w.w, x3, fma(w.z, x2, fma(w.y, x1, w.x * x0))));
+}
+
+// Convolution input of channel c at position pos (zero before the sequence starts).
+inline float gdn_ring(device const float* ring, int convDim, int c, int pos) {
+    return pos < 0 ? 0.0f : ring[(pos & 3) * convDim + c];
+}
+
+// q (simdgroups 0-3) and k (4-7) scale factors from the per-simdgroup sums of squares: mlx-lm's
+// normalize_qk, an RMS norm with eps 1e-6 / D, then × 1/D for q and × 1/sqrt(D) for k.
+inline float2 gdn_qk_scale(threadgroup const float* red, uint sgid) {
+    const int b = sgid < 4 ? 0 : 4;
+    const float tot = ((red[b] + red[b + 1]) + red[b + 2]) + red[b + 3];
+    return float2(rsqrt(tot / float(GDN_D) + 1e-6f / float(GDN_D)), sgid < 4 ? 1.0f / float(GDN_D) : 0.08838834764831845f);
+}
+
+// (g, beta) of one value head: g = exp(-exp(A_log) · softplus(a + dt_bias)), beta = sigmoid(b).
+inline float2 gdn_gate(float a, float b, float negA, float dtb) {
+    const float x = a + dtb;
+    const float e = exp(-abs(x)), u = 1.0f + e;
+    const float sp = max(x, 0.0f) + (log(u) - ((u - 1.0f) - e) / u);   // logaddexp(x, 0), log1p-accurate
+    return float2(exp(negA * sp), 1.0f / (1.0f + exp(-b)));
+}
+
+// One recurrence step of one state row. LPR lanes share a row; lane `part` holds the float4
+// columns j·LPR + part (j < D / 4 / LPR), and q / k are read at the same float4 indices.
+template <int LPR, typename P>
+inline float gdn_update(thread float4* s, P q, P k, int part, float g, float beta, float v) {
+    constexpr int N = GDN_D / 4 / LPR;
+    float kv = 0.0f;
+    for (int j = 0; j < N; j++) { s[j] *= g; kv += dot(s[j], k[j * LPR + part]); }
+    for (ushort m = 1; m < LPR; m <<= 1) kv += simd_shuffle_xor(kv, m);
+    const float4 delta = float4((v - kv) * beta);
+    float y = 0.0f;
+    for (int j = 0; j < N; j++) { s[j] = fma(k[j * LPR + part], delta, s[j]); y += dot(s[j], q[j * LPR + part]); }
+    for (ushort m = 1; m < LPR; m <<= 1) y += simd_shuffle_xor(y, m);
+    return y;
+}
+
+// Gated RMS norm of one value head (threads 0..D-1 hold y; every thread calls it).
+inline void gdn_out(float y, float z, int i, uint sgid, uint lane, threadgroup float* red, float w, float eps,
+                    device float* out) {
+    const float ss = simd_sum(y * y);
+    if (lane == 0 && sgid < 4) red[sgid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (i < GDN_D) {
+        const float inv = rsqrt((((red[0] + red[1]) + red[2]) + red[3]) / float(GDN_D) + eps);
+        out[i] = ((y * inv) * w) * gdn_silu(z);
+    }
+}
+
+// Decode (T = 1): one threadgroup (128 · LPR threads) per value head h.
+template <int LPR>
+kernel void gdn_step(device float*        proj   [[buffer(0)]],
+                     device const float4* convW  [[buffer(1)]],
+                     device float*        ring   [[buffer(2)]],
+                     device float*        state  [[buffer(3)]],
+                     device const float*  negA   [[buffer(4)]],
+                     device const float*  dtBias [[buffer(5)]],
+                     device const float*  normW  [[buffer(6)]],
+                     device float*        out    [[buffer(7)]],
+                     constant GDNParams&  p      [[buffer(8)]],
+                     uint h    [[threadgroup_position_in_grid]],
+                     uint tid  [[thread_index_in_threadgroup]],
+                     uint sgid [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int RPS = 32 / LPR, N = GDN_D / 4 / LPR;
+    const int ratio = p.Hv / p.Hk, hk = int(h) / ratio, keyDim = p.Hk * GDN_D, valueDim = p.Hv * GDN_D;
+    const int i = int(tid), pos = p.offset;
+    threadgroup float4 sq[GDN_D / 4], sk[GDN_D / 4];
+    threadgroup float sv[GDN_D], sy[GDN_D], red[8];
+    // This lane's part of its state row (loads overlap the convolution).
+    const int part = int(lane) % LPR, row = int(sgid) * RPS + int(lane) / LPR;
+    device float4* srow = (device float4*)(state + (ulong(h) * GDN_D + ulong(row)) * GDN_D);
+    float4 s[N];
+    for (int j = 0; j < N; j++) s[j] = pos == 0 ? float4(0.0f) : srow[j * LPR + part];
+    // Convolution: threads 0..D-1 take q channels, D..2D-1 k, 2D..3D-1 v. Key heads shared by several
+    // value heads are written to the ring by the first of them only.
+    float cv = 0.0f;
+    if (i < 3 * GDN_D) {
+        const int c = i < GDN_D ? hk * GDN_D + i : i < 2 * GDN_D ? keyDim + hk * GDN_D + (i - GDN_D) : 2 * keyDim + int(h) * GDN_D + (i - 2 * GDN_D);
+        const float x3 = proj[c];
+        cv = gdn_conv4(convW[c], gdn_ring(ring, p.convDim, c, pos - 3), gdn_ring(ring, p.convDim, c, pos - 2),
+                       gdn_ring(ring, p.convDim, c, pos - 1), x3);
+        if (i >= 2 * GDN_D || int(h) % ratio == 0) ring[(pos & 3) * p.convDim + c] = x3;
+    }
+    const float ss = simd_sum(cv * cv);
+    if (lane == 0 && sgid < 8) red[sgid] = ss;
+    if (i >= 2 * GDN_D && i < 3 * GDN_D) sv[i - 2 * GDN_D] = cv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (i < 2 * GDN_D) {
+        const float2 sc = gdn_qk_scale(red, sgid);
+        if (i < GDN_D) ((threadgroup float*)sq)[i] = (cv * sc.x) * sc.y;
+        else ((threadgroup float*)sk)[i - GDN_D] = (cv * sc.x) * sc.y;
+    }
+    const float2 gb = gdn_gate(proj[2 * keyDim + 2 * valueDim + p.Hv + int(h)], proj[2 * keyDim + 2 * valueDim + int(h)], negA[h], dtBias[h]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float y = gdn_update<LPR>(s, (threadgroup const float4*)sq, (threadgroup const float4*)sk, part, gb.x, gb.y, sv[row]);
+    for (int j = 0; j < N; j++) srow[j * LPR + part] = s[j];
+    if (part == 0) sy[row] = y;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float yv = i < GDN_D ? sy[i] : 0.0f;
+    const float z = i < GDN_D ? proj[2 * keyDim + valueDim + int(h) * GDN_D + i] : 0.0f;
+    gdn_out(yv, z, i, sgid, lane, red, i < GDN_D ? normW[i] : 0.0f, p.eps, out + int(h) * GDN_D);
+}
+
+// Batch, step 1: convolution + SiLU in place, one thread per channel walking the T tokens.
+kernel void gdn_conv(device float*        proj  [[buffer(0)]],
+                     device const float4* convW [[buffer(1)]],
+                     device float*        ring  [[buffer(2)]],
+                     constant GDNParams&  p     [[buffer(3)]],
+                     uint gid [[thread_position_in_grid]]) {
+    const int c = int(gid);
+    if (c >= p.convDim) return;
+    const float4 w = convW[c];
+    float x0 = gdn_ring(ring, p.convDim, c, p.offset - 3);
+    float x1 = gdn_ring(ring, p.convDim, c, p.offset - 2);
+    float x2 = gdn_ring(ring, p.convDim, c, p.offset - 1);
+    for (int t = 0; t < p.T; t++) {
+        device float* x = proj + t * p.cols + c;
+        const float x3 = *x;
+        *x = gdn_conv4(w, x0, x1, x2, x3);
+        if (t >= p.T - 4) ring[((p.offset + t) & 3) * p.convDim + c] = x3;
+        x0 = x1; x1 = x2; x2 = x3;
+    }
+}
+
+// Batch, step 2: one threadgroup (2D threads) per (key head, token): q and k normalized in place,
+// and (g, beta) of the key head's value heads written over their (a, b).
+kernel void gdn_prep(device float*       proj   [[buffer(0)]],
+                     device const float* negA   [[buffer(1)]],
+                     device const float* dtBias [[buffer(2)]],
+                     constant GDNParams& p      [[buffer(3)]],
+                     uint2 tg   [[threadgroup_position_in_grid]],
+                     uint  tid  [[thread_index_in_threadgroup]],
+                     uint  sgid [[simdgroup_index_in_threadgroup]],
+                     uint  lane [[thread_index_in_simdgroup]]) {
+    const int hk = int(tg.x), t = int(tg.y), i = int(tid);
+    const int keyDim = p.Hk * GDN_D, valueDim = p.Hv * GDN_D, ratio = p.Hv / p.Hk;
+    device float* r = proj + t * p.cols;
+    device float* x = r + (i < GDN_D ? hk * GDN_D + i : keyDim + hk * GDN_D + (i - GDN_D));
+    const float v = *x;
+    threadgroup float red[8];
+    const float ss = simd_sum(v * v);
+    if (lane == 0) red[sgid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float2 sc = gdn_qk_scale(red, sgid);
+    *x = (v * sc.x) * sc.y;
+    if (i < ratio) {
+        const int h = hk * ratio + i;
+        device float* bp = r + 2 * keyDim + 2 * valueDim + h;
+        device float* ap = bp + p.Hv;
+        const float2 gb = gdn_gate(*ap, *bp, negA[h], dtBias[h]);
+        *ap = gb.x;
+        *bp = gb.y;
+    }
+}
+
+// Batch, step 3: the recurrence over the T tokens. Threadgroups of whole simdgroups, RPS = 32 / LPR
+// state rows per simdgroup; y replaces v in place.
+template <int LPR>
+kernel void gdn_scan(device float*       proj  [[buffer(0)]],
+                     device float*       state [[buffer(1)]],
+                     constant GDNParams& p     [[buffer(2)]],
+                     uint2 tg   [[threadgroup_position_in_grid]],
+                     uint  sgid [[simdgroup_index_in_threadgroup]],
+                     uint  nsg  [[simdgroups_per_threadgroup]],
+                     uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr int RPS = 32 / LPR, N = GDN_D / 4 / LPR;
+    const int h = int(tg.y), ratio = p.Hv / p.Hk, hk = h / ratio, keyDim = p.Hk * GDN_D, valueDim = p.Hv * GDN_D;
+    const int part = int(lane) % LPR, row = (int(tg.x) * int(nsg) + int(sgid)) * RPS + int(lane) / LPR;
+    device float4* srow = (device float4*)(state + (ulong(h) * GDN_D + ulong(row)) * GDN_D);
+    float4 s[N];
+    for (int j = 0; j < N; j++) s[j] = p.offset == 0 ? float4(0.0f) : srow[j * LPR + part];
+    for (int t = 0; t < p.T; t++) {
+        device float* r = proj + t * p.cols;
+        device float* v = r + 2 * keyDim + h * GDN_D + row;
+        const float y = gdn_update<LPR>(s, (device const float4*)(r + hk * GDN_D), (device const float4*)(r + keyDim + hk * GDN_D),
+                                        part, r[2 * keyDim + 2 * valueDim + p.Hv + h], r[2 * keyDim + 2 * valueDim + h], *v);
+        if (part == 0) *v = y;
+    }
+    for (int j = 0; j < N; j++) srow[j * LPR + part] = s[j];
+}
+
+// Batch, step 4: gated RMS norm, one threadgroup (D threads) per (value head, token).
+kernel void gdn_norm(device const float* proj  [[buffer(0)]],
+                     device const float* normW [[buffer(1)]],
+                     device float*       out   [[buffer(2)]],
+                     constant GDNParams& p     [[buffer(3)]],
+                     uint2 tg   [[threadgroup_position_in_grid]],
+                     uint  tid  [[thread_index_in_threadgroup]],
+                     uint  sgid [[simdgroup_index_in_threadgroup]],
+                     uint  lane [[thread_index_in_simdgroup]]) {
+    const int h = int(tg.x), t = int(tg.y), i = int(tid), keyDim = p.Hk * GDN_D, valueDim = p.Hv * GDN_D;
+    device const float* r = proj + t * p.cols;
+    threadgroup float red[4];
+    gdn_out(r[2 * keyDim + h * GDN_D + i], r[2 * keyDim + valueDim + h * GDN_D + i], i, sgid, lane, red, normW[i], p.eps,
+            out + t * p.outStride + h * GDN_D);
+}
+
 // ---------------------------------------------------------------------------
 // Token selection on the GPU, in the same command buffer as the forward pass,
 // so the next decode step can be queued before this one has finished and the
@@ -1773,12 +2336,54 @@ inline uint smp_key(float f) { const uint u = as_type<uint>(f); return (u & 0x80
 inline float smp_val(ulong key) { const uint u = uint(key >> 32); return as_type<float>((u & 0x80000000u) ? (u & 0x7fffffffu) : ~u); }
 inline int smp_id(ulong key) { return int(~uint(key)); }
 
+#define SMP_BLK 256      // logits per block of the first pass (one simdgroup, 8 contiguous values per lane)
+#define SMP_POOL_MIN 128 // smallest accepted pool-size window top (see `cap` below)
+
+// Maximum of block b of the logits and the lowest index holding it (the whole simdgroup).
+inline void smp_block(device const float* logits, int V, int b, uint lane, thread float& m, thread int& idx) {
+    const int i0 = b * SMP_BLK + int(lane) * 8;
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    if (i0 + 8 <= V) {
+        const float4 a = *(device const float4*)(logits + i0), c = *(device const float4*)(logits + i0 + 4);
+        const float v[8] = {a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w};
+        for (int j = 0; j < 8; j++) if (v[j] > best) { best = v[j]; bi = i0 + j; }
+    } else {
+        for (int i = i0; i < V; i++) { const float v = logits[i]; if (v > best) { best = v; bi = i; } }
+    }
+    m = simd_max(best);
+    idx = simd_min(best == m ? bi : 0x7fffffff);
+}
+
+// First pass of the token selection, one simdgroup per block of SMP_BLK logits, the whole GPU at
+// work: bmax[b] / barg[b] = the block's maximum and its lowest index. `sample_token` reduces the
+// blocks for the maximum and scans only the blocks that can hold a candidate, instead of one
+// threadgroup (one GPU core) reading the whole vocabulary once per pass.
+kernel void sample_blocks(device const float*    logits [[buffer(0)]],
+                          constant SampleParams& p      [[buffer(4)]],
+                          device float*          bmax   [[buffer(6)]],
+                          device int*            barg   [[buffer(7)]],
+                          uint tg   [[threadgroup_position_in_grid]],
+                          uint sgid [[simdgroup_index_in_threadgroup]],
+                          uint nsg  [[simdgroups_per_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    const int nb = (p.V + SMP_BLK - 1) / SMP_BLK;
+    const int b = int(tg) * int(nsg) + int(sgid);
+    if (b >= nb) return;
+    float m; int idx;
+    smp_block(logits, p.V, b, lane, m, idx);
+    if (lane == 0) { bmax[b] = m; barg[b] = idx; }
+}
+
+// Second pass (one threadgroup) after `sample_blocks`: the token for hist[pos + 1].
 kernel void sample_token(device float*          logits [[buffer(0)]],
                          device int*            hist   [[buffer(1)]],
                          device ulong*          rng    [[buffer(2)]],   // [0] xorshift64 state, then the pool-width hint (float)
                          device int*            status [[buffer(3)]],   // status[pos + 1]: 0 ok, 1 non-finite logits
                          constant SampleParams& p      [[buffer(4)]],
                          device int*            diag   [[buffer(5)]],   // [0] pool size, [1] attempts (profiling)
+                         device float*          bmax   [[buffer(6)]],   // sample_blocks: block maxima
+                         device int*            barg   [[buffer(7)]],   //                and their indices
                          uint tid  [[thread_index_in_threadgroup]],
                          uint tsz  [[threads_per_threadgroup]],
                          uint sgid [[simdgroup_index_in_threadgroup]],
@@ -1802,19 +2407,29 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
             if (!dup && t >= 0 && t < V) { const float v = logits[t]; logits[t] = v > 0.0f ? v / p.penalty : v * p.penalty; }
         }
         threadgroup_barrier(mem_flags::mem_device);
+        // The blocks holding a penalized token get their maximum recomputed (one simdgroup per
+        // token; two tokens of one block write the same values).
+        for (int j = int(sgid); j < n; j += int(nsg)) {
+            const int t = hist[pos - j];
+            bool dup = false;
+            for (int j2 = 0; j2 < j; j2++) dup = dup || (hist[pos - j2] == t);
+            if (dup || t < 0 || t >= V) continue;
+            const int b = t / SMP_BLK;
+            float m; int idx;
+            smp_block(logits, V, b, lane, m, idx);
+            if (lane == 0) { bmax[b] = m; barg[b] = idx; }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
     }
 
-    // 2. Max logit and its lowest index. Passes over the logits take 8 contiguous values per lane
-    //    (two vector loads in flight) so they are not bound by load latency.
+    // 2. Max logit and its lowest index, from the block maxima of `sample_blocks` (ascending blocks,
+    //    strictly greater wins: the lowest index of the maximum). Passes over the logits take 8
+    //    contiguous values per lane (two vector loads in flight) so they are not bound by load latency.
     const int V8 = V & ~7;
+    const int nb = (V + SMP_BLK - 1) / SMP_BLK;
     float best = -INFINITY;
     int bi = 0x7fffffff;
-    for (int i0 = int(tid) * 8; i0 < V8; i0 += int(tsz) * 8) {
-        const float4 a = *(device const float4*)(logits + i0), b = *(device const float4*)(logits + i0 + 4);
-        const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-        for (int j = 0; j < 8; j++) if (v[j] > best) { best = v[j]; bi = i0 + j; }
-    }
-    for (int i = V8 + int(tid); i < V; i += int(tsz)) { const float v = logits[i]; if (v > best) { best = v; bi = i; } }
+    for (int b = int(tid); b < nb; b += int(tsz)) { const float v = bmax[b]; if (v > best) { best = v; bi = barg[b]; } }
     const float sm = simd_max(best);
     const int si = simd_min(best == sm ? bi : 0x7fffffff);
     if (lane == 0) { shf[sgid] = sm; shi[sgid] = si; }
@@ -1839,8 +2454,10 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
     //    at the maximum (delta = 0), an index bound is bisected instead, so the lowest ids win.
     //    k is capped at SMP_CAP (the CPU sampler caps a disabled top-k at 512 for the same reason).
     const int k = min(p.topK > 0 ? min(p.topK, V) : min(512, V), SMP_CAP);
-    // Aim for a pool of at most ~2k so sorting it stays cheap (SMP_CAP is the hard limit).
-    const uint cap = uint(min(SMP_CAP, max(2 * k, 128)));
+    // Aim for a pool of at most ~2k so sorting it stays cheap (SMP_CAP is the hard limit). The pool
+    // only has to hold the top k: its size does not change the selection, so the window is a cost
+    // trade-off (wider: fewer attempts, longer sort). SMP_POOL_MIN is a tuning point.
+    const uint cap = uint(min(SMP_CAP, max(2 * k, SMP_POOL_MIN)));
     device float* hint = (device float*)(rng + 1);
     float delta = hint[0];
     if (!(delta > 0.0f) || !(delta < 1.0e6f)) delta = 8.0f;
@@ -1848,13 +2465,36 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
     int limitB = V, loB = 0, hiB = V;   // index bound, used only once delta has reached 0
     uint count = 0;
     int attempts = 0;
+    // An attempt first bounds the pool with the block maxima: every block whose maximum reaches
+    // the threshold holds 1 to SMP_BLK candidates, so a threshold that `above` blocks reach gives
+    // above <= |pool| <= above · SMP_BLK. When that already decides the attempt the scan is skipped;
+    // the pool kept at the end always comes from a real scan (`force` repeats a skipped attempt, and
+    // the 64th attempt scans).
+    bool force = false;
     for (int attempt = 0; attempt < 64; attempt++) {
-        attempts++;
         if (tid == 0) atomic_store_explicit(&np, 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float thr = M - delta;
-        // 256 logits per simdgroup step (8 per lane); one atomic reserves the step's pool slots.
-        for (int base = int(sgid) * 256; base < V8; base += int(nsg) * 256) {
+        int above = -1;
+        if (delta > 0.0f && limitB == V) {
+            uint c = 0;
+            for (int b = int(tid); b < nb; b += int(tsz)) c += bmax[b] >= thr ? 1u : 0u;
+            c = simd_sum(c);
+            if (lane == 0) shi[sgid] = int(c);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            above = 0;
+            for (uint s = 0; s < nsg; s++) above += shi[s];
+        }
+        // The last attempt always scans, so a loop that runs out of attempts still keeps a real pool.
+        const bool scanned = force || attempt == 63 || above < 0 || !(uint(above) > cap || above * SMP_BLK < k);
+        if (!scanned) {
+            count = uint(above) > cap ? uint(above) : uint(above * SMP_BLK);
+        } else {
+        attempts++;   // scans (the bounded attempts cost nothing to speak of)
+        // One SMP_BLK block per simdgroup step (8 per lane), skipping the blocks whose maximum is
+        // below the threshold; one atomic reserves the step's pool slots.
+        for (int base = int(sgid) * SMP_BLK; base < V8; base += int(nsg) * SMP_BLK) {
+            if (bmax[base / SMP_BLK] < thr) continue;
             const int i0 = base + int(lane) * 8;
             float v[8];
             if (i0 < V8) {
@@ -1886,7 +2526,9 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         count = atomic_load_explicit(&np, memory_order_relaxed);
-        if (count >= uint(k) && count <= cap) break;
+        }
+        if (force) break;                                   // the repeated attempt: keep its pool
+        if (count >= uint(k) && count <= cap) break;        // (never true for a skipped attempt)
         if (delta == 0.0f) {                                // ties at the max: bisect the index bound
             if (count > cap) hiB = limitB; else loB = limitB;
             limitB = (loB + hiB) / 2;
@@ -1897,13 +2539,24 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
             // The interval collapsed, or the threshold can no longer move: only the max level fits.
             if (delta <= loD || delta >= hiD || M - delta >= M) delta = 0.0f;
         } else {
-            if (delta >= 1.0e6f) break;                     // fewer than k finite logits: take what there is
+            if (delta >= 1.0e6f) {                          // fewer than k finite logits: take what there is
+                if (scanned) break;
+                force = true; continue;
+            }
+            const float used = delta;
             loD = delta;
             delta = hiD < INFINITY ? 0.5f * (loD + hiD) : 4.0f * max(delta, 0.25f);
-            if (delta <= loD || delta >= hiD) break;        // no float between the bounds: keep this pool
+            if (delta <= loD || delta >= hiD) {             // no float between the bounds: keep this pool
+                if (scanned) break;
+                delta = used; force = true;
+            }
         }
     }
-    if (tid == 0) { if (delta > 0.0f) hint[0] = delta; diag[0] = int(count); diag[1] = attempts; }
+    if (tid == 0) {
+        if (delta > 0.0f) hint[0] = delta;
+        diag[0] = int(count); diag[1] = attempts;
+        diag[2] += attempts; diag[3] += int(min(count, uint(SMP_CAP))); diag[4] = max(diag[4], attempts);   // running totals (profiling)
+    }
     const int pool = int(min(count, uint(SMP_CAP)));
     const int n = min(k, pool);
 
@@ -2024,11 +2677,19 @@ INST_QMVT(half, f16) INST_QMVT(bfloat, bf16) INST_QMVT(float, f32)
   template [[host_name("qkv_post_" #TN)]] kernel void qkv_post<T>(device float*, device const float*, device half*, device half*, device const T*, device const T*, constant QKVPostParams&, uint2, uint, uint, uint, uint); \
   template [[host_name("add_rms_norm_" #TN)]] kernel void add_rms_norm<T>(device float*, device const float*, device float*, device const T*, constant NormParams&, uint, uint, uint, uint, uint, uint); \
   template [[host_name("norm_add_rms_norm_" #TN)]] kernel void norm_add_rms_norm<T>(device float*, device const float*, device float*, device const T*, constant NormParams&, device const T*, constant float&, uint, uint, uint, uint, uint, uint); \
-  template [[host_name("add_bias_" #TN)]] kernel void add_bias<T>(device float*, device const T*, constant EWParams&, uint2);
+  template [[host_name("add_bias_" #TN)]] kernel void add_bias<T>(device float*, device const T*, constant EWParams&, uint2); \
+  template [[host_name("qmvp_" #TN)]] kernel void qmvp<T, false>(device const uchar*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const uchar*, device const T*, uint2, uint2, uint, uint); \
+  template [[host_name("qmvp1k_" #TN)]] kernel void qmvp<T, true>(device const uchar*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const uchar*, device const T*, uint2, uint2, uint, uint); \
+  template [[host_name("qmvq1_" #TN)]] kernel void qmvq1<T>(device const uchar*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const uchar*, device const T*, uint2, uint2, uint, uint);
 
 INST_DENSE(half, f16)
 INST_DENSE(bfloat, bf16)
 INST_DENSE(float, f32)
+
+template [[host_name("gdn_step_4")]] kernel void gdn_step<4>(device float*, device const float4*, device float*, device float*, device const float*, device const float*, device const float*, device float*, constant GDNParams&, uint, uint, uint, uint);
+template [[host_name("gdn_step_8")]] kernel void gdn_step<8>(device float*, device const float4*, device float*, device float*, device const float*, device const float*, device const float*, device float*, constant GDNParams&, uint, uint, uint, uint);
+template [[host_name("gdn_scan_4")]] kernel void gdn_scan<4>(device float*, device float*, constant GDNParams&, uint2, uint, uint, uint);
+template [[host_name("gdn_scan_8")]] kernel void gdn_scan<8>(device float*, device float*, constant GDNParams&, uint2, uint, uint, uint);
 
 #define INST_ATTN_SG(E, SG, CAP, SFX) \
   template [[host_name("attention_" #E "_" #SG SFX)]] kernel void attention<E, SG, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint);
@@ -2062,6 +2723,17 @@ INST_ASPLIT(16, 1) INST_ASPLIT(16, 2)
 INST_ASPLIT_C(8, 1, true, "_cap") INST_ASPLIT_C(8, 2, true, "_cap") INST_ASPLIT_C(8, 4, true, "_cap")
 #define INST_ACOMB(E) \
   template [[host_name("attention_combine_" #E)]] kernel void attention_combine<E>(device const float*, device float*, constant AttnParams&, uint2, uint);
+// Hybrid (Qwen 3.5) decode attention: G query heads per KV head, HV virtual simdgroups (HNSG per
+// threadgroup), U keys in flight; "_g" applies the sigmoid output gate.
+#define INST_AHYB_G(G, HV, HNSG, U, GATE, SFX) \
+  template [[host_name("attention_hyb_" #G "_" #HV "_" #HNSG "_" #U SFX)]] kernel void attention_hyb<G, HV, HNSG, U, GATE>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint);
+#define INST_AHYB(G, HV, HNSG, U) INST_AHYB_G(G, HV, HNSG, U, true, "_g") INST_AHYB_G(G, HV, HNSG, U, false, "")
+INST_AHYB(4, 8, 8, 1) INST_AHYB(4, 8, 8, 2) INST_AHYB(4, 8, 8, 4)                          // fused (one threadgroup per KV head)
+INST_AHYB(4, 128, 8, 4) INST_AHYB(4, 128, 8, 2) INST_AHYB(4, 64, 8, 2) INST_AHYB(4, 64, 8, 4) INST_AHYB(4, 32, 8, 4) INST_AHYB(4, 32, 8, 2)
+#define INST_AHYBC(NT, CNSG) \
+  template [[host_name("attention_hyb_combine_" #NT "_" #CNSG "_g")]] kernel void attention_hyb_combine<NT, CNSG, true>(device const float*, device float*, constant AttnParams&, device const float*, uint2, uint, uint); \
+  template [[host_name("attention_hyb_combine_" #NT "_" #CNSG)]] kernel void attention_hyb_combine<NT, CNSG, false>(device const float*, device float*, constant AttnParams&, device const float*, uint2, uint, uint);
+INST_AHYBC(4, 1) INST_AHYBC(4, 4) INST_AHYBC(8, 1) INST_AHYBC(8, 8) INST_AHYBC(16, 1) INST_AHYBC(16, 8)
 INST_ACOMB(2) INST_ACOMB(3) INST_ACOMB(4) INST_ACOMB(8) INST_ACOMB(16)
 #define INST_ATTNP_C(E, QB, CAP, SFX) \
   template [[host_name("attention_prefill_" #E SFX)]] kernel void attention_prefill<E, QB, CAP>(device const float*, device const half*, device const half*, device float*, constant AttnParams&, uint2, uint, uint, uint);

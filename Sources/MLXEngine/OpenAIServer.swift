@@ -50,7 +50,9 @@ import Security
 /// for open-weight models), followed by the clean assistant `message`. `reasoning_effort:
 /// "none"` (Chat) or `reasoning: {effort: "none"}` (Responses) turns thinking off for models
 /// whose template supports it, as do `enable_thinking: false` and
-/// `chat_template_kwargs.enable_thinking: false`.
+/// `chat_template_kwargs.enable_thinking: false`; any other effort, or `true`, turns it on. A
+/// request that sets none of them gets the template's default (Qwen 3.5 0.8B and 2B answer
+/// directly, Qwen3 and larger Qwen 3.5 models think), as with `transformers` and mlx-lm.
 ///
 /// Generation requests run one at a time in FIFO order; at most `maxQueuedRequests` wait.
 public final class OpenAIServer: @unchecked Sendable {
@@ -454,10 +456,10 @@ public final class OpenAIServer: @unchecked Sendable {
         return out
     }
 
-    /// `enable_thinking`, `chat_template_kwargs.enable_thinking`, and a reasoning effort of "none".
-    private func enableThinking(_ b: JSONBody, effort: String?) throws -> Bool {
-        var on = true
-        if effort == "none" { on = false }
+    /// `enable_thinking`, `chat_template_kwargs.enable_thinking`, and a reasoning effort (`"none"` turns
+    /// thinking off, any other effort on). nil when the request sets none of them: the template decides.
+    private func enableThinking(_ b: JSONBody, effort: String?) throws -> Bool? {
+        var on: Bool? = effort.map { $0 != "none" }
         if let v = try b.bool("enable_thinking") { on = v }
         if let kw = b.raw["chat_template_kwargs"] as? [String: Any], let v = kw["enable_thinking"] as? Bool { on = v }
         return on
@@ -801,7 +803,7 @@ public final class OpenAIServer: @unchecked Sendable {
         let stream = try b.bool("stream") ?? false
         let includeUsage = ((b.raw["stream_options"] as? [String: Any])?["include_usage"] as? Bool) ?? false
         let job = Job(chat: false, messages: [], prompt: prompt, params: params, stops: stopList,
-                      enableThinking: true, splitReasoning: false)
+                      enableThinking: nil, splitReasoning: false)
 
         let token = CancelToken()
         conn.onClientGone = { token.cancel() }
@@ -1104,7 +1106,7 @@ public final class OpenAIServer: @unchecked Sendable {
         let prompt: String
         let params: SamplingParameters
         let stops: [String]
-        let enableThinking: Bool
+        let enableThinking: Bool?
         let splitReasoning: Bool
         var tools: ToolRequest? = nil
         /// Call opener the reply continues (`required` / named `tool_choice`).
@@ -1162,7 +1164,7 @@ public final class OpenAIServer: @unchecked Sendable {
     /// `onDelta` returns false when the client is gone; generation is then cancelled.
     private func run(_ job: Job, token: CancelToken, onDelta: (Delta) async -> Bool) async throws -> Outcome {
         let events = job.chat
-            ? engine.chat(job.messages, parameters: job.params, enableThinking: job.prefill == nil && job.enableThinking,
+            ? engine.chat(job.messages, parameters: job.params, enableThinking: job.prefill == nil ? job.enableThinking : false,
                           tools: job.tools, prefill: job.prefill,
                           constrainToolNames: job.tools?.choice == .required && job.prefill != nil ? job.tools?.tools.map(\.name) : nil,
                           token: token)

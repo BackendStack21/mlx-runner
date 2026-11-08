@@ -673,13 +673,14 @@ struct InspectorView: View {
         return info.sparseNote.map { "Off: \($0)" } ?? "Off"
     }
 
-    /// Installed models that can draft for the loaded one (same family, at most a quarter of its size).
+    /// Installed models that can draft for the loaded one (same family, at most a quarter of its size;
+    /// none for a model with a recurrent state, Qwen 3.5, which cannot drop rejected drafts).
     private var draftCandidates: [LocalModel] {
         let loaded = state.localModels.first { $0.directory == state.loadedInfo?.directory }
         return state.localModels.filter { m in
             guard m.isSupported else { return false }
             if m.directory.path == state.draftModel { return true }
-            guard let loaded else { return false }
+            guard let loaded, !SupportedArchitectures.hasRecurrentState(loaded.modelType) else { return false }
             return m.modelType == loaded.modelType && m.sizeBytes * 4 <= loaded.sizeBytes
         }
     }

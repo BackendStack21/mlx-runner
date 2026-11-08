@@ -5,7 +5,7 @@ import MLXEngine
 //   mlxr search <query>
 //   mlxr download <org/repo>
 //   mlxr list
-//   mlxr run <org/repo|path> [-p prompt] [--raw] [--max N] [--temp T] [--no-think] [--ctx N] [--draft <model|auto>] [--sparse <on|off|N>]
+//   mlxr run <org/repo|path> [-p prompt] [--raw] [--max N] [--temp T] [--think|--no-think] [--ctx N] [--draft <model|auto>] [--sparse <on|off|N>]
 //   mlxr tokenize <org/repo|path> <text>
 //   mlxr serve <org/repo|path> [--port 1234] [--ctx N] [--lan] [--draft <model|auto>] [--sparse <on|off|N>]
 
@@ -125,6 +125,14 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
     }
     let original = t.sparse
     defer { t.sparse = original }
+    // Hybrid models (recurrent state): every rerun of a position first restores the state there.
+    var base: Transformer.RecurrentSnapshot?, last: Transformer.RecurrentSnapshot?
+    func mark() { if t.config.isHybrid { last = t.snapshotRecurrent() } }
+    func seek(_ pos: Int) {
+        guard t.config.isHybrid, t.recurrentPosition != pos else { return }
+        guard let s = [base, last].compactMap({ $0 }).first(where: { $0.position == pos }) else { fail("no recurrent snapshot at \(pos)") }
+        t.restoreRecurrent(s)
+    }
     let sparse = t.sparseAvailable ? original : nil
     let steps = LongBench.steps
     func logits(_ tokens: [Int32], offset: Int) throws -> [Float] {
@@ -174,6 +182,7 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
             let s0 = Date()
             let first = try t.prefill(prompt, offset: 0, sample: sp)
             let prefillTime = Date().timeIntervalSince(s0)
+            if t.config.isHybrid { base = t.snapshotRecurrent() }
             print(String(format: "prefill @%d%@: %.1f s (%.0f tok/s)", ctx, at as NSString, prefillTime, Double(ctx) / prefillTime))
             // Each run decodes from the same prompt (positions from ctx on are rewritten, the index with them).
             var dense: [Int] = []
@@ -182,6 +191,7 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
             for (label, mode) in modes {
                 t.sparse = mode
                 t.seedSampler(1)
+                seek(ctx)
                 var tokens: [Int] = []
                 var gpu = 0.0
                 let s = Date()
@@ -209,9 +219,12 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
             // position, so the cache stays dense decode's).
             var match = 0, control = 0
             var input = Int32(first)
+            seek(ctx)
             for i in 0..<steps {
                 t.sparse = sparse
+                mark()
                 if argmax(try logits([input], offset: ctx + i)) == dense[i] { match += 1 }
+                seek(ctx + i)
                 t.sparse = nil
                 if argmax(try logits([input], offset: ctx + i)) == dense[i] { control += 1 }
                 input = Int32(dense[i])
@@ -223,10 +236,13 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
                 var kl: [Double] = [], nllDense = 0.0, nllSparse = 0.0, agree = 0
                 let edges: [Float] = [0.1, 0.5, 1]
                 var bucketTotal = [Int](repeating: 0, count: edges.count + 1), bucketAgree = bucketTotal
+                seek(ctx)
                 for i in 0..<N {
                     let input = text[(off + ctx + i) % text.count], target = Int(text[(off + ctx + i + 1) % text.count])
                     t.sparse = sparse
+                    mark()
                     let ls = try logits([input], offset: ctx + i)
+                    seek(ctx + i)
                     t.sparse = nil
                     let ld = try logits([input], offset: ctx + i)
                     let pd = logSoftmax(ld), ps = logSoftmax(ls)
@@ -254,7 +270,7 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
                 print(String(format: "    top-1 agreement %d/%d (%.1f%%); by dense top-1 margin (nats) %@", agree, N,
                              100 * Double(agree) / Double(N), byMargin as NSString))
             }
-            if oi == 0 {
+            if oi == 0 && !t.config.isHybrid {
                 // A dense verification pass of T tokens at this context (speculative decoding).
                 t.sparse = nil
                 var line: [String] = []
@@ -277,6 +293,7 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
                     let q = tokenizer.encode("\n\nQuestion: What is the passkey for door \(door)?\nAnswer: The passkey for door \(door) is").map { Int32($0) }
                     for (mi, mode) in [nil, sparse].enumerated() {
                         t.sparse = nil
+                        seek(ctx)
                         _ = try t.forward(Array(q.dropLast()), offset: ctx)
                         t.sparse = mode
                         var out: [Int] = []
@@ -351,7 +368,8 @@ case "run":
     let temp = Float(option("--temp") ?? "0") ?? 0
     let ctx = Int(option("--ctx") ?? "4096") ?? 4096
     let raw = flag("--raw")
-    let noThink = flag("--no-think")
+    // Neither flag: the template's default (Qwen 3.5 0.8B and 2B answer directly, Qwen3 thinks).
+    let thinking: Bool? = flag("--no-think") ? false : flag("--think") ? true : nil
     let showIds = flag("--ids")
     let draftArg = option("--draft")
     let sparseArg = sparseOption(option("--sparse"))
@@ -368,9 +386,9 @@ case "run":
     params.seed = 42
     if flag("--spec") { params.speculative = true }
     let stream = raw ? engine.complete(prompt, parameters: params)
-        : engine.chat([ChatMessage(role: .user, content: prompt)], parameters: params, enableThinking: !noThink)
+        : engine.chat([ChatMessage(role: .user, content: prompt)], parameters: params, enableThinking: thinking)
     if showIds {
-        let p = raw ? prompt : engine.renderChat([ChatMessage(role: .user, content: prompt)], enableThinking: !noThink)
+        let p = raw ? prompt : engine.renderChat([ChatMessage(role: .user, content: prompt)], enableThinking: thinking)
         print("prompt ids:", engine.encode(p))
     }
     for try await ev in stream {
@@ -421,9 +439,11 @@ case "bench":
               ? "sparse decode attention: top-k \(sp.topK), window \(sp.window), sink \(sp.sink), from \(sp.minContext) tokens"
               : "sparse decode attention: off (\(t.sparseOffReason ?? "unavailable"))")
     }
+    print("attention: \(t.attentionSummary)")
     let quick = ProcessInfo.processInfo.environment["MLXR_BENCH_DECODE"] != nil
     let noProfile = quick || ProcessInfo.processInfo.environment["MLXR_BENCH_NOPROFILE"] != nil
     if !noProfile { print(try t.profile()) }
+    if ProcessInfo.processInfo.environment["MLXR_BENCH_PROFILE_ONLY"] != nil { exit(0) }
     _ = try t.forward([1], offset: 0)
     for n in (quick ? [] : [128, 512, 2048]) {
         let toks = (0..<n).map { Int32($0 % 1000 + 100) }
@@ -460,11 +480,16 @@ case "bench":
             }
             let dt = Date().timeIntervalSince(s)
             print(String(format: "%@ @%4d: %6.1f tok/s  (wall %.2f ms, gpu %.2f ms per token)", label as NSString, ctx, Double(steps) / dt, dt / Double(steps) * 1000, gpu / Double(steps) * 1000))
+            let diag = t.takeSampleDiagnostics()
+            if ProcessInfo.processInfo.environment["MLXR_BENCH_SAMPLEDIAG"] != nil, diag.attempts > 0 {
+                print(String(format: "  sampler: %.2f attempts and pool %.0f per token on average, at most %d attempts", Double(diag.attempts) / Double(steps + 1), Double(diag.pool) / Double(steps + 1), diag.maxAttempts))
+            }
         }
     }
     // Speculative verification cost: one forward over T tokens with logits for every row.
     // At a short context and after a 1900-token prompt (the attention part grows with the context).
-    for ctx in [64, 1900] {
+    // (A recurrent state cannot rewind to rerun a position: no verification on hybrid models.)
+    for ctx in t.config.isHybrid ? [] : [64, 1900] {
         if ctx > 64 { _ = try t.forward((0..<ctx).map { Int32(100 + $0 % 5000) }, offset: 0) }
         for T in 1...Transformer.maxVerifyTokens {
             let steps = 32
@@ -481,7 +506,7 @@ case "bench":
     }
     for T in [5, 8, 12, 15] {
         let s = Date()
-        for i in 0..<8 { _ = try t.forward((0..<T).map { Int32(600 + $0 + i) }, offset: 64) }
+        for i in 0..<8 { _ = try t.forward((0..<T).map { Int32(600 + $0 + i) }, offset: t.config.isHybrid ? 0 : 64) }
         print(String(format: "prefill T=%d: %6.2f ms", T, Date().timeIntervalSince(s) / 8 * 1000))
     }
     if !longBench.contexts.isEmpty { try benchLongContext(t, dir: dir, bench: longBench) }
