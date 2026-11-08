@@ -73,7 +73,7 @@ public final class OpenAIServer: @unchecked Sendable {
     public var maxBodyBytes = 4 * 1024 * 1024
     public var maxMessages = 1000
     /// Server-side ceiling for max_tokens / max_completion_tokens / max_output_tokens.
-    public var maxOutputTokens = 32_768
+    public var maxOutputTokens = SamplingLimits.maxTokens
     public var headerTimeout: TimeInterval = 10
     public var bodyTimeout: TimeInterval = 30
     public var writeTimeout: TimeInterval = 30
@@ -102,7 +102,7 @@ public final class OpenAIServer: @unchecked Sendable {
         var maxConnections = 32
         var maxQueued = 8
         var maxMessages = 1000
-        var maxOutputTokens = 32_768
+        var maxOutputTokens = SamplingLimits.maxTokens
         var limits = HTTPConnection.Limits()
     }
 
@@ -411,7 +411,7 @@ public final class OpenAIServer: @unchecked Sendable {
         }
         if let v = try b.number("top_k") {
             guard v >= -1 else { throw APIError.invalid("'top_k' must be >= 0 (or -1 to disable)", param: "top_k") }
-            p.topK = v <= 0 ? 0 : Int(min(v, 100_000))
+            p.topK = SamplingLimits.clampTopK(v)
         }
         if let v = try b.number("min_p") {
             guard v >= 0 && v <= 1 else { throw APIError.invalid("'min_p' must be between 0 and 1", param: "min_p") }
@@ -420,7 +420,7 @@ public final class OpenAIServer: @unchecked Sendable {
         let rpKey = b.has("repetition_penalty") ? "repetition_penalty" : "repeat_penalty"
         if let v = try b.number(rpKey) {
             guard v > 0 else { throw APIError.invalid("'\(rpKey)' must be greater than 0", param: rpKey) }
-            p.repetitionPenalty = Float(min(v, 100))
+            p.repetitionPenalty = Float(SamplingLimits.clampRepeatPenalty(v))
         }
         for k in ["frequency_penalty", "presence_penalty"] {
             // Accepted for compatibility and range-checked, but not applied (see type docs).
@@ -430,7 +430,7 @@ public final class OpenAIServer: @unchecked Sendable {
         }
         if let k = maxKeys.first(where: { b.has($0) }), let v = try b.number(k) {
             guard v >= 1 else { throw APIError.invalid("'\(k)' must be at least 1", param: k) }
-            p.maxTokens = Int(min(v, Double(cfg.maxOutputTokens)))
+            p.maxTokens = SamplingLimits.clampMaxTokens(v, cap: cfg.maxOutputTokens)
         } else {
             p.maxTokens = min(defaultMax, cfg.maxOutputTokens)
         }

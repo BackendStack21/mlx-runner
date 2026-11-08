@@ -79,6 +79,9 @@ extension CLI {
         case .real(let r):
             guard let d = Double(raw), d.isFinite else { throw bad("strconv.ParseFloat: parsing \"\(raw)\": invalid syntax") }
             guard r.contains(d) else { throw bad("value \(raw) is outside \(r.lowerBound)...\(r.upperBound)") }
+        case .realAboveZero(let max):
+            guard let d = Double(raw), d.isFinite else { throw bad("strconv.ParseFloat: parsing \"\(raw)\": invalid syntax") }
+            guard d > 0 && d <= max else { throw bad("value \(raw) must be greater than 0 and at most \(max)") }
         case .choice(let c):
             guard c.contains(raw) else { throw bad("must be one of \(c.joined(separator: ", "))") }
         case .choiceOrInt(let c):

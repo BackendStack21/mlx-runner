@@ -488,3 +488,42 @@ enum BFloat16Rounding {
         return Float(bitPattern: rounded)
     }
 }
+
+/// Sampling defaults from a model's generation_config.json. Every value passes through
+/// `SamplingLimits`; a value outside them is dropped and described in `warnings`.
+public struct GenerationDefaults: Equatable, Sendable {
+    public var temperature: Float?
+    public var topP: Float?
+    public var topK: Int?
+    public var minP: Float?
+    public var repetitionPenalty: Float?
+    /// One line per dropped value, each naming `generation_config.json` and the key.
+    public var warnings: [String] = []
+
+    public init() {}
+
+    public static func parse(_ data: Data) -> GenerationDefaults {
+        var out = GenerationDefaults()
+        guard let g = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return out }
+        func number(_ key: String, _ ok: (Double) -> Bool, _ rule: String) -> Double? {
+            guard let raw = g[key] else { return nil }
+            if let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), ok(n.doubleValue) { return n.doubleValue }
+            out.warnings.append("warning: generation_config.json: ignoring \(key) = \(raw) (\(rule))")
+            return nil
+        }
+        out.temperature = number("temperature", { SamplingLimits.temperature.contains($0) }, "must be between 0 and 2").map { Float($0) }
+        out.topP = number("top_p", SamplingLimits.isValidTopP, "must be greater than 0 and at most 1").map { Float($0) }
+        out.topK = number("top_k", { $0 == $0.rounded() && SamplingLimits.topK.contains(Int(exactly: $0) ?? -1) },
+                          "must be a whole number from 0 to \(SamplingLimits.topK.upperBound)").map { Int($0) }
+        out.minP = number("min_p", { SamplingLimits.minP.contains($0) }, "must be between 0 and 1").map { Float($0) }
+        out.repetitionPenalty = number("repetition_penalty", SamplingLimits.isValidRepeatPenalty,
+                                       "must be greater than 0 and at most 100").map { Float($0) }
+        return out
+    }
+    /// Reads `<directory>/generation_config.json`; absent or unreadable gives empty defaults.
+    public static func load(directory: URL) -> GenerationDefaults {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent("generation_config.json"), options: .mappedIfSafe),
+              data.count <= 1 << 20 else { return GenerationDefaults() }
+        return parse(data)
+    }
+}

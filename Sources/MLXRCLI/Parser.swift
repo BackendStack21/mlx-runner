@@ -6,6 +6,8 @@ public enum ValueKind {
     case int(ClosedRange<Int>)
     case uint64
     case real(ClosedRange<Double>)
+    /// A finite number greater than 0 and at most `max`.
+    case realAboveZero(max: Double)
     case choice([String])
     case choiceOrInt([String])
     case model

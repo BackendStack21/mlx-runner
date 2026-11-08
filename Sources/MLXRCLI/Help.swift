@@ -60,7 +60,7 @@ extension CLI {
         switch k {
         case .int: return "int"
         case .uint64: return "uint"
-        case .real: return "float"
+        case .real, .realAboveZero: return "float"
         case .text, .choice, .choiceOrInt, .model, .file: return "string"
         }
     }

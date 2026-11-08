@@ -314,10 +314,11 @@ func legacyList() {
 
 }
 
-func legacyTokenize(_ model: String, _ text: String) throws {
+func legacyTokenize(_ model: String, _ text: String, idsOnly: Bool = false) throws {
     let tok = try Tokenizer(directory: try resolveModel(model))
     let ids = tok.encode(text)
     print(ids)
+    if idsOnly { return }
     print(ids.map { tok.token($0) ?? "?" })
     print("roundtrip:", tok.decode(ids, includeSpecial: true))
 
@@ -421,6 +422,13 @@ struct LegacyRun {
     var draft: String?
     var sparse: String?
     var spec = false
+    var system: String?
+    var topP: Float?
+    var topK: Int?
+    var minP: Float?
+    var repeatPenalty: Float?
+    var repeatLastN: Int?
+    var seed: UInt64?
 }
 
 func legacyRun(_ o: LegacyRun) async throws {
@@ -434,13 +442,19 @@ func legacyRun(_ o: LegacyRun) async throws {
     params.temperature = o.temp
     params.maxTokens = o.maxTokens
     params.repetitionPenalty = 1.0
-    params.seed = 42
+    params.seed = o.seed ?? 42
+    if let v = o.topP { params.topP = v }
+    if let v = o.topK { params.topK = v }
+    if let v = o.minP { params.minP = v }
+    if let v = o.repeatPenalty { params.repetitionPenalty = v }
+    if let v = o.repeatLastN { params.repetitionWindow = v }
+    let system = o.system.map { [ChatMessage(role: .system, content: $0)] } ?? []
     if o.spec { params.speculative = true }
     let prompt = o.prompt
     let stream = o.raw ? engine.complete(prompt, parameters: params)
-        : engine.chat([ChatMessage(role: .user, content: prompt)], parameters: params, enableThinking: o.thinking)
+        : engine.chat(system + [ChatMessage(role: .user, content: prompt)], parameters: params, enableThinking: o.thinking)
     if o.showIds {
-        let p = o.raw ? prompt : engine.renderChat([ChatMessage(role: .user, content: prompt)], enableThinking: o.thinking)
+        let p = o.raw ? prompt : engine.renderChat(system + [ChatMessage(role: .user, content: prompt)], enableThinking: o.thinking)
         print("prompt ids:", engine.encode(p))
     }
     for try await ev in stream {
