@@ -441,7 +441,7 @@ tar -xzf mlxr-&lt;version&gt;-macos-arm64.tar.gz
 sudo mkdir -p /usr/local/bin
 sudo install -m 755 mlxr-&lt;version&gt;-macos-arm64/mlxr /usr/local/bin/mlxr
 mlxr   # prints help"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div>
-      <p>Use <code>curl</code> as shown: macOS quarantines an archive downloaded in a browser, and the binary won't start until you run <code>xattr -d com.apple.quarantine /usr/local/bin/mlxr</code>. It uses the same model library as the app. To update, run the commands again (the CLI doesn't update itself). To check the archive first, see <a href="#verify">Verify</a>.</p>
+      <p>Use <code>curl</code> as shown: macOS quarantines an archive downloaded in a browser, and the binary won't start until you run <code>xattr -d com.apple.quarantine /usr/local/bin/mlxr</code>. It uses the same model library as the app. To update, run <code>mlxr upgrade</code> (<code>sudo mlxr upgrade</code> when it is in <code>/usr/local/bin</code>); it checks the signature before it replaces anything. 1.x has no upgrade command, so run the commands above once to get 2.0. To check the archive first, see <a href="#verify">Verify</a>.</p>
     </div>
   </section>
 

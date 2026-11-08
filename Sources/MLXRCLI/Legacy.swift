@@ -400,11 +400,20 @@ func legacyBench(_ model: String) throws {
     if !longBench.contexts.isEmpty { try benchLongContext(t, dir: dir, bench: longBench) }
 
 }
+/// What `serve` prints about its API key. A key `--lan` generated is shown once, because the operator has
+/// no other way to learn it; a key the user supplied (`--api-key`, `MLXR_API_KEY`) is never echoed.
+func serveKeyNotice(key: String?, generated: Bool) -> String? {
+    guard let key else { return nil }
+    return generated ? "API key (send as 'Authorization: Bearer <key>'): \(key)"
+                     : "API key required: send it as 'Authorization: Bearer <key>'"
+}
+
 func legacyServe(model: String, port: UInt16, ctx: Int, lan: Bool, apiKey: String?, draft: String?, sparse: String?) async throws {
     let sparseArg = try sparseSetting(sparse)
     // LAN mode always needs a key: use --api-key / MLXR_API_KEY, or generate one.
     var key = apiKey ?? ProcessInfo.processInfo.environment["MLXR_API_KEY"]
-    if lan && key == nil { key = OpenAIServer.generateAPIKey() }
+    let generated = lan && key == nil
+    if generated { key = OpenAIServer.generateAPIKey() }
     let dir = try installedModelDirectory(model, resolver: .live)
     let info = try await InferenceEngine.shared.load(directory: dir, draftDirectory: try draftDirectory(draft, target: dir), contextLength: ctx, sparse: sparseArg)
     print("Loaded \(info.name)\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s")
@@ -413,6 +422,6 @@ func legacyServe(model: String, port: UInt16, ctx: Int, lan: Bool, apiKey: Strin
     server.onLog = { print($0) }
     try startServer { try server.start() }
     print("OpenAI-compatible server on http://\(lan ? "0.0.0.0" : "127.0.0.1"):\(port)/v1  (Ctrl-C to stop)")
-    if let key { print("API key (send as 'Authorization: Bearer <key>'): \(key)") }
+    if let notice = serveKeyNotice(key: key, generated: generated) { print(notice) }
     while true { try await Task.sleep(nanoseconds: 3_600_000_000_000) }
 }

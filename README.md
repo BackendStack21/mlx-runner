@@ -37,7 +37,7 @@ sudo mkdir -p /usr/local/bin
 sudo install -m 755 mlxr-<version>-macos-arm64/mlxr /usr/local/bin/mlxr
 ```
 
-A browser download is quarantined by macOS and the binary won't start until you run `xattr -d com.apple.quarantine /usr/local/bin/mlxr`. The CLI doesn't update itself: repeat the steps for a new version.
+A browser download is quarantined by macOS and the binary won't start until you run `xattr -d com.apple.quarantine /usr/local/bin/mlxr`. From 2.0 on the CLI updates itself: run `mlxr upgrade` (`sudo mlxr upgrade` when it is installed in `/usr/local/bin`). 1.x has no upgrade command, so repeat these steps once to move to 2.0.
 
 ### Verifying a download
 
@@ -194,6 +194,7 @@ mlxr rm mlx-community/Qwen3-4B-4bit         # remove a model; `cp` copies, `ps` 
 mlxr serve mlx-community/Qwen3-4B-4bit --port 1234     # OpenAI-compatible server (--lan prints an API key)
 mlxr run mlx-community/Qwen3-8B-4bit --draft mlx-community/Qwen3-0.6B-4bit   # speculative decoding (or --draft auto)
 mlxr completion zsh                         # shell completions (zsh, bash)
+mlxr upgrade                                # update mlxr in place, verified against the signed SHA256SUMS (alias: update; --check only looks; `sudo mlxr upgrade` when installed in /usr/local/bin)
 ```
 
 Reproducible output (greedy): `mlxr run <model> "Explain RoPE" --temp 0 --repeat-penalty 1 --seed 42 --max 256`. Use these
