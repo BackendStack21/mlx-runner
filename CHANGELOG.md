@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.0.0
+
+The command line now follows Ollama: the same verbs, flags, help layout and error messages, in one process with no background server. The app, the engine and the server are unchanged. Breaking changes for scripts are listed first.
+
+**Changes that can break a script**
+
+- **`mlxr run` defaults follow Ollama for every way of giving a prompt** (positional words, `-p`, piped stdin, chat). Sampling comes from the model's `generation_config.json` (validated), else the app's defaults; generation runs until the model stops or the context fills (`--max` / `-n` caps it); no statistics unless `--verbose`. Benchmark, greedy and parity instructions now pass `--temp 0 --repeat-penalty 1 --seed 42 --max 256` explicitly. `--repeat-penalty 1` is part of the greedy command because 1.x forced a repetition penalty of 1.0 while 2.0 follows the model's or the app's default (1.05), which changes greedy text.
+- **stdout carries only the payload** (model text, `list`, `show` and `search` rows, the saved path of a `pull`, completion scripts, `bench` output unchanged). Banners, warnings, progress and statistics go to stderr, with `\r` progress only when stderr is a terminal.
+- **The default haiku prompt is gone.** `mlxr run <model>` with no prompt opens the chat on a terminal; with piped input it answers that input.
+- **Errors print `Error: <message>` to stderr and exit 1** instead of crashing (`mlxr download nosuch/repo` used to die with a fatal error, exit 133). A Hugging Face 401 or 404 reads "not found, or private/gated (set HF_TOKEN)".
+- `download` is now `pull` (`download` remains an alias); `ls` is an alias of `list`.
+
+**New**
+
+- **Ollama commands:** `pull`, `show`, `list`, `rm`, `cp`, `ps`, `stop`, `search`, `run`, `serve`, `completion`; `-h`, `--help` and `mlxr help [command]` print Ollama's layout; bare `mlxr` prints help; `-v` / `--version` print `mlxr version is 2.0.0` without touching Metal or the model library. `create`, `push`, `signin`, `signout` and `launch` are accepted and say they are not supported. `bench` and `tokenize` move under "Developer Commands".
+- **Model names:** a Hugging Face repo, an installed short name, a saved preset, or an Ollama-style alias (`name[:tag]`) from the built-in catalog. A missing model is pulled automatically, with Ollama-style progress, when the name resolves to a repo; an unsupported architecture is refused before downloading.
+- **`run` flags:** `--verbose`, `--think[=true|false|high|medium|low]`, `--hidethinking`, `--nowordwrap`, `--keepalive` and `--insecure` (accepted, no effect), `--system`, `--temp` (alias `--temperature`), `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `--seed`, `-n` / `--max-tokens` (`--max` still works), `--ctx`, `--raw`, `--draft`, `--sparse`, `--spec`, `--ids`, `--no-think`. Options are validated strictly with ranges. Presence and frequency penalty, `--format` and the other options the engine doesn't implement are refused with a clear error.
+- **Thinking display as in Ollama:** `Thinking...`, the reasoning, `...done thinking.` and a blank line (dim on a terminal); `--hidethinking` drops it. Word wrap on a terminal, off with `--nowordwrap` or when stdout is not a terminal.
+- **Interactive chat** with Ollama's slash commands, `>>> ` and `... ` prompts, multiline input, and line editing and history through the system libedit (no package). A cancelled reply keeps your turn; changing `num_ctx` reloads the model; the history sent to the model is capped.
+- **`mlxr upgrade`** (alias `update`) replaces the CLI in place with the latest release, after checking the signed `SHA256SUMS`, the archive digest and the binary's code signature; `--check` only reports. Use `sudo mlxr upgrade` when it is installed in `/usr/local/bin`. 1.x has no such command: reinstall once to get it.
+- **Shell completions:** `mlxr completion zsh` and `bash`, generated from the command tables.
+
+**Deliberate differences from Ollama**
+
+- Thinking follows each model's own template default (`--think` and `--no-think` override it).
+- Ctrl-C during a one-shot reply stops generation and exits 130 (Ollama exits 0). In chat it cancels the current reply and returns to the prompt; at the prompt it prints `Use Ctrl + d or /bye to exit.`. During a download it stops and keeps the partial files, so the next run resumes.
+- There is no server to unload from: `ps` lists models loaded by this process only and `keepalive` has no effect.
+
 ## 1.5.0
 
 Qwen 3.5 support: the hybrid Gated DeltaNet architecture. Decode is 6–7% ahead of mlx-lm on the 0.8B model, 2% behind on the 2B and 5% behind on the 4B; prefill is ahead. Thinking now follows each model's own default, and the app keeps its settings across relaunches.

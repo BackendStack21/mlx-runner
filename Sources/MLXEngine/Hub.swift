@@ -82,6 +82,12 @@ public struct HubModelDetails: Sendable {
     public let tags: [String]
     public let license: String?
 
+    public init(id: String, files: [HubFile], modelType: String?, bits: Int?, readmeURL: URL, downloads: Int?, likes: Int?,
+                tags: [String], license: String?, isMoE: Bool = false) {
+        self.id = id; self.files = files; self.modelType = modelType; self.bits = bits; self.readmeURL = readmeURL
+        self.downloads = downloads; self.likes = likes; self.tags = tags; self.license = license; self.isMoE = isMoE
+    }
+
     public var isMoE: Bool = false
     public var isSupported: Bool {
         SupportedArchitectures.isSupported(modelType) && !isMoE && files.contains { $0.rfilename == "tokenizer.json" }

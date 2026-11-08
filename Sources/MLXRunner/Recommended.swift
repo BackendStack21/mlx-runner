@@ -1,4 +1,5 @@
 import SwiftUI
+import MLXEngine
 
 /// Hand-picked models that run well with the built-in engine.
 struct RecommendedModel: Identifiable, Hashable {
@@ -8,18 +9,23 @@ struct RecommendedModel: Identifiable, Hashable {
     let gigabytes: Double
     let icon: String
 
-    static let all: [RecommendedModel] = [
-        .init(id: "mlx-community/Qwen3-0.6B-4bit", title: "Qwen3 0.6B", blurb: "Tiny and blazing fast, with thinking mode", gigabytes: 0.35, icon: "hare.fill"),
-        .init(id: "mlx-community/Qwen3.5-0.8B-4bit", title: "Qwen3.5 0.8B", blurb: "Newest tiny Qwen: hybrid linear attention, quick direct answers", gigabytes: 0.65, icon: "bolt.horizontal.fill"),
-        .init(id: "mlx-community/Llama-3.2-3B-Instruct-4bit", title: "Llama 3.2 3B", blurb: "Meta's compact all-rounder", gigabytes: 1.8, icon: "bolt.fill"),
-        .init(id: "mlx-community/Qwen3-4B-4bit", title: "Qwen3 4B", blurb: "Strong reasoning in a small footprint", gigabytes: 2.3, icon: "brain.head.profile"),
-        .init(id: "mlx-community/Phi-3.5-mini-instruct-4bit", title: "Phi-3.5 mini", blurb: "Microsoft's efficient 3.8B model", gigabytes: 2.2, icon: "graduationcap.fill"),
-        .init(id: "mlx-community/Mistral-7B-Instruct-v0.3-4bit", title: "Mistral 7B v0.3", blurb: "Classic, fluent 7B instruct model", gigabytes: 4.1, icon: "wind"),
-        .init(id: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit", title: "Qwen2.5 Coder 7B", blurb: "Code generation and review", gigabytes: 4.3, icon: "chevron.left.forwardslash.chevron.right"),
-        .init(id: "mlx-community/Qwen3-8B-4bit", title: "Qwen3 8B", blurb: "Best quality under 5 GB", gigabytes: 4.6, icon: "sparkles"),
-        .init(id: "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit", title: "Llama 3.1 8B", blurb: "Popular 8B with 128K context", gigabytes: 4.5, icon: "flame.fill"),
-        .init(id: "mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit", title: "DeepSeek R1 Distill 7B", blurb: "Step-by-step reasoning", gigabytes: 4.3, icon: "point.3.connected.trianglepath.dotted"),
+    private static let icons: [String: String] = [
+        "mlx-community/Qwen3-0.6B-4bit": "hare.fill",
+        "mlx-community/Qwen3.5-0.8B-4bit": "bolt.horizontal.fill",
+        "mlx-community/Llama-3.2-3B-Instruct-4bit": "bolt.fill",
+        "mlx-community/Qwen3-4B-4bit": "brain.head.profile",
+        "mlx-community/Phi-3.5-mini-instruct-4bit": "graduationcap.fill",
+        "mlx-community/Mistral-7B-Instruct-v0.3-4bit": "wind",
+        "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit": "chevron.left.forwardslash.chevron.right",
+        "mlx-community/Qwen3-8B-4bit": "sparkles",
+        "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit": "flame.fill",
+        "mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit": "point.3.connected.trianglepath.dotted",
     ]
+
+    /// The shared engine catalog plus this app's icons.
+    static let all: [RecommendedModel] = Catalog.standard.models.map {
+        RecommendedModel(id: $0.id, title: $0.title, blurb: $0.blurb, gigabytes: $0.gigabytes, icon: icons[$0.id] ?? "cube.fill")
+    }
 
     /// Picks that fit comfortably in this Mac's unified memory.
     static var forThisMac: [RecommendedModel] {

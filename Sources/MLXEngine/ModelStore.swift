@@ -17,6 +17,14 @@ public struct LocalModel: Identifiable, Hashable, Sendable {
     public var isSupported: Bool { SupportedArchitectures.isSupported(modelType) && !isMoE }
     /// A mixture-of-experts variant of a supported type (Gemma 4 26B-A4B).
     public var isMoE: Bool = false
+    /// When the model was last changed on disk.
+    public var modified: Date? = nil
+
+    public init(repo: String, directory: URL, sizeBytes: Int, modelType: String?, bits: Int?, source: Source,
+                isMoE: Bool = false, modified: Date? = nil) {
+        self.repo = repo; self.directory = directory; self.sizeBytes = sizeBytes; self.modelType = modelType
+        self.bits = bits; self.source = source; self.isMoE = isMoE; self.modified = modified
+    }
 }
 
 public enum ModelStore {
@@ -103,7 +111,7 @@ public enum ModelStore {
         }
         var m = LocalModel(repo: repo, directory: dir, sizeBytes: size,
                            modelType: (cfg["model_type"] as? String)?.lowercased(),
-                           bits: (q?["bits"] as? NSNumber)?.intValue, source: source)
+                           bits: (q?["bits"] as? NSNumber)?.intValue, source: source, modified: mtime(dir))
         m.isMoE = SupportedArchitectures.isMoE(cfg)
         return m
     }

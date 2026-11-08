@@ -37,7 +37,7 @@ sudo mkdir -p /usr/local/bin
 sudo install -m 755 mlxr-<version>-macos-arm64/mlxr /usr/local/bin/mlxr
 ```
 
-A browser download is quarantined by macOS and the binary won't start until you run `xattr -d com.apple.quarantine /usr/local/bin/mlxr`. The CLI doesn't update itself: repeat the steps for a new version.
+A browser download is quarantined by macOS and the binary won't start until you run `xattr -d com.apple.quarantine /usr/local/bin/mlxr`. From 2.0 on the CLI updates itself: run `mlxr upgrade` (`sudo mlxr upgrade` when it is installed in `/usr/local/bin`). 1.x has no upgrade command, so repeat these steps once to move to 2.0.
 
 ### Verifying a download
 
@@ -178,38 +178,41 @@ Models are stored in `~/Library/Application Support/MLX Runner/models/<org>/<rep
 
 ## Command line (`mlxr`)
 
+`mlxr` follows Ollama's command line: the same verbs, flags, help layout and `Error:` messages, on the
+app's model library. Model names are Hugging Face repos (`mlx-community/Qwen3-4B-4bit`) or the short
+Ollama aliases the built-in catalog knows. Results go to stdout; progress, stats and errors go to stderr.
+
 ```bash
+mlxr                                        # prints help
 mlxr search qwen3                           # search MLX models on the Hub
-mlxr download mlx-community/Qwen3-4B-4bit   # download into the app's library
-mlxr list                                   # installed models
-mlxr run mlx-community/Qwen3-4B-4bit -p "Explain RoPE" --max 300 [--temp 0.7] [--think|--no-think]
+mlxr pull mlx-community/Qwen3-4B-4bit       # download into the app's library (`download` still works)
+mlxr list                                   # installed models (alias: ls)
+mlxr show mlx-community/Qwen3-4B-4bit       # architecture, context length, quantization, capabilities
+mlxr run mlx-community/Qwen3-4B-4bit        # interactive chat (slash commands: /? lists them)
+mlxr run mlx-community/Qwen3-4B-4bit "Explain RoPE" --max 300 [--temp 0.7] [--think|--no-think]
+mlxr rm mlx-community/Qwen3-4B-4bit         # remove a model; `cp` copies, `ps` and `stop` list and unload
 mlxr serve mlx-community/Qwen3-4B-4bit --port 1234     # OpenAI-compatible server (--lan prints an API key)
 mlxr run mlx-community/Qwen3-8B-4bit --draft mlx-community/Qwen3-0.6B-4bit   # speculative decoding (or --draft auto)
+mlxr completion zsh                         # shell completions (zsh, bash)
+mlxr upgrade                                # update mlxr in place, verified against the signed SHA256SUMS (alias: update; --check only looks; `sudo mlxr upgrade` when installed in /usr/local/bin)
+```
+
+Reproducible output (greedy): `mlxr run <model> "Explain RoPE" --temp 0 --repeat-penalty 1 --seed 42 --max 256`. Use these
+flags for every benchmark or correctness comparison. `--repeat-penalty 1` matters: 1.x forced a repetition penalty of 1.0, while 2.0 uses the model's or the app's default (1.05) unless you pass it.
+
+Developer commands:
+
+```bash
 mlxr bench mlx-community/Qwen3-4B-4bit      # prefill/decode throughput, verification cost at short and 1,900-token contexts, kernel profile (MLXR_BENCH_NOPROFILE=1 skips it)
 mlxr tokenize <model> "some text"
 MLXR_BENCH_CTX=8192,30000 MLXR_BENCH_TEXT=book.txt mlxr bench <model>   # adds dense vs sparse decode after long prompts, with agreement on the text
-mlxr run <model> --sparse off   # sparse decode attention is on from 5,128 tokens of context; off, on or a key budget (N)
+mlxr run <model> "Explain RoPE" --temp 0 --repeat-penalty 1 --seed 42 --max 256 --sparse off   # sparse decode attention is on from 5,128 tokens of context; off, on or a key budget (N)
 ```
 
-## Architecture
-
-```
-Sources/
-  MLXEngine/            Inference engine (library)
-    Kernels.swift       Metal shader source, compiled at runtime
-    GPU.swift           Device and pipelines; safetensors loader (one aligned copy per shard)
-    Transformer.swift   Model graph: one command buffer per step, fused kernels
-    SparseAttention.swift  Sparse decode attention for long contexts (on by default; docs/sparse-decode-attention.md)
-    Tokenizer.swift     BPE from tokenizer.json (byte-level and SentencePiece)
-    ChatTemplate.swift  ChatML / Llama 3 / Mistral / Phi-3 prompt formats
-    Engine.swift        Generation loop, pipelined decode, KV-prefix reuse, cancellation, context fitting
-    Hub.swift           Hugging Face API client and downloader
-    ModelStore.swift    Local library and HF-cache scanning
-    OpenAIServer.swift  OpenAI-compatible HTTP server (Network.framework)
-  MLXRunner/            SwiftUI app
-  mlxr/                 CLI
-Tests/MLXEngineTests/   Swift Testing suite
-```
+Differences from Ollama: thinking follows each model's own template default (`--think` and `--no-think`
+override it); Ctrl-C during a reply exits with status 130; `create`, `push`, `signin`, `signout` and
+`launch` are accepted and answer that MLX Runner doesn't support them. `mlxr run` without a prompt no
+longer writes a haiku: it opens the chat.
 
 How the engine works:
 

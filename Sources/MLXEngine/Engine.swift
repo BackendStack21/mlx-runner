@@ -67,6 +67,19 @@ public struct LoadedModelInfo: Sendable, Hashable {
     public var sparseNote: String? = nil
     /// The draft model used for speculative decoding (nil = none).
     public var draftName: String? = nil
+
+    public init(name: String, directory: URL, modelType: String, quantization: String, parameterBytes: Int,
+                contextLength: Int, layers: Int, hiddenSize: Int, chatFormat: String, supportsThinking: Bool,
+                loadSeconds: Double, thinksByDefault: Bool = false, supportsTools: Bool = false,
+                sparseLayers: Int = 0, sparseTopK: Int = 0, sparseMinContext: Int = 0,
+                sparseNote: String? = nil, draftName: String? = nil) {
+        self.name = name; self.directory = directory; self.modelType = modelType; self.quantization = quantization
+        self.parameterBytes = parameterBytes; self.contextLength = contextLength; self.layers = layers
+        self.hiddenSize = hiddenSize; self.chatFormat = chatFormat; self.supportsThinking = supportsThinking
+        self.loadSeconds = loadSeconds; self.thinksByDefault = thinksByDefault; self.supportsTools = supportsTools
+        self.sparseLayers = sparseLayers; self.sparseTopK = sparseTopK; self.sparseMinContext = sparseMinContext
+        self.sparseNote = sparseNote; self.draftName = draftName
+    }
 }
 
 /// Minimal xorshift RNG so sampling is seedable.
