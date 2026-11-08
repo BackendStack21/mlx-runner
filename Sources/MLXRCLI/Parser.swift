@@ -54,6 +54,8 @@ public enum CLIError: Error, Equatable {
     case usage(String)
     case failure(String)
     case interrupted
+    /// Already reported on stderr: exit 1 without another message.
+    case reported
 }
 
 /// The streams and terminal facts a command sees; injected so commands are testable.

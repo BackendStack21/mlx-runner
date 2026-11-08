@@ -12,9 +12,10 @@ extension CLI {
     public static func commands(services: CLIServices = .live, library: ModelLibrary = .live, presets: PresetStore = .live,
                                 catalog: Catalog = .standard, now: @escaping @Sendable () -> Date = { Date() },
                                 hub: HubServices = .live, engine: GenerationEngine = LiveGenerationEngine(),
-                                interrupts: Interrupts = .shared) -> [Command] {
+                                interrupts: Interrupts = .shared, lineSource: LineSource? = nil,
+                                chatHistory: ChatHistory = .live) -> [Command] {
         let runDeps = RunDependencies(resolver: ModelResolver(library: library, presets: presets, catalog: catalog), hub: hub,
-                                      engine: engine, interrupts: interrupts)
+                                      engine: engine, interrupts: interrupts, lineSource: lineSource, history: chatHistory)
         let ctxRange = SamplingLimits.context
         return [
             Command(name: "run", summary: "Run a model", args: [Arg("MODEL", kind: .model), Arg("PROMPT", optional: true, variadic: true)],

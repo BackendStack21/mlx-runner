@@ -7,6 +7,8 @@ struct RunDependencies {
     var hub: HubServices
     var engine: GenerationEngine
     var interrupts: Interrupts
+    var lineSource: LineSource? = nil
+    var history: ChatHistory = .live
 }
 
 extension ModelResolver {
@@ -83,23 +85,15 @@ extension CLI {
         let stdin = console.stdinIsTTY ? "" : console.readAllStdin()
         let input = try assembleRunInput(stdin: stdin, words: words, promptFlag: inv.string("prompt"),
                                          stdinIsTTY: console.stdinIsTTY, stdoutIsTTY: console.stdoutIsTTY)
-        guard case .oneShot(let prompt) = input else {
-            throw CLIError.failure("interactive chat is not available yet: give a prompt, e.g. mlxr run \(inv.positionals[0]) \"Hello\"")
-        }
+        var oneShotPrompt: String?
+        if case .oneShot(let p) = input { oneShotPrompt = p }
         let interrupts = deps.interrupts, engine = deps.engine
         let dir = try await prepareModel(inv.positionals[0], console: console, deps: deps)
         if interrupts.wasInterrupted { throw CLIError.interrupted }
 
         // Sampling: model defaults (validated), else the app's, then the flags.
-        let defaults = GenerationDefaults.load(directory: dir)
-        defaults.warnings.forEach { console.err($0 + "\n") }
-        var params = SamplingParameters()
-        if let v = defaults.temperature { params.temperature = v }
-        if let v = defaults.topP { params.topP = v }
-        if let v = defaults.topK { params.topK = v }
-        if let v = defaults.minP { params.minP = v }
-        if let v = defaults.repetitionPenalty { params.repetitionPenalty = v }
-        params.maxTokens = inv.int("max-tokens") ?? SamplingLimits.maxTokens
+        var params = samplingDefaults(directory: dir, console: console)
+        if let v = inv.int("max-tokens") { params.maxTokens = v }
         if let v = inv.double("temp") { params.temperature = Float(v) }
         if let v = inv.double("top-p") { params.topP = Float(v) }
         if let v = inv.int("top-k") { params.topK = v }
@@ -125,9 +119,12 @@ extension CLI {
         console.err("Loaded \(info.name) [\(info.modelType), \(info.quantization), \(info.layers) layers, \(info.chatFormat)]"
                     + "\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s\n")
         console.err(sparseSummary(info) + "\n")
-        if prompt.isEmpty { interrupts.enter(.idle); return }
-
         let thinking: Bool? = inv.bool("no-think") ? false : inv.has("think") ? inv.string("think") != "false" : nil
+        guard let prompt = oneShotPrompt else {
+            try await runChat(inv, console, deps, dir: dir, info: info, params: params, thinking: thinking, sparse: sparse, draftDir: draftDir)
+            return
+        }
+        if prompt.isEmpty { interrupts.enter(.idle); return }
         let raw = inv.bool("raw")
         let messages = (inv.string("system").map { [ChatMessage(role: .system, content: $0)] } ?? [])
             + [ChatMessage(role: .user, content: prompt)]
@@ -167,5 +164,45 @@ extension CLI {
             console.err(StatsFormat.block(RunStats(loadSeconds: info.loadSeconds, stats: final)))
             StatsFormat.mlxrLines(prompt: promptStats, final: final).forEach { console.err($0 + "\n") }
         }
+    }
+}
+
+extension CLI {
+    /// `mlxr run MODEL` without a prompt on a terminal: the interactive chat.
+    fileprivate static func runChat(_ inv: Invocation, _ console: Console, _ deps: RunDependencies, dir: URL,
+                                    info: LoadedModelInfo, params: SamplingParameters, thinking: Bool?,
+                                    sparse: SparseAttention?, draftDir: URL?) async throws {
+        let name = inv.positionals[0]
+        let resolution = try? deps.resolver.resolve(name)
+        var s = ChatSettings(model: name, repo: resolution?.repo, directory: dir, info: info, preset: resolution?.preset)
+        s.parameters = params
+        s.system = inv.string("system") ?? resolution?.preset?.system
+        s.thinking = thinking
+        s.hideThinking = inv.bool("hidethinking")
+        s.wordWrap = !inv.bool("nowordwrap")
+        s.verbose = inv.bool("verbose")
+        s.contextLength = inv.int("ctx") ?? 4096
+        s.draftDirectory = draftDir
+        s.sparse = sparse
+        for (k, v) in resolution?.preset?.parameters.sorted(by: { $0.key < $1.key }) ?? [] {
+            var p = s.parameters
+            if (try? ChatParameter.apply(k, v, to: &p)) == .set { s.parameters = p; s.userParameters[k] = v }
+        }
+        let flagKeys = [("temp", "temperature"), ("top-p", "top_p"), ("top-k", "top_k"), ("min-p", "min_p"),
+                        ("repeat-penalty", "repeat_penalty"), ("repeat-last-n", "repeat_last_n"),
+                        ("seed", "seed"), ("max-tokens", "num_predict")]
+        for (flag, key) in flagKeys {
+            if let v = inv.string(flag) {
+                var p = s.parameters
+                if (try? ChatParameter.apply(key, v, to: &p)) == .set { s.parameters = p; s.userParameters[key] = v }
+            }
+        }
+        let lines = deps.lineSource ?? liveLineSource(console: console, history: deps.history)
+        let session = ChatSession(console: console, engine: deps.engine, resolver: deps.resolver,
+                                  presets: deps.resolver.presets, interrupts: deps.interrupts, lines: lines,
+                                  history: deps.history, settings: s)
+        let code = await session.run()
+        deps.interrupts.enter(.idle)
+        if code != 0 { throw CLIError.reported }
     }
 }

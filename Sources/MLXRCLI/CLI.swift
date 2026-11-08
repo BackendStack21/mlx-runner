@@ -41,6 +41,8 @@ public enum CLI {
             return 0
         } catch CLIError.interrupted {
             return 130
+        } catch CLIError.reported {
+            return 1
         } catch {
             console.err("Error: \(message(for: error))\n")
             return 1
@@ -53,6 +55,7 @@ public enum CLI {
             switch e {
             case .usage(let m), .failure(let m): return m
             case .interrupted: return "interrupted"
+            case .reported: return "failed"
             }
         }
         let ns = error as NSError
