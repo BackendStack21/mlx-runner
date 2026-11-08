@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.5.0
 
-Qwen 3.5 support: the hybrid Gated DeltaNet architecture. Decode is 6–7% ahead of mlx-lm on the 0.8B model, 2% behind on the 2B and 5% behind on the 4B; prefill is ahead.
+Qwen 3.5 support: the hybrid Gated DeltaNet architecture. Decode is 6–7% ahead of mlx-lm on the 0.8B model, 2% behind on the 2B and 5% behind on the 4B; prefill is ahead. Thinking now follows each model's own default, and the app keeps its settings across relaunches.
 
 - **Qwen 3.5** (`qwen3_5`, `qwen3_5_text`; the dense models; verified on the 0.8B, 2B and 4B 4-bit
   exports). Three of every four layers are
