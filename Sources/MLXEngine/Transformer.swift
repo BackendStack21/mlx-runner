@@ -168,10 +168,20 @@ final class Linear {
             throw EngineError.invalidFile("\(description): tensor outside its file")
         }
         let buf = try GPU.shared.buffer(2 * n * size)
-        let sp = s.buffer.contents() + s.offset, bp = b.buffer.contents() + b.offset, out = buf.contents()
-        for i in 0..<n {
-            (out + 2 * i * size).copyMemory(from: sp + i * size, byteCount: size)
-            (out + (2 * i + 1) * size).copyMemory(from: bp + i * size, byteCount: size)
+        let sp = UnsafeRawPointer(s.buffer.contents() + s.offset), bp = UnsafeRawPointer(b.buffer.contents() + b.offset)
+        // One typed pass (f16/bf16: 2 bytes, f32: 4), not two byte copies per element; the source
+        // offsets need not be aligned.
+        func interleave<W: FixedWidthInteger>(_: W.Type) {
+            let out = buf.contents().bindMemory(to: W.self, capacity: 2 * n)
+            for i in 0..<n {
+                out[2 * i] = sp.loadUnaligned(fromByteOffset: i * size, as: W.self)
+                out[2 * i + 1] = bp.loadUnaligned(fromByteOffset: i * size, as: W.self)
+            }
+        }
+        switch size {
+        case 2: interleave(UInt16.self)
+        case 4: interleave(UInt32.self)
+        default: return
         }
         pairs = buf
         qmvpPSO = try GPU.shared.pipeline(kernel)

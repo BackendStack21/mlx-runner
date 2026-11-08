@@ -2468,7 +2468,8 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
     // An attempt first bounds the pool with the block maxima: every block whose maximum reaches
     // the threshold holds 1 to SMP_BLK candidates, so a threshold that `above` blocks reach gives
     // above <= |pool| <= above · SMP_BLK. When that already decides the attempt the scan is skipped;
-    // the pool kept at the end always comes from a real scan (`force` repeats a skipped attempt).
+    // the pool kept at the end always comes from a real scan (`force` repeats a skipped attempt, and
+    // the 64th attempt scans).
     bool force = false;
     for (int attempt = 0; attempt < 64; attempt++) {
         if (tid == 0) atomic_store_explicit(&np, 0u, memory_order_relaxed);
@@ -2484,7 +2485,8 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
             above = 0;
             for (uint s = 0; s < nsg; s++) above += shi[s];
         }
-        const bool scanned = force || above < 0 || !(uint(above) > cap || above * SMP_BLK < k);
+        // The last attempt always scans, so a loop that runs out of attempts still keeps a real pool.
+        const bool scanned = force || attempt == 63 || above < 0 || !(uint(above) > cap || above * SMP_BLK < k);
         if (!scanned) {
             count = uint(above) > cap ? uint(above) : uint(above * SMP_BLK);
         } else {

@@ -223,14 +223,15 @@ final class AppState {
         Task {
             do {
                 // Resolved off the main actor (tokenizer hashing). A saved pick that no longer fits the
-                // model being loaded (another family, or removed) is dropped rather than failing the load.
+                // model being loaded (another family, removed, or a target with a recurrent state, which
+                // cannot drop rejected drafts) is dropped rather than failing the load.
                 let draft: URL? = await Task.detached(priority: .userInitiated) {
                     switch draftSetting {
                     case "": return nil
                     case "auto": return InferenceEngine.autoDraft(for: model.directory, among: models)?.directory
                     default:
                         guard let d = models.first(where: { $0.directory.path == draftSetting }), d.isSupported, d.directory != model.directory,
-                              d.modelType == model.modelType,
+                              d.modelType == model.modelType, !SupportedArchitectures.hasRecurrentState(model.modelType),
                               let fp = InferenceEngine.tokenizerFingerprint(model.directory), InferenceEngine.tokenizerFingerprint(d.directory) == fp
                         else { return nil }
                         return d.directory
