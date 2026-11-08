@@ -50,6 +50,8 @@ public struct UpdateInstall: Equatable, Sendable {
         case macApp
         /// `swift run` / an unbundled build: updated with git.
         case source
+        /// The standalone `mlxr` command-line binary, replaced in place by `mlxr upgrade`.
+        case cli
     }
 
     public var kind: Kind
@@ -67,9 +69,21 @@ public struct UpdateInstall: Equatable, Sendable {
         return UpdateInstall(kind: url.pathExtension == "app" ? .macApp : .source, target: url)
     }
 
-    /// The release asset for a version.
+    /// Works out how a running `mlxr` binary was installed: the real path (symlinks resolved) is the
+    /// target; a binary inside a `.build` directory is a source build.
+    public static func detectCLI(executable: URL) -> UpdateInstall {
+        let url = executable.resolvingSymlinksInPath().standardizedFileURL
+        return UpdateInstall(kind: url.pathComponents.contains(".build") ? .source : .cli, target: url)
+    }
+
+    /// The release asset for a version (the app's disk image).
     public static func assetName(for version: String) -> String {
         "MLX-Runner-\(version)-macos-arm64.dmg"
+    }
+
+    /// The release asset for a version and install kind.
+    public static func assetName(for version: String, kind: Kind) -> String {
+        kind == .cli ? "mlxr-\(version)-macos-arm64.tar.gz" : assetName(for: version)
     }
 }
 
@@ -667,5 +681,88 @@ public struct MacAppInstaller: UpdateInstalling {
             throw UpdateError("\((tool as NSString).lastPathComponent) failed: \(first.trimmingCharacters(in: .whitespaces))")
         }
         return text
+    }
+}
+
+
+// MARK: - CLI installer
+
+/// Extracts `mlxr-<version>-macos-arm64/mlxr` from the release tarball with `/usr/bin/tar`, validates it
+/// (regular file, size cap, arm64 Mach-O, valid code signature) and swaps it over `target` with one
+/// `rename(2)`. Everything it creates in `stage` is removed again, on success and on failure.
+public struct CLIInstaller: UpdateInstalling {
+    public static let defaultMaxBinaryBytes: Int = 256 << 20
+    public var maxBinaryBytes: Int
+
+    public init(maxBinaryBytes: Int = CLIInstaller.defaultMaxBinaryBytes) {
+        self.maxBinaryBytes = maxBinaryBytes
+    }
+
+    public func install(package: URL, version: String, target: URL, stage: URL) async throws {
+        // tar and codesign block: keep them off the cooperative thread pool.
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                c.resume(with: Result { try installSync(package: package, version: version, target: target, stage: stage) })
+            }
+        }
+    }
+
+    func installSync(package: URL, version: String, target: URL, stage: URL) throws {
+        let folder = "mlxr-\(version)-macos-arm64"
+        let member = "\(folder)/mlxr"
+        try checkListing(package: package, folder: folder, member: member)
+
+        let work = stage.appendingPathComponent("extract", isDirectory: true)
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: work) }
+        try MacAppInstaller.run("/usr/bin/tar", ["-xzf", package.path, "-C", work.path, "--", member])
+
+        let staged = work.appendingPathComponent(member)
+        try validate(staged)
+        guard chmod(staged.path, 0o755) == 0 else {
+            throw UpdateError("Could not make the new mlxr executable: \(String(cString: strerror(errno))).")
+        }
+        guard rename(staged.path, target.path) == 0 else {
+            throw UpdateError("Could not replace \(target.path): \(String(cString: strerror(errno))).")
+        }
+    }
+
+    /// Every archive member must live under the release folder (no absolute or `..` paths), and the
+    /// binary must be there exactly once. Other members (LICENSE) are never extracted.
+    func checkListing(package: URL, folder: String, member: String) throws {
+        let listing = try MacAppInstaller.run("/usr/bin/tar", ["-tzf", package.path])
+        let names = listing.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        var found = 0
+        for name in names {
+            let parts = name.split(separator: "/", omittingEmptySubsequences: false)
+            guard !name.hasPrefix("/"), !parts.contains(".."), name.hasPrefix(folder + "/") else {
+                throw UpdateError("The release archive has an unexpected entry: \(name.prefix(80)).")
+            }
+            if name == member { found += 1 }
+        }
+        guard found == 1 else { throw UpdateError("The release archive has no \(member).") }
+    }
+
+    /// A regular file (never a link) under the size cap, arm64 Mach-O, validly code signed.
+    func validate(_ file: URL) throws {
+        var st = stat()
+        guard lstat(file.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else {
+            throw UpdateError("The new mlxr is not a regular file.")
+        }
+        guard st.st_size <= Int64(maxBinaryBytes) else { throw UpdateError("The new mlxr is too large.") }
+        guard st.st_size >= 8, let handle = try? FileHandle(forReadingFrom: file) else {
+            throw UpdateError("The new mlxr is not an arm64 executable.")
+        }
+        let head = (try? handle.read(upToCount: 8)) ?? Data()
+        try? handle.close()
+        // MH_MAGIC_64 (CF FA ED FE), then CPU_TYPE_ARM64 (0x0100000C), both little-endian.
+        guard Array(head) == [0xCF, 0xFA, 0xED, 0xFE, 0x0C, 0x00, 0x00, 0x01] else {
+            throw UpdateError("The new mlxr is not an arm64 executable.")
+        }
+        do {
+            try MacAppInstaller.run("/usr/bin/codesign", ["--verify", "--strict", file.path])
+        } catch let e as UpdateError {
+            throw UpdateError("The new mlxr's code signature is invalid: \(e.message)")
+        }
     }
 }
