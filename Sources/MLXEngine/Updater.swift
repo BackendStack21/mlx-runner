@@ -57,10 +57,13 @@ public struct UpdateInstall: Equatable, Sendable {
     public var kind: Kind
     /// The `.app` bundle that gets replaced.
     public var target: URL
+    /// The target is the standalone `mlxr` binary (installed or a source build), not an app bundle.
+    public var isCommandLine: Bool
 
-    public init(kind: Kind, target: URL) {
+    public init(kind: Kind, target: URL, isCommandLine: Bool? = nil) {
         self.kind = kind
         self.target = target
+        self.isCommandLine = isCommandLine ?? (kind == .cli)
     }
 
     /// Works out how the running app was installed from its bundle location.
@@ -73,7 +76,7 @@ public struct UpdateInstall: Equatable, Sendable {
     /// target; a binary inside a `.build` directory is a source build.
     public static func detectCLI(executable: URL) -> UpdateInstall {
         let url = executable.resolvingSymlinksInPath().standardizedFileURL
-        return UpdateInstall(kind: url.pathComponents.contains(".build") ? .source : .cli, target: url)
+        return UpdateInstall(kind: url.pathComponents.contains(".build") ? .source : .cli, target: url, isCommandLine: true)
     }
 
     /// The release asset for a version (the app's disk image).
@@ -314,14 +317,24 @@ public actor Updater {
     }
 
     private func cannotInstall(_ r: Release) -> String? {
-        if install.kind == .source { return "Running from source: update with git pull." }
-        let name = UpdateInstall.assetName(for: r.version)
+        if install.kind == .source {
+            return install.isCommandLine ? "mlxr is running from a source build; update it with git pull"
+                                         : "Running from source: update with git pull."
+        }
+        let name = UpdateInstall.assetName(for: r.version, kind: install.kind)
         if r.assets[name] == nil { return "This release has no build for this Mac (\(name))." }
         if r.assets["SHA256SUMS"] == nil || r.assets["SHA256SUMS.sig"] == nil {
             return "This release isn't signed, so it can't be installed automatically."
         }
         if Self.publicKey(fromBase64: publicKeyBase64) == nil { return "This build has no update signing key." }
         let path = install.target.path
+        if install.kind == .cli {
+            // The binary is replaced by a rename in its directory, so the directory must be writable.
+            if !FileManager.default.isWritableFile(atPath: install.target.deletingLastPathComponent().path) {
+                return "cannot replace \(path) (permission denied); run: sudo mlxr upgrade"
+            }
+            return nil
+        }
         if path.contains("/AppTranslocation/") || path.hasPrefix("/Volumes/") {
             return "Move MLX Runner to the Applications folder to update it."
         }
@@ -343,9 +356,9 @@ public actor Updater {
 
         progress(.checking)
         let info = try await check(force: true)
-        guard info.available, let release = cached?.release else { throw UpdateError("MLX Runner is already up to date.") }
+        guard info.available, let release = cached?.release else { throw UpdateError(install.isCommandLine ? "mlxr is already up to date." : "MLX Runner is already up to date.") }
         guard info.canInstall else { throw UpdateError(info.reason ?? "This update can't be installed automatically.") }
-        let name = UpdateInstall.assetName(for: release.version)
+        let name = UpdateInstall.assetName(for: release.version, kind: install.kind)
         guard let assetURL = release.assets[name], let sumsURL = release.assets["SHA256SUMS"],
               let sigURL = release.assets["SHA256SUMS.sig"] else { throw UpdateError("The release is missing files.") }
 
@@ -474,13 +487,17 @@ public actor Updater {
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: queue)
         defer { session.finishTasksAndInvalidate() }
         let task = session.dataTask(with: request)
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-                delegate.continuation = c
-                task.resume()
+        do {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                    delegate.continuation = c
+                    task.resume()
+                }
+            } onCancel: {
+                task.cancel()
             }
-        } onCancel: {
-            task.cancel()
+        } catch let e as URLError where e.code != .cancelled {
+            throw UpdateError("Network error: \(e.localizedDescription)")
         }
     }
 }
