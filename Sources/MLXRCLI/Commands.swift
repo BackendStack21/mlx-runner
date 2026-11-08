@@ -17,7 +17,7 @@ extension CLI {
         let runDeps = RunDependencies(resolver: ModelResolver(library: library, presets: presets, catalog: catalog), hub: hub,
                                       engine: engine, interrupts: interrupts, lineSource: lineSource, history: chatHistory)
         let ctxRange = SamplingLimits.context
-        return [
+        let table: [Command] = [
             Command(name: "run", summary: "Run a model", args: [Arg("MODEL", kind: .model), Arg("PROMPT", optional: true, variadic: true)],
                     options: [
                         Opt(long: "prompt", short: "p", value: .text, help: "prompt"),
@@ -101,6 +101,7 @@ extension CLI {
                         try await services.bench(BenchOptions(model: inv.positionals[0], decodeOnly: inv.bool("decode"), contexts: inv.string("ctx")), console)
                     }),
         ] + modelCommands(library: library, presets: presets, catalog: catalog, now: now)
+        return table + [completionCommand(table: table)]
     }
 }
 
