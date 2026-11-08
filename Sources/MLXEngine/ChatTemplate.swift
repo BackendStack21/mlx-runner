@@ -45,6 +45,10 @@ public struct ChatTemplate: Sendable {
     public let format: ChatFormat
     /// The template supports Qwen3-style `enable_thinking`.
     public let supportsThinkingToggle: Bool
+    /// What the template does when `enable_thinking` is not given: Qwen3 and Qwen 3.5 4B+ think,
+    /// Qwen 3.5 0.8B and 2B (`enable_thinking is true` templates) answer directly. Their model
+    /// cards warn that thinking mode often loops on those two sizes. False without a toggle.
+    public let thinksByDefault: Bool
     let bos: String
     /// System prompt the template injects when the conversation has none (Qwen2.5).
     let defaultSystem: String?
@@ -78,7 +82,10 @@ public struct ChatTemplate: Sendable {
         let t = (template ?? "") + (toolTemplate ?? "")
         hermesDoubleBraces = t.contains("{{\\\"name\\\": <function-name>")
         emptyThoughtPrefill = format == .gemma4 && (template ?? "").contains("'<|channel>thought\\n<channel|>'")
-        qwen35 = format == .chatML && (template ?? "").contains("enable_thinking is true")
+        // Qwen 3.5 templates open the reasoning block on their own (`{{- '<think>\n' }}`); the
+        // opt-in form (thinking only when asked, 0.8B/2B) and opt-out form (4B+) differ only there.
+        qwen35 = format == .chatML && supportsThinkingToggle && (template ?? "").contains("{{- '<think>\\n' }}")
+        thinksByDefault = supportsThinkingToggle && !(template ?? "").contains("enable_thinking is true")
         switch format {
         case .chatML: supportsTools = t.contains("<tool_call>") && !t.contains("<function=")
         case .llama3: supportsTools = llamaDatePreamble && t.contains("ipython")
@@ -92,8 +99,9 @@ public struct ChatTemplate: Sendable {
 
     /// The rendered prompt ends inside an opened reasoning block (Qwen 3.5 with thinking on): the
     /// reply is reasoning until `</think>`, without the model writing `<think>` itself.
-    public func opensThinking(enableThinking: Bool, prefill: String? = nil) -> Bool {
-        qwen35 && enableThinking && prefill == nil
+    /// `enableThinking` nil: the template's default.
+    public func opensThinking(enableThinking: Bool?, prefill: String? = nil) -> Bool {
+        qwen35 && (enableThinking ?? thinksByDefault) && prefill == nil
     }
 
     /// Text that starts the assistant turn so the reply must be a tool call: any call for
@@ -117,8 +125,9 @@ public struct ChatTemplate: Sendable {
         return f.string(from: Date())
     }
 
-    /// Renders messages as a prompt ending with the assistant turn opener.
-    public func render(_ messages: [ChatMessage], enableThinking: Bool = true, tools: [ToolDefinition] = [],
+    /// Renders messages as a prompt ending with the assistant turn opener. `enableThinking` nil
+    /// renders what the template does when it is not given (`thinksByDefault`).
+    public func render(_ messages: [ChatMessage], enableThinking: Bool? = nil, tools: [ToolDefinition] = [],
                        prefill: String? = nil) -> String {
         renderMarked(messages, enableThinking: enableThinking, tools: tools, prefill: prefill).text
     }
@@ -127,8 +136,9 @@ public struct ChatTemplate: Sendable {
     /// tokenized as plain text so a message cannot inject control tokens (forged turns).
     /// `tools` are rendered the way the model's own template does; `prefill` (see
     /// `toolCallPrefill`) is appended after the assistant turn opener.
-    public func renderMarked(_ messages: [ChatMessage], enableThinking: Bool = true, tools: [ToolDefinition] = [],
+    public func renderMarked(_ messages: [ChatMessage], enableThinking: Bool? = nil, tools: [ToolDefinition] = [],
                              prefill: String? = nil) -> (text: String, content: [NSRange]) {
+        let enableThinking = enableThinking ?? thinksByDefault
         var s = ""
         var len = 0
         var ranges: [NSRange] = []

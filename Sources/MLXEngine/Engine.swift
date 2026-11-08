@@ -54,6 +54,8 @@ public struct LoadedModelInfo: Sendable, Hashable {
     public let chatFormat: String
     public let supportsThinking: Bool
     public let loadSeconds: Double
+    /// The template thinks when chat requests leave `enableThinking` unset (see `ChatTemplate.thinksByDefault`).
+    public var thinksByDefault: Bool = false
     /// The chat template defines native tool calling.
     public var supportsTools: Bool = false
     /// Layers that decode with sparse attention from `sparseMinContext` tokens on (0: dense decode).
@@ -318,7 +320,8 @@ public final class InferenceEngine: @unchecked Sendable {
                         parameterBytes: model.weightBytes, contextLength: model.maxSeq,
                         layers: model.config.numLayers, hiddenSize: model.config.hiddenSize,
                         chatFormat: tpl.format.rawValue, supportsThinking: tpl.supportsThinkingToggle,
-                        loadSeconds: Date().timeIntervalSince(start), supportsTools: tpl.supportsTools,
+                        loadSeconds: Date().timeIntervalSince(start), thinksByDefault: tpl.thinksByDefault,
+                        supportsTools: tpl.supportsTools,
                         sparseLayers: model.sparseAvailable ? model.sparseLayerCount : 0,
                         sparseTopK: model.sparseAvailable ? sparse?.topK ?? 0 : 0,
                         sparseMinContext: model.sparseAvailable ? sparse?.minContext ?? 0 : 0,
@@ -359,14 +362,15 @@ public final class InferenceEngine: @unchecked Sendable {
     /// (from `ChatTemplate.toolCallPrefill`) starts the assistant turn.
     /// `constrainToolNames`: the reply continues a prefill that ends inside a function name
     /// (`tool_choice: required`); until the name is complete, only tokens that keep it one of
-    /// these names can be sampled.
-    public func chat(_ messages: [ChatMessage], parameters: SamplingParameters = .init(), enableThinking: Bool = true,
+    /// these names can be sampled. `enableThinking` nil: the template's default (`thinksByDefault`).
+    public func chat(_ messages: [ChatMessage], parameters: SamplingParameters = .init(), enableThinking: Bool? = nil,
                      conversationID: String? = nil, tools: ToolRequest? = nil, prefill: String? = nil,
                      constrainToolNames: [String]? = nil,
                      token: CancelToken = CancelToken()) -> AsyncThrowingStream<GenerationEvent, Error> {
         let defs = (tools?.active ?? false) ? tools?.tools ?? [] : []
         return stream(token, parameters: parameters, revealToolMarkers: !defs.isEmpty, nameChoices: constrainToolNames) { tok, tpl in
             guard let tpl else { throw EngineError.invalidFile("No model loaded") }
+            let enableThinking = enableThinking ?? tpl.thinksByDefault
             let ids = self.fitToContext(messages, template: tpl, tokenizer: tok,
                                         reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking,
                                         conversationID: conversationID, tools: defs, prefill: prefill)
@@ -417,7 +421,7 @@ public final class InferenceEngine: @unchecked Sendable {
     /// Token-level API used by the CLI and tests. Must not be called concurrently with generation.
     public func encode(_ text: String) -> [Int] { queue.sync { tokenizer?.encode(text) ?? [] } }
     public func decode(_ ids: [Int]) -> String { queue.sync { tokenizer?.decode(ids) ?? "" } }
-    public func renderChat(_ messages: [ChatMessage], enableThinking: Bool = true) -> String {
+    public func renderChat(_ messages: [ChatMessage], enableThinking: Bool? = nil) -> String {
         queue.sync { template?.render(messages, enableThinking: enableThinking) ?? "" }
     }
 

@@ -5,7 +5,7 @@ import MLXEngine
 //   mlxr search <query>
 //   mlxr download <org/repo>
 //   mlxr list
-//   mlxr run <org/repo|path> [-p prompt] [--raw] [--max N] [--temp T] [--no-think] [--ctx N] [--draft <model|auto>] [--sparse <on|off|N>]
+//   mlxr run <org/repo|path> [-p prompt] [--raw] [--max N] [--temp T] [--think|--no-think] [--ctx N] [--draft <model|auto>] [--sparse <on|off|N>]
 //   mlxr tokenize <org/repo|path> <text>
 //   mlxr serve <org/repo|path> [--port 1234] [--ctx N] [--lan] [--draft <model|auto>] [--sparse <on|off|N>]
 
@@ -368,7 +368,8 @@ case "run":
     let temp = Float(option("--temp") ?? "0") ?? 0
     let ctx = Int(option("--ctx") ?? "4096") ?? 4096
     let raw = flag("--raw")
-    let noThink = flag("--no-think")
+    // Neither flag: the template's default (Qwen 3.5 0.8B and 2B answer directly, Qwen3 thinks).
+    let thinking: Bool? = flag("--no-think") ? false : flag("--think") ? true : nil
     let showIds = flag("--ids")
     let draftArg = option("--draft")
     let sparseArg = sparseOption(option("--sparse"))
@@ -385,9 +386,9 @@ case "run":
     params.seed = 42
     if flag("--spec") { params.speculative = true }
     let stream = raw ? engine.complete(prompt, parameters: params)
-        : engine.chat([ChatMessage(role: .user, content: prompt)], parameters: params, enableThinking: !noThink)
+        : engine.chat([ChatMessage(role: .user, content: prompt)], parameters: params, enableThinking: thinking)
     if showIds {
-        let p = raw ? prompt : engine.renderChat([ChatMessage(role: .user, content: prompt)], enableThinking: !noThink)
+        let p = raw ? prompt : engine.renderChat([ChatMessage(role: .user, content: prompt)], enableThinking: thinking)
         print("prompt ids:", engine.encode(p))
     }
     for try await ev in stream {

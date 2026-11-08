@@ -254,10 +254,12 @@ struct ModelTests {
         #expect(cached > 10, "second turn should reuse the KV cache prefix")
     }
 
-    /// Qwen 3.5: the follow-up turn resumes from the recurrent checkpoint taken just before the first
-    /// prompt's generation opener, and answers exactly as a fresh engine processing the whole prompt.
-    @Test(.enabled(if: installedModel(qwen35) != nil), arguments: [false, true])
-    func hybridFollowUpResumesFromCheckpoint(thinking: Bool) async throws {
+    /// Qwen 3.5 (0.8B and 4B, whose templates differ in their thinking default): the follow-up turn
+    /// resumes from the recurrent checkpoint taken just before the first prompt's generation opener,
+    /// and answers exactly as a fresh engine processing the whole prompt.
+    @Test(.enabled(if: installedModel(qwen35) != nil), arguments: [qwen35, qwen35_4b], [false, true])
+    func hybridFollowUpResumesFromCheckpoint(repo: String, thinking: Bool) async throws {
+        guard let dir = installedModel(repo) else { return }
         var p = SamplingParameters()
         p.temperature = 0
         p.maxTokens = thinking ? 48 : 24
@@ -270,7 +272,9 @@ struct ModelTests {
             return (text, cached)
         }
         let engine = InferenceEngine()
-        _ = try await engine.load(directory: installedModel(Self.qwen35)!, contextLength: 2048)
+        let info = try await engine.load(directory: dir, contextLength: 2048)
+        // The 0.8B template thinks only when asked, the 4B template unless told not to.
+        #expect(info.supportsThinking && info.thinksByDefault == (repo == Self.qwen35_4b))
         var msgs = [ChatMessage(role: .system, content: "You answer in one short sentence."),
                     ChatMessage(role: .user, content: "What is the capital of France?")]
         let first = try await reply(engine, msgs)
@@ -280,7 +284,7 @@ struct ModelTests {
         let second = try await reply(engine, msgs)
         #expect(second.cached > 10, "the follow-up should resume from the checkpoint")
         let fresh = InferenceEngine()
-        _ = try await fresh.load(directory: installedModel(Self.qwen35)!, contextLength: 2048)
+        _ = try await fresh.load(directory: dir, contextLength: 2048)
         let reference = try await reply(fresh, msgs)
         #expect(reference.cached == 0 && second.text == reference.text)
     }

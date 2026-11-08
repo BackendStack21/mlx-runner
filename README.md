@@ -58,14 +58,14 @@ gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx
 
 **Chat**
 - Streaming responses with Markdown rendering: headings, lists, tables, quotes, and code blocks with syntax highlighting and copy.
-- Qwen3 thinking mode: reasoning appears in a collapsible "Thought for N s" block, and a toggle turns it off.
+- Qwen3 and Qwen 3.5 thinking mode: reasoning appears in a collapsible "Thought for N s" block. A per-model toggle turns it on or off; each model starts with its own default (Qwen3.5 0.8B and 2B answer directly, as their model cards advise).
 - Live tok/s while generating. Each reply also shows tok/s, token count and time to first token.
 - Edit and resend, regenerate, copy, a per-chat system prompt, and searchable, persistent chat history.
 - An inspector panel for temperature, top-p, top-k, min-p, repeat penalty, max tokens, context length, draft model and long-context sparse attention.
 
 **Local Server**
 - OpenAI-compatible: the Responses API (`POST /v1/responses`, with typed streaming events), Chat Completions (`developer` role, content parts, `max_completion_tokens`, `stream_options.include_usage`), legacy Completions, and `/v1/models`.
-- Qwen3 thinking is returned as `reasoning_content` (Chat Completions) or a `reasoning` item (Responses).
+- Qwen3 and Qwen 3.5 thinking is returned as `reasoning_content` (Chat Completions) or a `reasoning` item (Responses). A request that doesn't set `enable_thinking`, `chat_template_kwargs.enable_thinking` or a reasoning effort gets the model template's default.
 - Tool calling (function tools) in both APIs, streaming and non-streaming, for Qwen2.5, Qwen3, Llama 3.1+ and Mistral v0.3 models. Prompts are rendered in each model's native tool format, checked byte for byte against the official chat templates and `mistral-common`. `tool_choice` supports `auto`, `none`, `required` (the function name is constrained to the tools you defined) and a named function. `parallel_tool_calls` and the full call → `tool` result → answer loop are supported. Models without a tool format (Phi-3.5) answer tool requests with a 400.
 - Features it can't honour (JSON mode, images, logprobs, built-in tools such as web search) are rejected with an OpenAI-style 400 instead of being silently ignored.
 - Safe by default: binds to localhost, rejects other `Host` headers (DNS rebinding) and unknown browser `Origin`s, accepts JSON bodies only, and enforces timeouts plus connection, queue and size limits. An API key is optional on localhost and required in LAN mode.
@@ -95,7 +95,7 @@ gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx
 | `gemma3_text`, `gemma3` | gemma-3-1b-it-qat-4bit, gemma-3-270m-it-4bit | q/k norms, 5:1 sliding/global layers with their own RoPE bases; `gemma3` multimodal exports run their language model |
 | `gemma4`, `gemma4_text` | gemma-4-e2b-it-OptiQ-4bit | head dims 256/512, proportional RoPE, KV sharing across layers, per-layer input embeddings, mixed 4/8-bit layers |
 | `gemma4_unified` | gemma-4-12B-it-OptiQ-4bit | as above, K = V in the global layers; the vision part of the export is ignored |
-| `qwen3_5`, `qwen3_5_text` | Qwen3.5-0.8B-4bit, Qwen3.5-2B-4bit, Qwen3.5-4B-4bit | hybrid: Gated DeltaNet linear attention (a recurrent state, no KV cache) in 3 of every 4 layers, gated full attention with partial RoPE in the rest; thinking toggle; the vision part of the export is ignored |
+| `qwen3_5`, `qwen3_5_text` | Qwen3.5-0.8B-4bit, Qwen3.5-2B-4bit, Qwen3.5-4B-4bit | hybrid: Gated DeltaNet linear attention (a recurrent state, no KV cache) in 3 of every 4 layers, gated full attention with partial RoPE in the rest; thinking toggle (off by default on the 0.8B and 2B, as in their templates); the vision part of the export is ignored |
 
 Each checkpoint above passes end-to-end generation and the prefill-versus-decode consistency test; the Gemma and Qwen 3.5 checkpoints also match mlx-lm's logits position by position (teacher-forced: the same argmax at every position, within 0.05 of a float32 mlx-lm run; Qwen3.5-0.8B within 0.004). Other models of the same type, such as larger Qwen3, Qwen2.5-Coder or other Llama 3 fine-tunes, should work too, unless they need a feature that isn't implemented.
 
@@ -103,7 +103,7 @@ Each checkpoint above passes end-to-end generation and the prefill-versus-decode
 
 - **Unsupported model types:** mixture-of-experts (Mixtral, Qwen3-MoE, Gemma 4 26B-A4B, Qwen 3.5 MoE), Gemma 3n, and the vision and audio parts of multimodal models (Gemma 3 and Gemma 4 exports run as text-only). Discover marks unsupported types as not runnable.
 - **Gemma:** no tool calling and no Gemma 4 thinking mode (Gemma 4 runs with thinking off, its template's default). Sliding-window layers keep a ring of window + 512 K/V rows, so a chat whose shared prefix with the previous request ends more than 512 tokens before that request's end is processed from the start instead of reusing the cache.
-- **Qwen 3.5:** no tool calling yet (its templates use an XML `<function=…>` call format; tool requests get a 400) and no multi-token prediction. Its linear-attention layers keep a recurrent state that, unlike a KV cache, cannot be rolled back: the engine saves a checkpoint of it 8 tokens before the end of each prompt, so a chat follow-up (or a regenerated reply) resumes from there. A request that diverges from the previous one earlier than that is processed from the start. Speculative decoding (prompt lookup or a draft model) is off for these models.
+- **Qwen 3.5:** no tool calling yet (its templates use an XML `<function=…>` call format; tool requests get a 400) and no multi-token prediction. Its linear-attention layers keep a recurrent state that, unlike a KV cache, cannot be rolled back: the engine saves a checkpoint of it 8 tokens before the end of each prompt, so a chat follow-up (or a regenerated reply) resumes from there. A request that diverges from the previous one earlier than that is processed from the start. Speculative decoding (prompt lookup or a draft model) is off for these models. With Think turned on, the 0.8B and 2B often keep thinking without reaching an answer, as Qwen's model cards warn (Qwen recommends a presence penalty, which the engine does not implement yet); they answer directly by default.
 - **Chat templates:** the prompt format is detected (ChatML, Llama 3, Mistral, Phi-3, Gemma, Gemma 4) rather than executed as Jinja, so a model with an unusual template may get a near-match format.
 - **Prefill speed:** about 247 tok/s on a 7B model on an M2 Pro, against about 305 for mlx-lm on the same files. The 64×64 GEMM tile measures about 3.5 TFLOPS. Prompts shorter than about 128 tokens use the 32×32 tile and are further behind mlx-lm. Long prompts fall further behind, because prefill attention grows with the prompt: at 30K tokens mlx-lm prefills 1.4–2× faster (Mistral 7B: 107 against 202 tok/s, so 280 s against 149 s for the prompt). See [docs/sparse-decode-attention.md](docs/sparse-decode-attention.md#against-mlx-lm).
 - **Long-context decode against mlx-lm:** with sparse attention (the default) decode is level with mlx-lm at 8K on 7–14B models and 1.4–2.4× faster at 30K. Dense decode (`--sparse off`) is 3–11% behind mlx-lm on 7–14B models.
@@ -173,7 +173,7 @@ Models are stored in `~/Library/Application Support/MLX Runner/models/<org>/<rep
 mlxr search qwen3                           # search MLX models on the Hub
 mlxr download mlx-community/Qwen3-4B-4bit   # download into the app's library
 mlxr list                                   # installed models
-mlxr run mlx-community/Qwen3-4B-4bit -p "Explain RoPE" --max 300 [--temp 0.7] [--no-think]
+mlxr run mlx-community/Qwen3-4B-4bit -p "Explain RoPE" --max 300 [--temp 0.7] [--think|--no-think]
 mlxr serve mlx-community/Qwen3-4B-4bit --port 1234     # OpenAI-compatible server (--lan prints an API key)
 mlxr run mlx-community/Qwen3-8B-4bit --draft mlx-community/Qwen3-0.6B-4bit   # speculative decoding (or --draft auto)
 mlxr bench mlx-community/Qwen3-4B-4bit      # prefill/decode throughput, verification cost at short and 1,900-token contexts, kernel profile (MLXR_BENCH_NOPROFILE=1 skips it)

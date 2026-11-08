@@ -15,6 +15,10 @@ Qwen 3.5 support: the hybrid Gated DeltaNet architecture. Decode is 6–7% ahead
     argmax everywhere; the tokenizer and the chat template match transformers.
   - Thinking toggle: with thinking on, the prompt opens the `<think>` block and the reply starts with
     the tag, so the app's "Thought for N s" block and the API's `reasoning_content` work as for Qwen3.
+  - Thinking follows each model's own default: the 0.8B and 2B answer directly unless thinking is
+    turned on (their templates make it opt-in, and Qwen's model cards warn that it often loops on them:
+    with the app's default sampling, 4 of 6 seeded replies on the 0.8B and 5 of 6 on the 2B were still
+    thinking after 4,096 tokens; mlx-lm: 3 and 6 of 6). The 4B and larger think unless it is turned off.
   - Chat follow-ups: the recurrent state cannot be rolled back like a KV cache, so the engine saves a
     checkpoint of it 8 tokens before the end of each prompt (before the part the next turn renders
     differently) and the next turn resumes there, with output identical to a fresh run.
@@ -45,6 +49,15 @@ Qwen 3.5 support: the hybrid Gated DeltaNet architecture. Decode is 6–7% ahead
     are unchanged.
 - Multimodal exports no longer copy their vision tower or multi-token-prediction weights into GPU
   memory (201 MB less for Qwen3.5-0.8B; Gemma 3 4B also benefits).
+- **Thinking default per model.** A chat that doesn't say whether to think gets the template's
+  default, as with transformers and mlx-lm: an API request without `enable_thinking`,
+  `chat_template_kwargs` or a reasoning effort, `mlxr run` without `--think`/`--no-think` (new), and
+  the app's Think toggle, which now remembers its setting per model. Settings saved by earlier
+  versions with thinking off keep it off for every model. Qwen3 thinks by default, as before. A
+  `reasoning_effort` other than `none` now turns thinking on.
+- **App settings survive a relaunch.** Loading the saved settings at launch wrote defaults over the
+  ones not read yet (system prompt, context length, draft model, sparse attention, last model), so only
+  the sampling settings were kept.
 
 ## 1.4.0
 
