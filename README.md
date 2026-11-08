@@ -28,7 +28,16 @@ A native macOS app for discovering, downloading and chatting with **MLX models f
 
 Later versions arrive through **MLX Runner → Check for Updates…**. The app checks GitHub at launch and every 6 hours; turn that off in Settings.
 
-The CLI: unpack `mlxr-<version>-macos-arm64.tar.gz` and put `mlxr` on your `PATH`.
+The CLI on its own (no app needed; [the landing page](https://mlx-runner.21no.de/#cli-install) fills in the latest version):
+
+```bash
+curl -LO https://github.com/BackendStack21/mlx-runner/releases/download/v<version>/mlxr-<version>-macos-arm64.tar.gz
+tar -xzf mlxr-<version>-macos-arm64.tar.gz
+sudo mkdir -p /usr/local/bin
+sudo install -m 755 mlxr-<version>-macos-arm64/mlxr /usr/local/bin/mlxr
+```
+
+A browser download is quarantined by macOS and the binary won't start until you run `xattr -d com.apple.quarantine /usr/local/bin/mlxr`. The CLI doesn't update itself: repeat the steps for a new version.
 
 ### Verifying a download
 

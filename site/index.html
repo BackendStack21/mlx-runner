@@ -33,9 +33,9 @@
 <meta name="twitter:image:alt" content="MLX Runner by 21no.de: LLMs at the speed of unified memory. 343 tok/s on Qwen2.5 0.5B, 41 tok/s on Mistral 7B, M2 Pro.">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"MLX Runner","alternateName":"mlxr","description":"A native macOS app to discover, download and chat with MLX models from Hugging Face, with its own Metal inference engine written in Swift. Zero third-party dependencies. Includes an OpenAI-compatible local server with tool calling and the mlxr command-line tool.","url":"https://mlx-runner.21no.de/","image":"https://mlx-runner.21no.de/assets/og.png","screenshot":"https://mlx-runner.21no.de/assets/screenshot-chat.jpg","applicationCategory":"DeveloperApplication","applicationSubCategory":"Machine learning","operatingSystem":"macOS 15 or later (Apple silicon)","processorRequirements":"Apple silicon (arm64)","license":"https://opensource.org/licenses/MIT","isAccessibleForFree":true,"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"downloadUrl":"https://github.com/BackendStack21/mlx-runner/releases/latest","codeRepository":"https://github.com/BackendStack21/mlx-runner","programmingLanguage":"Swift","author":{"@type":"Organization","name":"21no.de","url":"https://21no.de"},"publisher":{"@type":"Organization","name":"21no.de","url":"https://21no.de"}}</script>
 <link rel="preload" href="fonts/SpaceGrotesk.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="site.css">
+<link rel="stylesheet" href="site.css?v=2">
 <script type="application/json" id="release-config">{"repo":"BackendStack21/mlx-runner","assets":[{"id":"dmg","suffix":"-macos-arm64.dmg"},{"id":"cli","suffix":"-macos-arm64.tar.gz"},{"id":"sums","name":"SHA256SUMS"},{"id":"sig","name":"SHA256SUMS.sig"}]}</script>
-<script src="site.js" defer></script>
+<script src="site.js?v=2" defer></script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -290,6 +290,7 @@
         <li><code>mlxr serve &lt;model&gt; --port 1234</code></li>
         <li><code>mlxr bench &lt;model&gt;</code></li>
       </ul>
+      <p class="cli-get">No app needed: <a href="#cli-install">install only the CLI</a>.</p>
     </div>
     <figure class="term">
       <div class="win-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="win-title">zsh · M2 Pro</span><button class="replay" type="button" id="term-replay" aria-label="Replay the terminal session"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
@@ -403,7 +404,7 @@ curl http://localhost:1234/v1/responses \
       <p class="dl-sub" id="dl-version">For Apple silicon Macs running macOS 15 or newer. Free and open source, MIT licensed.</p>
       <div class="cta">
         <a class="btn primary" id="dl-dmg" href="https://github.com/BackendStack21/mlx-runner/releases/latest"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8.5M4.5 7 8 10.5 11.5 7M3 13.5h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Download the app (.dmg)</span></a>
-        <a class="btn ghost" id="dl-cli" href="https://github.com/BackendStack21/mlx-runner/releases/latest">mlxr CLI (.tar.gz)</a>
+        <a class="btn ghost" id="dl-cli" href="#cli-install">Install only the CLI</a>
       </div>
       <div class="table-wrap">
         <table class="assets">
@@ -424,7 +425,23 @@ curl http://localhost:1234/v1/responses \
       <h3>First launch</h3>
       <p>Drag <b>MLX Runner</b> to Applications. It is ad-hoc signed, <b>not notarized by Apple</b>, so macOS blocks the first launch: right-click it and choose <b>Open</b>, or run:</p>
       <div class="cmd"><pre><code>xattr -dr com.apple.quarantine "/Applications/MLX Runner.app"</code></pre><button class="copy" type="button" aria-label="Copy command" data-copy="xattr -dr com.apple.quarantine &quot;/Applications/MLX Runner.app&quot;"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div>
-      <p>Updates then arrive through <b>Check for Updates…</b>, verified before they install. For the CLI, copy <code>mlxr</code> from the archive to a directory on your <code>PATH</code>.</p>
+      <p>Updates then arrive through <b>Check for Updates…</b>, verified before they install.</p>
+      <h3 id="cli-install">Only the CLI</h3>
+      <p><code>mlxr</code> is a single binary and doesn't need the app. In Terminal:</p>
+      <div class="cmd" data-template="curl -LO {url:cli}
+tar -xzf {name:cli}
+sudo mkdir -p /usr/local/bin
+sudo install -m 755 {dir:cli}/mlxr /usr/local/bin/mlxr
+mlxr   # prints its usage line"><pre><code>curl -LO https://github.com/BackendStack21/mlx-runner/releases/download/&lt;tag&gt;/mlxr-&lt;version&gt;-macos-arm64.tar.gz
+tar -xzf mlxr-&lt;version&gt;-macos-arm64.tar.gz
+sudo mkdir -p /usr/local/bin
+sudo install -m 755 mlxr-&lt;version&gt;-macos-arm64/mlxr /usr/local/bin/mlxr
+mlxr   <span class="c"># prints its usage line</span></code></pre><button class="copy" type="button" aria-label="Copy the install commands" data-copy="curl -LO https://github.com/BackendStack21/mlx-runner/releases/download/&lt;tag&gt;/mlxr-&lt;version&gt;-macos-arm64.tar.gz
+tar -xzf mlxr-&lt;version&gt;-macos-arm64.tar.gz
+sudo mkdir -p /usr/local/bin
+sudo install -m 755 mlxr-&lt;version&gt;-macos-arm64/mlxr /usr/local/bin/mlxr
+mlxr"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div>
+      <p>Use <code>curl</code> as shown: macOS quarantines an archive downloaded in a browser, and the binary won't start until you run <code>xattr -d com.apple.quarantine /usr/local/bin/mlxr</code>. It uses the same model library as the app. To update, run the commands again (the CLI doesn't update itself). To check the archive first, see <a href="#verify">Verify</a>.</p>
     </div>
   </section>
 
@@ -433,8 +450,8 @@ curl http://localhost:1234/v1/responses \
     <p class="sub">Every release is built by <a href="https://github.com/BackendStack21/mlx-runner/blob/main/.github/workflows/release.yml">GitHub Actions</a> from a tagged commit. Three independent checks prove the file you have is that build.</p>
     <ol class="steps">
       <li><h3>Download the app, the checksum list and its signature</h3><div class="cmd" data-template="curl -LO {url:dmg}
-curl -LO https://github.com/BackendStack21/mlx-runner/releases/latest/download/SHA256SUMS
-curl -LO https://github.com/BackendStack21/mlx-runner/releases/latest/download/SHA256SUMS.sig"><pre><code>curl -LO https://github.com/BackendStack21/mlx-runner/releases/download/&lt;tag&gt;/MLX-Runner-&lt;version&gt;-macos-arm64.dmg
+curl -LO {url:sums}
+curl -LO {url:sig}"><pre><code>curl -LO https://github.com/BackendStack21/mlx-runner/releases/download/&lt;tag&gt;/MLX-Runner-&lt;version&gt;-macos-arm64.dmg
 curl -LO https://github.com/BackendStack21/mlx-runner/releases/latest/download/SHA256SUMS
 curl -LO https://github.com/BackendStack21/mlx-runner/releases/latest/download/SHA256SUMS.sig</code></pre><button class="copy" type="button" aria-label="Copy command" data-copy="curl -LO https://github.com/BackendStack21/mlx-runner/releases/download/&lt;tag&gt;/MLX-Runner-&lt;version&gt;-macos-arm64.dmg
 curl -LO https://github.com/BackendStack21/mlx-runner/releases/latest/download/SHA256SUMS

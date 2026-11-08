@@ -1,8 +1,9 @@
 // mlx-runner.21no.de: live release data, the token-stream replay, the race, the terminal, tabs.
 //
 // Nothing about a release is baked into the page: the latest release (version, file names, sizes,
-// SHA-256 digests) is read from GitHub's API here. Without JavaScript, or if the API can't be
-// reached, every download link already points at the GitHub "latest release" page.
+// SHA-256 digests) is read from GitHub's API here, and the last one seen is kept for repeat visits.
+// Without JavaScript, or if neither is available, every download link already points at the GitHub
+// "latest release" page.
 //
 // The speed demos replay measured `mlxr bench` numbers (M2 Pro, 16 GB). Nothing runs a model here.
 (() => {
@@ -270,9 +271,14 @@
   }
 
   // ── 5. live release data ──
+  // The release list is asked first: GitHub's /releases/latest has timed out or answered 504 for
+  // minutes at a time while the list answered in under a second. Each request gives up after 8 s.
+  // The last release seen is kept in localStorage: a repeat visit shows it at once, and it stands in
+  // when GitHub can't be reached or rate-limits the visitor (60 unauthenticated requests an hour).
   const config = JSON.parse($("release-config").textContent);
-  const API = `https://api.github.com/repos/${config.repo}/releases/latest`;
-  const CACHE = "mlxr:latest-release";
+  const API = `https://api.github.com/repos/${config.repo}/releases`;
+  const CACHE = "mlxr:release";
+  const FRESH = 10 * 60 * 1000;
   const COPY_ICON = document.querySelector(".copy svg") ? document.querySelector(".copy svg").outerHTML : "";
   const fmtSize = (n) => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(n >= 100 * 1024 * 1024 ? 0 : 1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
   const fmtDate = (iso) => new Date(iso).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
@@ -286,52 +292,78 @@
     return { tag: rel.tag_name, published: rel.published_at, assets, names: new Set((rel.assets || []).map((a) => a.name)) };
   }
 
-  async function load() {
+  // Only the fields the page uses are stored.
+  const trim = (rel) => ({
+    tag_name: rel.tag_name,
+    published_at: rel.published_at,
+    assets: (rel.assets || []).map((a) => ({ name: a.name, size: a.size, digest: a.digest, browser_download_url: a.browser_download_url })),
+  });
+
+  async function get(url) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 8000);
     try {
-      const cached = JSON.parse(sessionStorage.getItem(CACHE) || "null");
-      if (cached && Date.now() - cached.at < 10 * 60 * 1000) return cached.rel;
-    } catch {}
-    const res = await fetch(API, { headers: { accept: "application/vnd.github+json" } });
-    if (res.status === 404) return null; // no release published yet
-    if (!res.ok) throw new Error(`GitHub ${res.status}`);
-    const rel = await res.json();
+      const res = await fetch(url, { headers: { accept: "application/vnd.github+json" }, signal: ctl.signal });
+      if (res.status === 404) return null;
+      if (!res.ok) throw new Error(`GitHub ${res.status}`);
+      return await res.json();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // The newest release that is neither a draft nor a prerelease (what /latest returns), or null if
+  // none is published yet.
+  async function latest() {
     try {
-      sessionStorage.setItem(CACHE, JSON.stringify({ at: Date.now(), rel }));
+      const list = await get(`${API}?per_page=10`);
+      if (Array.isArray(list)) return list.find((r) => !r.draft && !r.prerelease) || null;
     } catch {}
-    return rel;
+    return get(`${API}/latest`);
+  }
+
+  function saved() {
+    try {
+      const s = JSON.parse(localStorage.getItem(CACHE) || "null");
+      if (s && typeof s.at === "number" && s.rel && typeof s.rel.tag_name === "string" && Array.isArray(s.rel.assets)) return s;
+    } catch {}
+    return null;
   }
 
   function fill(r) {
-    const { dmg, cli } = r.assets;
+    const { dmg } = r.assets;
     if (dmg) {
       $("dl-primary").href = dmg.url;
       $("dl-dmg").href = dmg.url;
       $("dl-dmg").querySelector("span").textContent = `Download ${r.tag} (.dmg, ${fmtSize(dmg.size)})`;
     }
-    if (cli) $("dl-cli").href = cli.url;
     $("release-line").textContent = `${r.tag} · Apple silicon · macOS 15 or newer`;
     $("release-status").textContent = `Latest: ${r.tag}, released ${fmtDate(r.published)}. Built and signed by GitHub Actions.`;
     for (const tr of document.querySelectorAll("tr[data-asset]")) {
       const a = r.assets[tr.dataset.asset];
-      if (!a) {
-        tr.hidden = true;
-        continue;
-      }
+      tr.hidden = !a;
+      if (!a) continue;
       const link = tr.querySelector("[data-link]");
       link.href = a.url;
       link.textContent = a.name;
       tr.querySelector("[data-size]").textContent = fmtSize(a.size);
-      const hash = tr.querySelector("[data-hash]");
-      if (a.sha256) {
-        const b = document.createElement("button");
-        b.className = "sha";
-        b.type = "button";
-        b.title = "Copy SHA-256";
-        b.setAttribute("aria-label", `Copy the SHA-256 of ${a.name}`);
-        b.dataset.copy = a.sha256;
-        b.innerHTML = `<code>${a.sha256.slice(0, 10)}…${a.sha256.slice(-6)}</code>${COPY_ICON}`;
-        hash.replaceWith(b);
-      } else hash.textContent = "in SHA256SUMS";
+      // fill runs twice when a saved release is shown first, so the cell keeps its data-hash marker
+      let hash;
+      if (/^[0-9a-f]{64}$/.test(a.sha256)) {
+        hash = document.createElement("button");
+        hash.className = "sha";
+        hash.type = "button";
+        hash.title = "Copy SHA-256";
+        hash.setAttribute("aria-label", `Copy the SHA-256 of ${a.name}`);
+        hash.dataset.copy = a.sha256;
+        hash.innerHTML = `<code>${a.sha256.slice(0, 10)}…${a.sha256.slice(-6)}</code>${COPY_ICON}`;
+      } else {
+        hash = document.createElement("span");
+        hash.className = "muted";
+        hash.textContent = "in SHA256SUMS";
+      }
+      hash.dataset.hash = "";
+      tr.querySelector("[data-hash]").replaceWith(hash);
     }
     for (const el of document.querySelectorAll("[data-name]")) {
       const a = r.assets[el.dataset.name];
@@ -370,18 +402,29 @@
     for (const el of document.querySelectorAll("[data-needs]")) el.hidden = !r.names.has(el.dataset.needs);
   }
 
-  load()
-    .then((rel) => {
-      if (!rel) {
-        $("release-status").textContent = "No release is published yet. Watch the repository on GitHub, or build it from source below.";
-        for (const el of document.querySelectorAll("[data-needs]")) el.hidden = true;
-        return;
-      }
-      fill(parse(rel));
-    })
-    .catch(() => {
-      $("release-status").textContent = "Couldn't load the release details right now; the links open the latest release on GitHub.";
-    });
+  const last = saved();
+  if (last) fill(parse(last.rel));
+  if (!last || Date.now() - last.at > FRESH) {
+    latest()
+      .then((rel) => {
+        if (!rel) {
+          if (last) return;
+          $("release-status").textContent = "No release is published yet. Watch the repository on GitHub, or build it from source below.";
+          for (const el of document.querySelectorAll("[data-needs]")) el.hidden = true;
+          return;
+        }
+        const t = trim(rel);
+        try {
+          localStorage.setItem(CACHE, JSON.stringify({ at: Date.now(), rel: t }));
+        } catch {}
+        fill(parse(t));
+      })
+      .catch(() => {
+        $("release-status").textContent = last
+          ? `Showing ${last.rel.tag_name}, saved from an earlier visit: GitHub didn't answer just now, so a newer release may exist.`
+          : "Couldn't load the release details right now; the links open the latest release on GitHub.";
+      });
+  }
 
   // ── copy buttons ──
   document.addEventListener("click", (e) => {
