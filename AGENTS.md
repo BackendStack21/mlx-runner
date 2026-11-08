@@ -8,9 +8,9 @@ How to work on MLX Runner (a native macOS app by 21no.de).
   Foundation, Metal, Network, CryptoKit, Security). No SwiftPM packages, no vendored code, no Python —
   scripts are Swift (`swift scripts/<name>.swift`) or POSIX shell.
 - **Performance changes need numbers.** Measure with `mlxr bench <model>` (`MLXR_BENCH_DECODE=1` for
-  decode only) before and after; keep a change only if it wins. Nothing else may use the GPU while
+  decode only; for runs use `mlxr run <model> "<prompt>" --temp 0 --seed 42 --max 256`) before and after; keep a change only if it wins. Nothing else may use the GPU while
   benchmarking.
-- **Correctness gates:** `swift test` passes; greedy output stays token-identical; prefill matches
+- **Correctness gates:** `swift test` passes; greedy output (`--temp 0 --seed 42 --max 256`) stays token-identical; prefill matches
   incremental decode for every architecture (`prefillMatchesIncrementalDecode`). Model tests run when the
   model is installed (`mlxr download <repo>`), otherwise they skip. The 14B cases need
   `MLXR_TEST_LARGE=1` (with the Gemma suite they do not fit 16 GB).

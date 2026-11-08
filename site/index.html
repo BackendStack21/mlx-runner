@@ -283,10 +283,11 @@
     <div class="cli-copy">
       <p class="kicker">Command line</p>
       <h2><code class="grad">mlxr</code>, the same engine in your terminal.</h2>
-      <p>Search, download, run, serve and benchmark from a shell, on the app's model library. Every number on this page came from <code>mlxr bench</code>.</p>
+      <p>Ollama-style commands on the app's model library: pull, run (or chat interactively), list, show, serve and bench. Every number on this page came from <code>mlxr bench</code>.</p>
       <ul class="cmds">
-        <li><code>mlxr download mlx-community/Qwen3-4B-4bit</code></li>
-        <li><code>mlxr run &lt;model&gt; -p "Explain RoPE" --no-think</code></li>
+        <li><code>mlxr pull mlx-community/Qwen3-4B-4bit</code></li>
+        <li><code>mlxr run mlx-community/Qwen3-4B-4bit "Explain RoPE" --no-think</code></li>
+        <li><code>mlxr list</code>, <code>mlxr show &lt;model&gt;</code></li>
         <li><code>mlxr serve &lt;model&gt; --port 1234</code></li>
         <li><code>mlxr bench &lt;model&gt;</code></li>
       </ul>
@@ -294,13 +295,12 @@
     </div>
     <figure class="term">
       <div class="win-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="win-title">zsh · M2 Pro</span><button class="replay" type="button" id="term-replay" aria-label="Replay the terminal session"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
-<pre id="term" tabindex="0" aria-label="Terminal session"><code><span class="p">$</span> mlxr run mlx-community/Qwen2.5-0.5B-Instruct-4bit -p "Write a haiku about Metal shaders." --temp 0
-<span class="o">Loaded Qwen2.5-0.5B-Instruct-4bit [qwen2, q4g64, 24 layers, chatML] in 0.51s
-[prompt: 37 tokens, 831 tok/s, ttft 0.045s]</span>
-Metal shaders: a new art,
-Transforming code into magic,
-A new form of art.
-<span class="o">[generated 19 tokens at 339.0 tok/s, stop: stop, drafts accepted 0/0]</span>
+<pre id="term" tabindex="0" aria-label="Terminal session"><code><span class="p">$</span> mlxr run mlx-community/Llama-3.2-1B-Instruct-4bit "Write a haiku about Metal shaders." --temp 0 --seed 42 --max 256
+<span class="o">Loaded Llama-3.2-1B-Instruct-4bit [llama, q4g64, 16 layers, llama3] in 0.96s
+sparse attention off: the context length (4096) is below 5128 tokens, where it starts</span>
+Metal's dark delight
+Glowing shards of fiery
+Beauty in the dark
 
 <span class="p">$</span> mlxr bench mlx-community/Qwen2.5-0.5B-Instruct-4bit
 <span class="c"># … kernel and sampler micro-benchmarks …</span>
@@ -309,7 +309,7 @@ A new form of art.
 <span class="hl">decode @1024:  295.3 tok/s</span><span class="o">  (wall 3.39 ms, gpu 3.38 ms per token)</span>
 <span class="o">sampled @  16:  345.5 tok/s  (wall 2.89 ms, gpu 2.89 ms per token)
 sampled @1024:  290.3 tok/s  (wall 3.44 ms, gpu 3.44 ms per token)</span></code></pre>
-      <figcaption>Real output from 1.1.1 on an M2 Pro (16 GB). "sampled" is the app's default sampler, on the GPU too.</figcaption>
+      <figcaption>Real output on an M2 Pro (16 GB): the run is from 2.0.0 (the two notes above the haiku go to stderr), the bench is from 1.1.1. "sampled" is the app's default sampler, on the GPU too.</figcaption>
     </figure>
   </section>
 
@@ -432,15 +432,15 @@ curl http://localhost:1234/v1/responses \
 tar -xzf {name:cli}
 sudo mkdir -p /usr/local/bin
 sudo install -m 755 {dir:cli}/mlxr /usr/local/bin/mlxr
-mlxr   # prints its usage line"><pre><code>curl -LO https://github.com/BackendStack21/mlx-runner/releases/download/&lt;tag&gt;/mlxr-&lt;version&gt;-macos-arm64.tar.gz
+mlxr   # prints help"><pre><code>curl -LO https://github.com/BackendStack21/mlx-runner/releases/download/&lt;tag&gt;/mlxr-&lt;version&gt;-macos-arm64.tar.gz
 tar -xzf mlxr-&lt;version&gt;-macos-arm64.tar.gz
 sudo mkdir -p /usr/local/bin
 sudo install -m 755 mlxr-&lt;version&gt;-macos-arm64/mlxr /usr/local/bin/mlxr
-mlxr   <span class="c"># prints its usage line</span></code></pre><button class="copy" type="button" aria-label="Copy the install commands" data-copy="curl -LO https://github.com/BackendStack21/mlx-runner/releases/download/&lt;tag&gt;/mlxr-&lt;version&gt;-macos-arm64.tar.gz
+mlxr   <span class="c"># prints help</span></code></pre><button class="copy" type="button" aria-label="Copy the install commands" data-copy="curl -LO https://github.com/BackendStack21/mlx-runner/releases/download/&lt;tag&gt;/mlxr-&lt;version&gt;-macos-arm64.tar.gz
 tar -xzf mlxr-&lt;version&gt;-macos-arm64.tar.gz
 sudo mkdir -p /usr/local/bin
 sudo install -m 755 mlxr-&lt;version&gt;-macos-arm64/mlxr /usr/local/bin/mlxr
-mlxr"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div>
+mlxr   # prints help"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div>
       <p>Use <code>curl</code> as shown: macOS quarantines an archive downloaded in a browser, and the binary won't start until you run <code>xattr -d com.apple.quarantine /usr/local/bin/mlxr</code>. It uses the same model library as the app. To update, run the commands again (the CLI doesn't update itself). To check the archive first, see <a href="#verify">Verify</a>.</p>
     </div>
   </section>
