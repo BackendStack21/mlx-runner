@@ -40,12 +40,32 @@ public struct ChatHistory: Sendable {
         ChatHistory(file: ModelStore.root.deletingLastPathComponent().appendingPathComponent("history"))
     }
 
-    /// The saved lines, oldest first.
+    /// Keeps the file bounded: past the cap, rewrites it with the newest lines (about half the cap).
+    private func trimIfOversized(_ file: URL) {
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.intValue,
+              size > Self.sizeLimit else { return }
+        let kept = tail(file, keep: Self.sizeLimit / 2).joined(separator: "\n") + "\n"
+        let tmp = file.deletingLastPathComponent().appendingPathComponent(".history-\(UUID().uuidString)")
+        guard FileManager.default.createFile(atPath: tmp.path, contents: Data(kept.utf8), attributes: [.posixPermissions: 0o600]) else { return }
+        if (try? FileManager.default.replaceItemAt(file, withItemAt: tmp)) == nil { try? FileManager.default.removeItem(at: tmp) }
+    }
+
+    /// The newest lines of the file (at most the last `sizeLimit` bytes), oldest first.
+    private func tail(_ file: URL, keep: Int) -> [String] {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return [] }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd() else { return [] }
+        let start = end > UInt64(keep) ? end - UInt64(keep) : 0
+        guard (try? handle.seek(toOffset: start)) != nil, let data = try? handle.readToEnd() else { return [] }
+        var lines = String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
+        if start > 0, !lines.isEmpty { lines.removeFirst() }  // a cut-off first line
+        return lines
+    }
+
+    /// The saved lines, oldest first (the newest ones when the file is larger than the cap).
     public func lines() -> [String] {
-        guard let file,
-              let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.intValue,
-              size <= Self.sizeLimit, let data = try? Data(contentsOf: file) else { return [] }
-        return String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
+        guard let file else { return [] }
+        return tail(file, keep: Self.sizeLimit)
     }
 
     /// Adds a line (creates the file with mode 0600). Failures are ignored: history is a convenience.
@@ -61,6 +81,8 @@ public struct ChatHistory: Sendable {
         _ = try? handle.seekToEnd()
         let flat = line.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\r", with: " ")
         try? handle.write(contentsOf: Data((flat + "\n").utf8))
+        try? handle.close()
+        trimIfOversized(file)
     }
 }
 
@@ -92,8 +114,8 @@ public struct ChatSettings {
 
 /// `/set parameter` keys: Ollama's, with what the engine does with each.
 enum ChatParameter {
-    static let noEffect: Set<String> = ["num_gpu", "main_gpu", "use_mmap", "num_thread", "num_batch"]
-    static let stored: Set<String> = ["typical_p", "num_keep", "stop", "draft_num_predict", "num_ctx"]
+    static let noEffect: Set<String> = ["num_gpu", "main_gpu", "use_mmap", "num_thread", "num_batch",
+                                        "typical_p", "num_keep", "stop", "draft_num_predict"]
     static let unsupported: Set<String> = ["presence_penalty", "frequency_penalty"]
 
     enum Outcome { case set, ignored }
@@ -131,7 +153,7 @@ enum ChatParameter {
         case "seed":
             guard let v = UInt64(value) else { throw CLIError.failure("invalid value '\(value)' for seed") }
             p.seed = v
-        case _ where stored.contains(key): return .set
+        case "num_ctx": _ = try int(SamplingLimits.context)
         case _ where noEffect.contains(key): return .ignored
         case _ where unsupported.contains(key): throw CLIError.failure("\(key) is not supported by the engine")
         default: throw CLIError.failure("unknown parameter '\(key)'")
@@ -249,7 +271,7 @@ public final class ChatSession {
         let cancelled = token.isCancelled || final?.stopReason == "cancelled"
         if failure == nil && !cancelled { emit(splitter.flush()) }
         if cancelled || failure != nil {
-            messages.removeLast()
+            if !cancelled { messages.removeLast() }  // a cancelled turn keeps the user message
             console.out("\n")
             if !cancelled, let failure { console.err("Error: \(CLI.message(for: failure))\n") }
             return
@@ -310,7 +332,7 @@ public final class ChatSession {
         case "/clear":
             messages = []
             say("Cleared session context")
-        case "/set": await set(line, args)
+        case "/set": return await set(line, args)
         case "/show": show(args)
         case "/load": return await load(args.joined(separator: " "))
         case "/save": save(args.first)
@@ -319,21 +341,21 @@ public final class ChatSession {
         return nil
     }
 
-    private func set(_ line: String, _ args: [String]) async {
+    private func set(_ line: String, _ args: [String]) async -> Int32? {
         guard let sub = args.first else {
             say("Usage:\n  /set parameter ...\n  /set system <string>\n  /set history|nohistory\n  /set wordwrap|nowordwrap\n  /set format json\n  /set noformat\n  /set verbose|quiet\n  /set think|nothink")
-            return
+            return nil
         }
         switch sub {
         case "parameter":
-            guard args.count >= 3 else { say("Usage:\n  /set parameter <param> <value>"); return }
-            setParameter(args[1], args.dropFirst(2).joined(separator: " "))
+            guard args.count >= 3 else { say("Usage:\n  /set parameter <param> <value>"); return nil }
+            return await setParameter(args[1], args.dropFirst(2).joined(separator: " "))
         case "system":
-            guard let range = line.range(of: "system") else { return }
+            guard let range = line.range(of: "system") else { return nil }
             let rest = line[range.upperBound...].trimmingCharacters(in: .whitespaces)
-            guard !rest.isEmpty else { say("Usage:\n  /set system <string>"); return }
+            guard !rest.isEmpty else { say("Usage:\n  /set system <string>"); return nil }
             if rest.hasPrefix("\"\"\"") {
-                guard let text = gather(rest) else { return }
+                guard let text = gather(rest) else { return nil }
                 settings.system = text
             } else {
                 settings.system = rest
@@ -362,24 +384,43 @@ public final class ChatSession {
             say("Set 'nothink' mode.")
         default: unknown("/set \(sub)")
         }
+        return nil
     }
 
-    private func setParameter(_ key: String, _ value: String) {
+    private func setParameter(_ key: String, _ value: String) async -> Int32? {
         var p = settings.parameters
         do {
             switch try ChatParameter.apply(key, value, to: &p) {
             case .set:
+                if key == "num_ctx", let ctx = Int(value), ctx != settings.contextLength,
+                   let code = await reload(contextLength: ctx) { return code }
                 settings.parameters = p
                 settings.userParameters[key] = value
                 say("Set parameter '\(key)' to '\(value)'")
             case .ignored:
-                say("warning: parameter '\(key)' has no effect: mlxr runs on the GPU with its own settings")
+                say("warning: parameter '\(key)' has no effect: mlxr does not use it")
             }
         } catch {
             say("Couldn't set parameter: \"\(CLI.message(for: error))\"")
         }
+        return nil
     }
 
+    /// Reloads the current model with a new context length; the conversation is kept.
+    private func reload(contextLength: Int) async -> Int32? {
+        interrupts.enter(.loading)
+        defer { interrupts.enter(.idle) }
+        do {
+            settings.info = try await engine.load(directory: settings.directory, draftDirectory: settings.draftDirectory,
+                                                  contextLength: contextLength, sparse: settings.sparse)
+            settings.contextLength = contextLength
+            return nil
+        } catch {
+            say("Error: \(CLI.message(for: error))")
+            failed = true
+            return 1
+        }
+    }
     private func show(_ args: [String]) {
         guard let sub = args.first else {
             say("Available Commands:\n  /show info         Show details for this model\n  /show license      Show model license\n  /show modelfile    Show Modelfile for this model\n  /show parameters   Show parameters for this model\n  /show system       Show system message\n  /show template     Show prompt template")
@@ -477,7 +518,7 @@ extension CLI {
     static func liveLineSource(console: Console, history: ChatHistory) -> LineSource {
         if console.stdinIsTTY && console.stdoutIsTTY {
             let noHistory = ["1", "true"].contains((console.env["OLLAMA_NOHISTORY"] ?? "").lowercased())
-            return LibeditLineSource(history: noHistory ? [] : history.lines())
+            return LibeditLineSource(history: noHistory ? [] : history.lines(), console: console)
         }
         return ConsoleLineSource(console: console)
     }

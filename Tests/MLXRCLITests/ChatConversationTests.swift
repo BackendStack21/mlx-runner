@@ -139,8 +139,7 @@ struct ChatConversationTests {
         await h.session(lines).run()
         #expect(h.engine.chats.count == 1)
         #expect(h.engine.chats.first?.messages == [ChatMessage(role: .user, content: "hi")])
-        #expect(lines.prompts.last == ">>> " || lines.prompts.contains(">>> "))
-        #expect(lines.prompts.contains("... "), "\(lines.prompts)")
+        #expect(lines.prompts == [">>> ", "... ", "... ", ">>> ", ">>> "], "\(lines.prompts)")
     }
 
     @Test func ctrlDOnAnEmptyLineExitsWithZero() async throws {

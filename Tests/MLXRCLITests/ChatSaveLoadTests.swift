@@ -97,7 +97,8 @@ struct ChatSaveLoadTests {
         let lines = ScriptedLines(["/load \(LibraryFixture.qwen8)", "/bye"])
         let code = await h.session(lines).run()
         #expect(h.stderr.contains("bad weights"), "\(h.stderr)")
-        #expect(code != 0 || lines.remaining == 0, "after a failed load the engine has no model: leave, do not generate")
+        #expect(code == 1, "a failed load ends the chat with exit 1")
+        #expect(lines.remaining == 1, "the next line (/bye) is never read: the chat ended at the failed load")
         #expect(h.engine.chats.isEmpty)
         #expect(h.engine.loads.count == 1)
     }

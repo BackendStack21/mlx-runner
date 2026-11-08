@@ -51,12 +51,14 @@ struct ChatSlashCommandTests {
         #expect(p?.repetitionPenalty == 1.2 && p?.repetitionWindow == 32 && p?.seed == 42 && p?.maxTokens == 99)
     }
 
-    @Test func setParameterAcceptsTheOtherOllamaKeys() async throws {
+    @Test func setParameterNumCtxIsAcceptedAndOtherInertKeysWarn() async throws {
         let h = try ChatHarness()
-        await h.chat(["/set parameter typical_p 0.5", "/set parameter num_keep 4", "/set parameter stop END",
-                      "/set parameter draft_num_predict 3", "/set parameter num_ctx 8192"])
-        for k in ["typical_p", "num_keep", "stop", "draft_num_predict", "num_ctx"] {
-            #expect(h.all.contains("Set parameter '\(k)' to"), "\(k): \(h.all)")
+        await h.chat(["/set parameter num_ctx 8192", "/set parameter typical_p 0.5", "/set parameter num_keep 4",
+                      "/set parameter stop END", "/set parameter draft_num_predict 3"])
+        #expect(h.all.contains("Set parameter 'num_ctx' to '8192'"), "\(h.all)")
+        for k in ["typical_p", "num_keep", "stop", "draft_num_predict"] {
+            #expect(h.stderr.contains(k) && h.stderr.contains("no effect"), "\(k): \(h.stderr)")
+            #expect(!h.all.contains("Set parameter '\(k)'"), "\(k) must not claim success")
         }
         #expect(!h.all.contains("Couldn't set parameter"))
     }
