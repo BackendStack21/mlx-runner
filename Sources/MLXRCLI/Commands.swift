@@ -10,7 +10,8 @@ extension CLI {
 
     /// The command table with its outside world injected.
     public static func commands(services: CLIServices = .live, library: ModelLibrary = .live, presets: PresetStore = .live,
-                                catalog: Catalog = .standard, now: @escaping @Sendable () -> Date = { Date() }) -> [Command] {
+                                catalog: Catalog = .standard, now: @escaping @Sendable () -> Date = { Date() },
+                                hub: HubServices = .live) -> [Command] {
         let ctxRange = SamplingLimits.context
         return [
             Command(name: "run", summary: "Run a model", args: [Arg("MODEL", kind: .model), Arg("PROMPT", optional: true, variadic: true)],
@@ -67,10 +68,8 @@ extension CLI {
                                               ctx: inv.int("ctx") ?? 8192, lan: inv.bool("lan"), apiKey: inv.string("api-key"),
                                               draft: inv.string("draft"), sparse: inv.string("sparse"))
                     }),
-            Command(name: "download", aliases: ["pull"], summary: "Download a model from Hugging Face", args: [Arg("MODEL", kind: .model)],
-                    run: { inv, _ in try await legacyDownload(inv.positionals[0]) }),
-            Command(name: "show", summary: "Show information for a model", args: [Arg("MODEL", kind: .model)],
-                    run: { _, _ in throw CLIError.failure("show is not available yet") }),
+            pullCommand(library: library, presets: presets, catalog: catalog, hub: hub),
+            showCommand(library: library, presets: presets, catalog: catalog),
             Command(name: "search", summary: "Search Hugging Face for MLX models", args: [Arg("QUERY", variadic: true)],
                     options: [
                         Opt(long: "limit", value: .int(1...100), defaultText: "25", help: "maximum number of results"),
