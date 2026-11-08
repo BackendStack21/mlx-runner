@@ -17,8 +17,10 @@ let package = Package(
             swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
         ),
         .executableTarget(name: "MLXRunner", dependencies: ["MLXEngine"]),
-        .executableTarget(name: "mlxr", dependencies: ["MLXEngine"]),
+        .target(name: "MLXRCLI", dependencies: ["MLXEngine"]),
+        .executableTarget(name: "mlxr", dependencies: ["MLXRCLI"]),
         .testTarget(name: "MLXEngineTests", dependencies: ["MLXEngine"]),
+        .testTarget(name: "MLXRCLITests", dependencies: ["MLXRCLI", "MLXEngine"]),
     ],
     swiftLanguageModes: [.v5]
 )
