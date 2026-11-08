@@ -3,41 +3,15 @@ import MLXEngine
 
 // The original `mlxr` command bodies, kept as they were while the commands move onto the parser kit.
 
-func fail(_ msg: String) -> Never {
-    FileHandle.standardError.write((msg + "\n").data(using: .utf8)!)
-    exit(1)
-}
-
-
-func resolve(_ s: String) -> URL {
-    if FileManager.default.fileExists(atPath: s) { return URL(fileURLWithPath: s) }
-    if let m = ModelStore.scan().first(where: { $0.repo == s || $0.name == s }) { return m.directory }
-    fail("model not found: \(s) (try `mlxr download \(s)`)")
-}
-
 /// `--draft <model|auto>`: the draft model for speculative decoding.
-func draftDirectory(_ s: String?, target: URL) -> URL? {
+func draftDirectory(_ s: String?, target: URL) throws -> URL? {
     guard let s else { return nil }
-    guard s == "auto" else { return resolve(s) }
+    guard s == "auto" else { return try resolveModel(s) }
     guard let m = InferenceEngine.autoDraft(for: target) else {
         print("no installed draft model pairs with \(target.lastPathComponent); running without one")
         return nil
     }
     return m.directory
-}
-
-/// `--sparse <on|off|N>`: sparse decode attention for long contexts (N: long-range keys; the window,
-/// minimum context and shared selection still come from MLXR_SPARSE_*). Without the
-/// option: MLXR_SPARSE_ATTN, which defaults to on.
-func sparseOption(_ s: String?) -> SparseAttention? {
-    guard let s else { return SparseAttention.fromEnvironment }
-    switch s.lowercased() {
-    case "on", "1": return .configured(topK: SparseAttention.standard.topK)
-    case "off", "0": return nil
-    default:
-        guard let n = Int(s), n > 0 else { fail("--sparse takes on, off or a number of long-range keys") }
-        return .configured(topK: n)
-    }
 }
 
 func sparseSummary(_ info: LoadedModelInfo) -> String {
@@ -94,9 +68,9 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
     let tokenizer = try Tokenizer(directory: dir)
     var text: [Int32] = []
     if let path = ProcessInfo.processInfo.environment["MLXR_BENCH_TEXT"] {
-        guard let s = try? String(contentsOfFile: path, encoding: .utf8) else { fail("cannot read MLXR_BENCH_TEXT \(path)") }
+        guard let s = try? String(contentsOfFile: path, encoding: .utf8) else { throw CLIError.failure("cannot read MLXR_BENCH_TEXT \(path)") }
         text = tokenizer.encode(s).map { Int32($0) }.filter { $0 >= 0 && Int($0) < V }
-        guard !text.isEmpty else { fail("MLXR_BENCH_TEXT \(path) has no tokens") }
+        guard !text.isEmpty else { throw CLIError.failure("MLXR_BENCH_TEXT \(path) has no tokens") }
         let bos = tokenizer.bosToken.flatMap { b in tokenizer.tokenId(b).map { " (prompts start with \(b), id \($0))" } } ?? ""
         print("long-context prompt: \(path), \(text.count) tokens (repeated to length)\(bos)")
     } else {
@@ -107,9 +81,9 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
     // Hybrid models (recurrent state): every rerun of a position first restores the state there.
     var base: Transformer.RecurrentSnapshot?, last: Transformer.RecurrentSnapshot?
     func mark() { if t.config.isHybrid { last = t.snapshotRecurrent() } }
-    func seek(_ pos: Int) {
+    func seek(_ pos: Int) throws {
         guard t.config.isHybrid, t.recurrentPosition != pos else { return }
-        guard let s = [base, last].compactMap({ $0 }).first(where: { $0.position == pos }) else { fail("no recurrent snapshot at \(pos)") }
+        guard let s = [base, last].compactMap({ $0 }).first(where: { $0.position == pos }) else { throw CLIError.failure("no recurrent snapshot at \(pos)") }
         t.restoreRecurrent(s)
     }
     let sparse = t.sparseAvailable ? original : nil
@@ -170,7 +144,7 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
             for (label, mode) in modes {
                 t.sparse = mode
                 t.seedSampler(1)
-                seek(ctx)
+                try seek(ctx)
                 var tokens: [Int] = []
                 var gpu = 0.0
                 let s = Date()
@@ -198,12 +172,12 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
             // position, so the cache stays dense decode's).
             var match = 0, control = 0
             var input = Int32(first)
-            seek(ctx)
+            try seek(ctx)
             for i in 0..<steps {
                 t.sparse = sparse
                 mark()
                 if argmax(try logits([input], offset: ctx + i)) == dense[i] { match += 1 }
-                seek(ctx + i)
+                try seek(ctx + i)
                 t.sparse = nil
                 if argmax(try logits([input], offset: ctx + i)) == dense[i] { control += 1 }
                 input = Int32(dense[i])
@@ -215,13 +189,13 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
                 var kl: [Double] = [], nllDense = 0.0, nllSparse = 0.0, agree = 0
                 let edges: [Float] = [0.1, 0.5, 1]
                 var bucketTotal = [Int](repeating: 0, count: edges.count + 1), bucketAgree = bucketTotal
-                seek(ctx)
+                try seek(ctx)
                 for i in 0..<N {
                     let input = text[(off + ctx + i) % text.count], target = Int(text[(off + ctx + i + 1) % text.count])
                     t.sparse = sparse
                     mark()
                     let ls = try logits([input], offset: ctx + i)
-                    seek(ctx + i)
+                    try seek(ctx + i)
                     t.sparse = nil
                     let ld = try logits([input], offset: ctx + i)
                     let pd = logSoftmax(ld), ps = logSoftmax(ls)
@@ -272,7 +246,7 @@ func benchLongContext(_ t: Transformer, dir: URL, bench: LongBench) throws {
                     let q = tokenizer.encode("\n\nQuestion: What is the passkey for door \(door)?\nAnswer: The passkey for door \(door) is").map { Int32($0) }
                     for (mi, mode) in [nil, sparse].enumerated() {
                         t.sparse = nil
-                        seek(ctx)
+                        try seek(ctx)
                         _ = try t.forward(Array(q.dropLast()), offset: ctx)
                         t.sparse = mode
                         var out: [Int] = []
@@ -316,7 +290,7 @@ func legacySearch(_ query: String) async throws {
 }
 
 func legacyDownload(_ repo: String) async throws {
-    guard RepoID.isValid(repo) else { fail("invalid repo id: \(repo) (expected owner/name)") }
+    try validateRepoID(repo)
     let details = try await HubClient.details(repo)
     if !details.isSupported { print("warning: \(details.modelType ?? "unknown") architecture is not supported by the engine") }
     print("Downloading \(repo) (\(formatBytes(details.downloadSize)))")
@@ -327,12 +301,8 @@ func legacyDownload(_ repo: String) async throws {
         print(String(format: "\r  %5.1f%%  %@ / %@  %@/s   ", p * 100, formatBytes(Int(done)), formatBytes(Int(total)), formatBytes(Int(speed))), terminator: "")
     }
     dl.onEvent = { print("\n  \($0)") }
-    do {
-        let dir = try await dl.start()
-        print("\nSaved to \(dir.path)")
-    } catch {
-        fail("\ndownload failed: \(error.localizedDescription)")
-    }
+    let dir = try await performDownload(start: { try await dl.start() })
+    print("\nSaved to \(dir.path)")
 
 }
 
@@ -345,7 +315,7 @@ func legacyList() {
 }
 
 func legacyTokenize(_ model: String, _ text: String) throws {
-    let tok = try Tokenizer(directory: resolve(model))
+    let tok = try Tokenizer(directory: try resolveModel(model))
     let ids = tok.encode(text)
     print(ids)
     print(ids.map { tok.token($0) ?? "?" })
@@ -354,7 +324,7 @@ func legacyTokenize(_ model: String, _ text: String) throws {
 }
 
 func legacyBench(_ model: String) throws {
-    let dir = resolve(model)
+    let dir = try resolveModel(model)
     // Long-context decode (opt-in): MLXR_BENCH_CTX=8192,32768 adds a section at the end.
     let longBench = LongBench(env: ProcessInfo.processInfo.environment)
     let t = try Transformer(directory: dir, contextLength: max(4096, (longBench.contexts.max() ?? 0) + longBench.margin + 64))
@@ -454,10 +424,10 @@ struct LegacyRun {
 }
 
 func legacyRun(_ o: LegacyRun) async throws {
-    let sparseArg = sparseOption(o.sparse)
+    let sparseArg = try sparseSetting(o.sparse)
     let engine = InferenceEngine.shared
-    let dir = resolve(o.model)
-    let info = try await engine.load(directory: dir, draftDirectory: draftDirectory(o.draft, target: dir), contextLength: o.ctx, sparse: sparseArg)
+    let dir = try resolveModel(o.model)
+    let info = try await engine.load(directory: dir, draftDirectory: try draftDirectory(o.draft, target: dir), contextLength: o.ctx, sparse: sparseArg)
     print("Loaded \(info.name) [\(info.modelType), \(info.quantization), \(info.layers) layers, \(info.chatFormat)]\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s")
     print(sparseSummary(info))
     var params = SamplingParameters()
@@ -490,17 +460,17 @@ func legacyRun(_ o: LegacyRun) async throws {
 }
 
 func legacyServe(model: String, port: UInt16, ctx: Int, lan: Bool, apiKey: String?, draft: String?, sparse: String?) async throws {
-    let sparseArg = sparseOption(sparse)
+    let sparseArg = try sparseSetting(sparse)
     // LAN mode always needs a key: use --api-key / MLXR_API_KEY, or generate one.
     var key = apiKey ?? ProcessInfo.processInfo.environment["MLXR_API_KEY"]
     if lan && key == nil { key = OpenAIServer.generateAPIKey() }
-    let dir = resolve(model)
-    let info = try await InferenceEngine.shared.load(directory: dir, draftDirectory: draftDirectory(draft, target: dir), contextLength: ctx, sparse: sparseArg)
+    let dir = try resolveModel(model)
+    let info = try await InferenceEngine.shared.load(directory: dir, draftDirectory: try draftDirectory(draft, target: dir), contextLength: ctx, sparse: sparseArg)
     print("Loaded \(info.name)\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s")
     print(sparseSummary(info))
     let server = OpenAIServer(port: port, allowLAN: lan, apiKey: key)
     server.onLog = { print($0) }
-    do { try server.start() } catch { fail("cannot start server: \(error.localizedDescription)") }
+    try startServer { try server.start() }
     print("OpenAI-compatible server on http://\(lan ? "0.0.0.0" : "127.0.0.1"):\(port)/v1  (Ctrl-C to stop)")
     if let key { print("API key (send as 'Authorization: Bearer <key>'): \(key)") }
     while true { try await Task.sleep(nanoseconds: 3_600_000_000_000) }

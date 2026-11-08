@@ -43,7 +43,7 @@ extension CLI {
                     if rest.hasPrefix("=") { rest.removeFirst() }
                     inline = rest
                 }
-                opt = o; shown = "--\(o.long)"
+                opt = o; shown = o.short.map { "-\($0), --\(o.long)" } ?? "--\(o.long)"
             }
             let o = opt!
             let raw: String
