@@ -1407,6 +1407,9 @@ html:not(.js) .car-btn {
 .first-launch h3 {
   font-size: 22px;
 }
+.first-launch h3:not(:first-child) {
+  margin-top: 40px;
+}
 .first-launch p {
   color: var(--muted);
   font-size: 15px;
