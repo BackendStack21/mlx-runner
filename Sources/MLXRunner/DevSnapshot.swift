@@ -105,21 +105,25 @@ enum DevSnapshot {
             let server = ServerController.shared
             server.start()
             try? await Task.sleep(nanoseconds: 500_000_000)
-            if server.running { await tourRequests(port: server.port, model: state.loadedInfo?.name ?? "model") }
+            if server.running { await tourRequests(port: server.port, model: state.loadedInfo?.name ?? "model", key: server.effectiveAPIKey) }
             await shot("server", window: window, dir: dir, settle: 1.5)
             server.stop()
             NSApp.terminate(nil)
         }
     }
 
-    /// Calls the running local server so its request log has something to show.
-    private static func tourRequests(port: Int, model: String) async {
+    /// Calls the running local server so its request log has something to show. Sends the API key when the
+    /// server requires one (a saved "Require API key"), so the log shows answers, not 401s.
+    private static func tourRequests(port: Int, model: String, key: String?) async {
         let base = "http://127.0.0.1:\(port)/v1"
-        _ = try? await URLSession.shared.data(from: URL(string: "\(base)/models")!)
+        var list = URLRequest(url: URL(string: "\(base)/models")!)
+        if let key { list.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        _ = try? await URLSession.shared.data(for: list)
         for prompt in ["Say hello in five words.", "Name three planets, comma-separated."] {
             var req = URLRequest(url: URL(string: "\(base)/chat/completions")!)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            if let key { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
             let body: [String: Any] = ["model": model, "messages": [["role": "user", "content": prompt]],
                                        "max_tokens": 40, "enable_thinking": false]
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)

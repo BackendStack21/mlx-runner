@@ -139,6 +139,7 @@ struct HubRow: View {
                     Text(model.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                     if ModelStore.isInstalled(model.id) {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.good).font(.system(size: 11))
+                            .accessibilityLabel("Downloaded")
                     }
                     if state.downloads[model.id] != nil {
                         ProgressView().controlSize(.mini)
@@ -156,7 +157,7 @@ struct HubRow: View {
             }
             Spacer()
             if let q = model.quantizationHint { Badge(text: q, color: Theme.accent) }
-            if let t = model.modelType { Badge(text: t, color: model.isRunnable ? Theme.accent2 : .orange) }
+            if let t = model.modelType { ArchitectureBadge(type: t, supported: model.isRunnable) }
         }
         .padding(.vertical, 4)
     }
@@ -222,7 +223,7 @@ struct ModelDetailView: View {
     }
 
     @ViewBuilder private func modelBadges(_ d: HubModelDetails) -> some View {
-        if let t = d.modelType { Badge(text: t, color: d.isSupported ? Theme.accent2 : .orange, systemImage: "cpu") }
+        if let t = d.modelType { ArchitectureBadge(type: t, supported: d.isSupported) }
         if let b = d.bits { Badge(text: "\(b)-bit", color: Theme.accent, systemImage: "square.stack.3d.down.right") }
         Badge(text: Fmt.bytes(d.downloadSize), color: .secondary, systemImage: "internaldrive")
     }

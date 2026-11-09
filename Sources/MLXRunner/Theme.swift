@@ -6,6 +6,10 @@ enum Theme {
     static let pink = Color(red: 0.98, green: 0.35, blue: 0.62)
     static let gradient = LinearGradient(colors: [accent, accent2], startPoint: .topLeading, endPoint: .bottomTrailing)
     static let warmGradient = LinearGradient(colors: [pink, accent], startPoint: .topLeading, endPoint: .bottomTrailing)
+    /// Fills behind white text (user bubble, New Chat, update pill, send button). The cyan end of `gradient`
+    /// gives white text about 2.2:1; this deeper blue keeps it at or above 4.5:1 along the whole fill.
+    static let fillEnd = Color(red: 0.0, green: 0.45, blue: 0.8)
+    static let fillGradient = LinearGradient(colors: [accent, fillEnd], startPoint: .topLeading, endPoint: .bottomTrailing)
     static let good = Color(red: 0.2, green: 0.8, blue: 0.5)
 }
 
@@ -61,6 +65,7 @@ struct Badge: View {
 
 /// Animated aurora background used behind empty states.
 struct AuroraBackground: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var phase = false
     var body: some View {
         ZStack {
@@ -72,7 +77,9 @@ struct AuroraBackground: View {
                 .offset(x: phase ? 20 : -40, y: phase ? 160 : 60)
         }
         .allowsHitTesting(false)
+        .accessibilityHidden(true)
         .onAppear {
+            guard !reduceMotion else { return }
             withAnimation(.easeInOut(duration: 9).repeatForever(autoreverses: true)) { phase.toggle() }
         }
     }
@@ -88,5 +95,21 @@ struct GradientIcon: View {
             .frame(width: size, height: size)
             .background(Theme.gradient, in: RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
             .shadow(color: Theme.accent.opacity(0.45), radius: 12, y: 6)
+            .accessibilityHidden(true)   // decorative: every use sits next to a text title
+    }
+}
+
+/// A model's architecture. An unsupported one also gets a warning symbol and says so to VoiceOver,
+/// so the state never depends on the orange colour alone.
+struct ArchitectureBadge: View {
+    let type: String
+    let supported: Bool
+
+    var body: some View {
+        Badge(text: type, color: supported ? Theme.accent2 : .orange,
+              systemImage: supported ? nil : "exclamationmark.triangle.fill")
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(supported ? "\(type) architecture" : "\(type) architecture, not supported")
+            .help(supported ? "Architecture: \(type)" : "The \(type) architecture isn't supported by the built-in engine yet")
     }
 }

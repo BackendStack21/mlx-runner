@@ -8,6 +8,7 @@ final class ServerController {
     static let shared = ServerController()
     var running = false
     var port: Int = UserDefaults.standard.object(forKey: "serverPort") as? Int ?? 1234
+    /// Not saved on purpose: a server started at launch always binds to localhost; LAN serving is chosen each session.
     var allowLAN = false
     /// Require `Authorization: Bearer <apiKey>` even on localhost (always required in LAN mode).
     var requireAPIKey: Bool = UserDefaults.standard.bool(forKey: "serverRequireAPIKey") {
@@ -85,6 +86,7 @@ final class ServerController {
 struct ServerView: View {
     @Environment(AppState.self) private var state
     @State private var server = ServerController.shared
+    @AppStorage(LaunchKeys.startServer) private var startAtLaunch = false
 
     var body: some View {
         @Bindable var server = server
@@ -127,6 +129,9 @@ struct ServerView: View {
                 }
                 .padding(16)
                 .glassCard()
+
+                Toggle("Start the server (localhost) when MLX Runner opens", isOn: $startAtLaunch)
+                    .help("Also in Settings. Pair it with \"Load the last model\" so clients get answers right after a restart.")
 
                 if let e = server.error {
                     Label(e, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
@@ -228,7 +233,7 @@ struct ServerView: View {
                 .foregroundStyle(.white)
                 .frame(width: 44)
                 .padding(.vertical, 3)
-                .background(method == "GET" ? Theme.accent2 : Theme.accent, in: RoundedRectangle(cornerRadius: 5))
+                .background(method == "GET" ? Theme.fillEnd : Theme.accent, in: RoundedRectangle(cornerRadius: 5))
             Text(verbatim: "http://localhost:\(String(server.port))\(path)").font(.system(size: 12.5, design: .monospaced)).textSelection(.enabled)
         }
     }
@@ -238,12 +243,25 @@ struct SettingsView: View {
     @Environment(AppState.self) private var state
     @Environment(UpdateController.self) private var updates
     @AppStorage(UpdateController.autoCheckKey) private var autoUpdateCheck = true
+    @AppStorage(LaunchKeys.loadLastModel) private var loadLastModelAtLaunch = false
+    @AppStorage(LaunchKeys.startServer) private var startServerAtLaunch = false
     /// Edited locally; persisted to the Keychain (never UserDefaults).
     @State private var hfToken = ""
     @State private var tokenSaveFailed = false
+    @State private var confirmDeleteAll = false
+
+    private var deleteAllTitle: String {
+        let n = state.conversations.count
+        return n == 1 ? "Delete 1 chat?" : "Delete all \(n) chats?"
+    }
 
     var body: some View {
         Form {
+            Section("When MLX Runner opens") {
+                Toggle("Load the last model", isOn: $loadLastModelAtLaunch)
+                Toggle("Start the local server", isOn: $startServerAtLaunch)
+                Text(lastModelCaption).font(.caption).foregroundStyle(.secondary)
+            }
             Section("Hugging Face") {
                 SecureField("Access token (for gated models)", text: $hfToken)
                     .onSubmit(saveToken)
@@ -264,7 +282,14 @@ struct SettingsView: View {
                 LabeledContent("Also scanning") { Text(ModelStore.huggingFaceCache.path).foregroundStyle(.secondary) }
             }
             Section("Chats") {
-                Button("Delete all chats", role: .destructive) { state.clearAllChats() }
+                Button("Delete All Chats…", role: .destructive) { confirmDeleteAll = true }
+                    .disabled(state.conversations.isEmpty)
+                    .confirmationDialog(deleteAllTitle, isPresented: $confirmDeleteAll, titleVisibility: .visible) {
+                        Button("Delete All Chats", role: .destructive) { state.clearAllChats() }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("This can't be undone.")
+                    }
             }
             Section("Updates") {
                 Toggle("Check for updates automatically", isOn: $autoUpdateCheck)
@@ -280,8 +305,13 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 520, height: 560)
+        .frame(width: 520, height: 620)
         .onAppear { hfToken = HFToken.stored ?? "" }
+    }
+
+    private var lastModelCaption: String {
+        let name = state.lastModel?.name
+        return "Off by default: a model takes memory as soon as it loads. " + (name.map { "Last model: \($0)." } ?? "No model has been loaded yet.")
     }
 
     private func saveToken() {

@@ -34,6 +34,8 @@ struct MyModelsView: View {
                                 Text("\(Int(d.progress * 100))%").font(.system(size: 11).monospacedDigit()).frame(width: 36)
                                 Button { state.cancelDownload(repo) } label: { Image(systemName: "xmark.circle.fill") }
                                     .buttonStyle(.borderless)
+                                    .accessibilityLabel("Cancel download of \(repo)")
+                                    .help("Cancel download")
                             }
                         }
                     }
@@ -101,9 +103,10 @@ struct ModelCard: View {
                 } label: { Image(systemName: "ellipsis.circle") }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
+                    .accessibilityLabel("More actions for \(model.name)")
             }
             HStack(spacing: 6) {
-                if let t = model.modelType { Badge(text: t, color: model.isSupported ? Theme.accent2 : .orange) }
+                if let t = model.modelType { ArchitectureBadge(type: t, supported: model.isSupported) }
                 if let b = model.bits { Badge(text: "\(b)-bit", color: Theme.accent) }
                 Badge(text: Fmt.bytes(model.sizeBytes), color: .secondary)
                 if model.source == .huggingFaceCache { Badge(text: "HF cache", color: .secondary) }

@@ -228,7 +228,7 @@ struct UpdatePill: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 9)
                 .padding(.vertical, 4)
-                .background(Theme.gradient, in: Capsule())
+                .background(Theme.fillGradient, in: Capsule())
             }
             .buttonStyle(.plain)
             .help("MLX Runner \(latest) is available (you have \(updates.current))")

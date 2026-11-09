@@ -98,6 +98,26 @@ enum LoadState: Equatable {
     case failed(String)
 }
 
+/// The load-time settings a model was loaded with. Compared with the current settings (not with
+/// `LoadedModelInfo`, whose values the engine clamps or turns off per model) to tell when a reload is due.
+struct LoadSettings: Equatable {
+    var contextLength: Int
+    var draftModel: String
+    var sparse: SparseAttention?
+}
+
+/// A load that failed while another model stayed loaded (the engine checks before it unloads).
+struct LoadFailure: Equatable {
+    var model: String
+    var message: String
+}
+
+/// UserDefaults keys for what happens when the app opens.
+enum LaunchKeys {
+    static let loadLastModel = "launchLoadLastModel"
+    static let startServer = "launchStartServer"
+}
+
 // MARK: - App state
 
 @MainActor @Observable
@@ -109,7 +129,22 @@ final class AppState {
     var downloads: [String: DownloadState] = [:]
     var generatingConversation: UUID?
     var showInspector = true
-    var draft: String = ""
+    /// Unsent composer text, per chat.
+    var drafts: [UUID: String] = [:]
+    /// The model picker popover (lifted here so ⌘L and the sidebar footer can open it).
+    var showModelPicker = false
+    /// The user message being edited in place (the composer's ⌘⏎ is off meanwhile).
+    var editingMessage: UUID?
+    /// A chat whose reply waits for a model load to finish (send with no model loaded).
+    var pendingSend: UUID?
+    /// The settings the loaded model was loaded with (nil when none is loaded).
+    var loadedWith: LoadSettings?
+    /// A failed load that left the previous model loaded.
+    var loadFailure: LoadFailure?
+    /// The first scan of installed models has finished (until then "no models" is unknown, not true).
+    var modelsScanned = false
+    /// Downloads in progress; changes only when one starts or ends (the sidebar reads it, not `downloads`).
+    var activeDownloadCount = 0
     var liveTokens = 0
     var liveTokensPerSecond: Double = 0
     /// The reply being generated. Streamed here, not into `conversations`: every view that
@@ -196,6 +231,36 @@ final class AppState {
 
     var isGenerating: Bool { generatingConversation != nil }
 
+    var isLoading: Bool {
+        if case .loading = loadState { return true }
+        return false
+    }
+
+    /// The model loaded last time (any session), if it is still installed and runnable.
+    var lastModel: LocalModel? {
+        guard let p = lastModelPath else { return nil }
+        return localModels.first { $0.directory.path == p && $0.isSupported }
+    }
+
+    /// A reply can start: a model is loaded, loading, or the last one can be loaded on send.
+    var canStartReply: Bool { loadedInfo != nil || isLoading || lastModel != nil }
+
+    /// Settings as the next load would use them.
+    var currentLoadSettings: LoadSettings {
+        LoadSettings(contextLength: contextLength, draftModel: draftModel, sparse: sparseConfig)
+    }
+
+    /// Load-time settings changed since the loaded model was loaded.
+    var needsReload: Bool {
+        guard loadedInfo != nil, let used = loadedWith else { return false }
+        return used != currentLoadSettings
+    }
+
+    /// One VoiceOver announcement (never per streamed token).
+    func announce(_ text: String) {
+        AccessibilityNotification.Announcement(text).post()
+    }
+
     // MARK: Models
 
     func refreshModels() {
@@ -205,20 +270,48 @@ final class AppState {
                 self.localModels = models
                 // A draft pick whose model was removed falls back to none (the picker has no such row).
                 if !["", "auto"].contains(self.draftModel), !models.contains(where: { $0.directory.path == self.draftModel }) { self.draftModel = "" }
+                if !self.modelsScanned {
+                    self.modelsScanned = true
+                    self.runLaunchActions()
+                }
             }
         }
     }
 
+    /// "When MLX Runner opens" settings: load the last model, start the local server. Both off by default.
+    private func runLaunchActions() {
+        guard !DevSnapshot.isActive else { return }
+        let d = UserDefaults.standard
+        if d.bool(forKey: LaunchKeys.loadLastModel) { reloadLast() }
+        if d.bool(forKey: LaunchKeys.startServer) { ServerController.shared.start() }
+    }
+
+    /// Reloads the loaded model with the current settings (context length, draft, sparse attention).
+    func reloadModel() {
+        guard let dir = loadedInfo?.directory, let m = localModels.first(where: { $0.directory == dir }) else { return }
+        load(m)
+    }
+
     func load(_ model: LocalModel) {
         guard model.isSupported else {
-            loadState = .failed("\(model.modelType ?? "This") architecture is not supported yet.")
+            let message = "\(model.modelType ?? "This") architecture is not supported yet."
+            loadState = .failed(message)
+            if let id = pendingSend {
+                pendingSend = nil
+                if let i = index(id) {
+                    conversations[i].messages.append(StoredMessage(role: .assistant, content: "", error: message))
+                    scheduleSave()
+                }
+            }
             return
         }
         stopGeneration()
+        loadFailure = nil
         loadState = .loading(model.name)
         let ctx = contextLength
         let draftSetting = draftModel
         let sparse = sparseConfig
+        let settings = currentLoadSettings
         let models = localModels
         Task {
             do {
@@ -239,9 +332,32 @@ final class AppState {
                 }.value
                 let info = try await engine.load(directory: model.directory, draftDirectory: draft, contextLength: ctx, sparse: sparse)
                 loadState = .loaded(info)
+                loadedWith = settings
                 lastModelPath = model.directory.path
+                announce("\(info.name) loaded")
+                if let id = pendingSend {
+                    pendingSend = nil
+                    generate(in: id)
+                }
             } catch {
-                loadState = .failed(error.localizedDescription)
+                let message = error.localizedDescription
+                if let previous = engine.info {
+                    // The engine checks a model before unloading the current one: that one is still loaded.
+                    loadState = .loaded(previous)
+                    loadFailure = LoadFailure(model: model.name, message: message)
+                } else {
+                    loadState = .failed(message)
+                    loadedWith = nil
+                }
+                announce("Couldn't load \(model.name)")
+                if let id = pendingSend {
+                    pendingSend = nil
+                    if let i = index(id) {
+                        conversations[i].messages.append(StoredMessage(role: .assistant, content: "",
+                                                                       error: "Couldn't load \(model.name): \(message)"))
+                        scheduleSave()
+                    }
+                }
             }
         }
     }
@@ -250,6 +366,8 @@ final class AppState {
         stopGeneration()
         engine.unload()
         loadState = .idle
+        loadedWith = nil
+        loadFailure = nil
     }
 
     func reloadLast() {
@@ -275,6 +393,7 @@ final class AppState {
         }
         let dl = ModelDownload(details: details, destination: destination)
         activeDownloads[details.id] = dl
+        activeDownloadCount = activeDownloads.count
         downloads[details.id] = DownloadState(total: Int64(details.downloadSize))
         let repo = details.id
         let throttle = Throttle(interval: 0.1)
@@ -289,18 +408,23 @@ final class AppState {
                 _ = try await dl.start()
                 downloads[repo] = nil
                 refreshModels()
+                announce("Downloaded \(repo.split(separator: "/").last.map(String.init) ?? repo)")
+                // Bounces the Dock icon once when the app is in the background; cleared on activation.
+                if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
             } catch is CancellationError {
                 downloads[repo] = nil
             } catch {
                 downloads[repo]?.error = error.localizedDescription
             }
             activeDownloads[repo] = nil
+            activeDownloadCount = activeDownloads.count
         }
     }
 
     func cancelDownload(_ repo: String) {
         activeDownloads[repo]?.cancel()
         activeDownloads[repo] = nil
+        activeDownloadCount = activeDownloads.count
         downloads[repo] = nil
     }
 
@@ -319,13 +443,76 @@ final class AppState {
         return c.id
     }
 
-    func deleteChat(_ id: UUID) {
+    /// Chats in sidebar order (most recently updated first).
+    var sortedChats: [Conversation] { conversations.sorted { $0.updated > $1.updated } }
+
+    /// Deletes a chat. With an undo manager, Edit ▸ Undo Delete Chat puts it back where it was.
+    func deleteChat(_ id: UUID, undoManager: UndoManager? = nil) {
+        guard let i = index(id) else { return }
         if generatingConversation == id { stopGeneration() }
-        conversations.removeAll { $0.id == id }
+        if pendingSend == id { pendingSend = nil }
+        let order = sortedChats
+        let removed = conversations.remove(at: i)
+        drafts[id] = nil
         if case .chat(let s) = selection, s == id {
-            selection = conversations.first.map { .chat($0.id) } ?? .discover
+            // The next chat down the list (or the one above when it was the last), as Mail and Notes do.
+            let rest = order.filter { $0.id != id }
+            let at = order.firstIndex { $0.id == id } ?? 0
+            selection = rest.isEmpty ? .discover : .chat(rest[min(at, rest.count - 1)].id)
         }
+        if let undoManager {
+            undoManager.registerUndo(withTarget: self) { s in
+                MainActor.assumeIsolated { s.restoreChat(removed, at: i, undoManager: undoManager) }
+            }
+            undoManager.setActionName("Delete Chat")
+        }
+        announce("Deleted \(removed.title)")
         scheduleSave()
+    }
+
+    private func restoreChat(_ c: Conversation, at i: Int, undoManager: UndoManager) {
+        guard index(c.id) == nil else { return }
+        conversations.insert(c, at: min(i, conversations.count))
+        selection = .chat(c.id)
+        undoManager.registerUndo(withTarget: self) { s in
+            MainActor.assumeIsolated { s.deleteChat(c.id, undoManager: undoManager) }
+        }
+        undoManager.setActionName("Delete Chat")
+        scheduleSave()
+    }
+
+    /// Selects the next (`offset` 1) or previous (-1) chat in sidebar order.
+    func selectAdjacentChat(_ offset: Int) {
+        let order = sortedChats
+        guard !order.isEmpty else { return }
+        guard case .chat(let id) = selection, let i = order.firstIndex(where: { $0.id == id }) else {
+            selection = .chat(order[offset > 0 ? 0 : order.count - 1].id)
+            return
+        }
+        let j = i + offset
+        guard order.indices.contains(j) else { return }
+        selection = .chat(order[j].id)
+    }
+
+    var selectedChatID: UUID? {
+        if case .chat(let id) = selection { return id }
+        return nil
+    }
+
+    func copyLastReply() {
+        guard let id = selectedChatID, let i = index(id),
+              let m = conversations[i].messages.last(where: { $0.role == .assistant && !$0.content.isEmpty }) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(m.content, forType: .string)
+        announce("Copied")
+    }
+
+    /// Opens the model picker, switching to a chat first when another screen is showing.
+    func openModelPicker() {
+        if selectedChatID == nil {
+            if let recent = sortedChats.first { selection = .chat(recent.id) } else { newChat() }
+        }
+        showModelPicker = true
     }
 
     func renameChat(_ id: UUID, _ title: String) {
@@ -337,6 +524,8 @@ final class AppState {
     func clearAllChats() {
         stopGeneration()
         conversations.removeAll()
+        drafts.removeAll()
+        pendingSend = nil
         selection = .discover
         scheduleSave()
     }
@@ -345,27 +534,43 @@ final class AppState {
 
     func send(_ text: String, in id: UUID) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !isGenerating, let i = index(id) else { return }
+        guard !trimmed.isEmpty, !isGenerating, pendingSend == nil, let i = index(id) else { return }
         conversations[i].messages.append(StoredMessage(role: .user, content: trimmed))
         if conversations[i].title == "New Chat" {
             conversations[i].title = String(trimmed.split(separator: "\n").first ?? "").prefix(48).description
         }
-        generate(in: id)
+        startReply(in: id)
         // Persist the user's message right away, not only when generation finishes.
         saveNow()
     }
 
     func regenerate(in id: UUID) {
-        guard !isGenerating, let i = index(id) else { return }
+        guard !isGenerating, pendingSend == nil, let i = index(id) else { return }
         while let last = conversations[i].messages.last, last.role == .assistant {
             conversations[i].messages.removeLast()
         }
         guard conversations[i].messages.last?.role == .user else { return }
+        startReply(in: id)
+    }
+
+    /// Generates now, or once a model has loaded: the one loading, else the last one used.
+    private func startReply(in id: UUID) {
+        if loadedInfo == nil {
+            if isLoading {
+                pendingSend = id
+                return
+            }
+            if let m = lastModel {
+                pendingSend = id
+                load(m)
+                return
+            }
+        }
         generate(in: id)
     }
 
     func editAndResend(_ messageID: UUID, newText: String, in id: UUID) {
-        guard !isGenerating, let i = index(id),
+        guard !isGenerating, pendingSend == nil, let i = index(id),
               let m = conversations[i].messages.firstIndex(where: { $0.id == messageID }) else { return }
         conversations[i].messages.removeSubrange(m...)
         send(newText, in: id)
@@ -470,7 +675,24 @@ final class AppState {
             }
             generatingConversation = nil
             scheduleSave()
+            announce("Reply finished")
         }
+    }
+
+    /// Sampling settings from the loaded model's generation_config.json over the engine defaults (the reply
+    /// limit is kept: it is not a sampling setting).
+    func resetSamplingToModelDefaults() {
+        var p = SamplingParameters()
+        if let dir = loadedInfo?.directory {
+            let d = GenerationDefaults.load(directory: dir)
+            if let v = d.temperature { p.temperature = v }
+            if let v = d.topP { p.topP = v }
+            if let v = d.topK { p.topK = v }
+            if let v = d.minP { p.minP = v }
+            if let v = d.repetitionPenalty { p.repetitionPenalty = v }
+        }
+        p.maxTokens = sampling.maxTokens
+        sampling = p
     }
 
     private func update(_ conv: UUID, _ msg: UUID, _ body: (inout StoredMessage) -> Void) {

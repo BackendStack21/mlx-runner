@@ -33,6 +33,9 @@ public struct GenerationStats: Sendable, Hashable, Codable {
     public var draftCycles: Int? = nil
     public var draftSeconds: Double? = nil
     public var verifySeconds: Double? = nil
+    /// Chat turns (not counting the system prompt) left out of the prompt so it fits the context
+    /// window, oldest first; nil when the whole conversation was sent.
+    public var droppedMessages: Int? = nil
     public init() {}
 }
 
@@ -270,14 +273,8 @@ public final class InferenceEngine: @unchecked Sendable {
             queue.async {
                 do {
                     let start = Date()
-                    self.model = nil
-                    self.draftModel = nil
-                    self.tokenizer = nil
-                    self.info = nil
-                    self.cachedTokens = []
-                    self.draftCached = []
-                    self.trimState = [:]
-                    self.tokenTexts = nil
+                    // Checks that need no GPU memory run first: a model that cannot load (bad tokenizer, an
+                    // incompatible draft, too big for this Mac) leaves the current one loaded and serving.
                     let tok = try Tokenizer(directory: directory)
                     if let draftDirectory {
                         try Self.checkDraftCompatible(target: directory, targetTokenizer: tok, draft: draftDirectory)
@@ -296,6 +293,15 @@ public final class InferenceEngine: @unchecked Sendable {
                         sparse = nil
                         sparseNote = "its index does not fit in memory at this context length"
                     }
+                    // From here on the new model is built: free the current one first.
+                    self.model = nil
+                    self.draftModel = nil
+                    self.tokenizer = nil
+                    self.info = nil
+                    self.cachedTokens = []
+                    self.draftCached = []
+                    self.trimState = [:]
+                    self.tokenTexts = nil
                     let model = try Transformer(directory: directory, contextLength: contextLength, sparse: sparse)
                     if sparse != nil, !model.sparseAvailable { sparseNote = model.sparseOffReason ?? "unavailable" }
                     var draft: Transformer?
@@ -387,12 +393,12 @@ public final class InferenceEngine: @unchecked Sendable {
         return stream(token, parameters: parameters, revealToolMarkers: !defs.isEmpty, nameChoices: constrainToolNames) { tok, tpl in
             guard let tpl else { throw EngineError.invalidFile("No model loaded") }
             let enableThinking = enableThinking ?? tpl.thinksByDefault
-            let ids = self.fitToContext(messages, template: tpl, tokenizer: tok,
-                                        reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking,
-                                        conversationID: conversationID, tools: defs, prefill: prefill)
+            let (ids, dropped) = self.fitToContext(messages, template: tpl, tokenizer: tok,
+                                                   reserve: min(parameters.maxTokens, 1024), enableThinking: enableThinking,
+                                                   conversationID: conversationID, tools: defs, prefill: prefill)
             // A prompt that opened the reasoning block (Qwen 3.5): the reply text starts with the tag, as
             // it does for models that write it themselves, so reasoning splitters see it.
-            return (ids, tpl.opensThinking(enableThinking: enableThinking, prefill: prefill) ? "<think>\n" : nil)
+            return (ids, tpl.opensThinking(enableThinking: enableThinking, prefill: prefill) ? "<think>\n" : nil, dropped)
         }
     }
 
@@ -403,13 +409,13 @@ public final class InferenceEngine: @unchecked Sendable {
             var ids = tok.encode(prompt)
             // Models such as Llama, Mistral and Gemma expect BOS on raw prompts (`Tokenizer.addBosToken`).
             if tok.addBosToken, let b = tok.bosToken, let id = tok.tokenId(b), ids.first != id { ids.insert(id, at: 0) }
-            return (ids, nil)
+            return (ids, nil, 0)
         }
     }
 
     private func stream(_ token: CancelToken, parameters: SamplingParameters, revealToolMarkers: Bool = false,
                         nameChoices: [String]? = nil,
-                        _ makeTokens: @escaping (Tokenizer, ChatTemplate?) throws -> (ids: [Int], lead: String?)) -> AsyncThrowingStream<GenerationEvent, Error> {
+                        _ makeTokens: @escaping (Tokenizer, ChatTemplate?) throws -> (ids: [Int], lead: String?, dropped: Int)) -> AsyncThrowingStream<GenerationEvent, Error> {
         AsyncThrowingStream { cont in
             cont.onTermination = { _ in token.cancel() }
             queue.async {
@@ -421,11 +427,11 @@ public final class InferenceEngine: @unchecked Sendable {
                 self.cancelLock.lock(); self.currentToken = token; self.cancelLock.unlock()
                 defer { self.cancelLock.lock(); self.currentToken = nil; self.cancelLock.unlock() }
                 do {
-                    let (tokens, lead) = try makeTokens(tok, self.template)
+                    let (tokens, lead, dropped) = try makeTokens(tok, self.template)
                     let reveal = revealToolMarkers
                         ? Set((self.template?.toolCallMarkerTokens ?? []).compactMap { tok.tokenId($0) }) : []
                     try self.run(tokens: tokens, parameters: parameters, reveal: reveal, nameChoices: nameChoices, lead: lead,
-                                 token: token) { cont.yield($0) }
+                                 dropped: dropped, token: token) { cont.yield($0) }
                     cont.finish()
                 } catch {
                     cont.finish(throwing: error)
@@ -450,7 +456,7 @@ public final class InferenceEngine: @unchecked Sendable {
     /// the whole window on every turn.
     private func fitToContext(_ messages: [ChatMessage], template: ChatTemplate, tokenizer: Tokenizer,
                               reserve: Int, enableThinking: Bool, conversationID: String?,
-                              tools: [ToolDefinition] = [], prefill: String? = nil) -> [Int] {
+                              tools: [ToolDefinition] = [], prefill: String? = nil) -> (ids: [Int], dropped: Int) {
         let limit = (model?.maxSeq ?? Int.max) - reserve
         // Content is tokenized as plain text (see renderMarked), normalised up front if needed.
         let msgs = tokenizer.usesNFC ? messages.map {
@@ -462,7 +468,7 @@ public final class InferenceEngine: @unchecked Sendable {
         let turns = msgs.filter { $0.role != .system }
         guard let first = turns.first else {
             let r = template.renderMarked(msgs, enableThinking: enableThinking, tools: tools, prefill: prefill)
-            return tokenizer.encode(r.text, plainRanges: r.content)
+            return (tokenizer.encode(r.text, plainRanges: r.content), 0)
         }
         let key = conversationID ?? (first.role.rawValue + "\u{0}" + first.content)
         if trimState.count > 256 { trimState = [:] }
@@ -493,7 +499,7 @@ public final class InferenceEngine: @unchecked Sendable {
             }
         }
         trimState[key] = dropped
-        return tokens
+        return (tokens, dropped)
     }
 
     /// `reveal`: special tokens whose text is emitted (tool-call markers); others decode to nothing.
@@ -503,10 +509,11 @@ public final class InferenceEngine: @unchecked Sendable {
 
     /// `lead`: text emitted before the first generated token (it is part of the prompt).
     private func run(tokens: [Int], parameters: SamplingParameters, reveal: Set<Int> = [], nameChoices: [String]? = nil,
-                     lead: String? = nil, token: CancelToken, emit: (GenerationEvent) -> Void) throws {
+                     lead: String? = nil, dropped: Int = 0, token: CancelToken, emit: (GenerationEvent) -> Void) throws {
         guard let model, let tok = tokenizer else { throw EngineError.invalidFile("No model loaded") }
         var stats = GenerationStats()
         stats.promptTokens = tokens.count
+        if dropped > 0 { stats.droppedMessages = dropped }
         guard !tokens.isEmpty else { throw EngineError.invalidFile("Empty prompt") }
         guard tokens.count < model.maxSeq else { throw EngineError.contextFull }
 
