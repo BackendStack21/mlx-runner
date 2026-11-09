@@ -15,10 +15,17 @@ public enum LineEvent: Equatable, Sendable {
 public protocol LineSource: AnyObject {
     /// Shows `prompt` (`>>> ` or `... `) and returns the next event.
     func read(prompt: String) -> LineEvent
+    /// Ctrl-C while the chat waits for input: makes a `read` in progress return `.interrupt`, from any
+    /// thread. Nil when the source cannot be woken: Ctrl-C at its prompt then ends the process (130).
+    var interrupter: (@Sendable () -> Void)? { get }
+}
+
+extension LineSource {
+    public var interrupter: (@Sendable () -> Void)? { nil }
 }
 
 /// The `readLine()` fallback used when stdin or stdout is not a terminal: each line is one event,
-/// the end of input is `.eof`. Writes nothing to stdout.
+/// the end of input is `.eof`. Writes nothing to stdout. Ctrl-C at its prompt ends the process.
 public final class ConsoleLineSource: LineSource {
     private let console: Console
     public init(console: Console) { self.console = console }
@@ -188,10 +195,16 @@ public final class ChatSession {
 
     private func say(_ s: String) { console.err(s + "\n") }
 
+    /// Between turns: Ctrl-C wakes the prompt when the line source can show it (Ollama's "Use Ctrl + d
+    /// or /bye to exit."), and ends the process otherwise.
+    private func awaitInput() {
+        if let wake = lines.interrupter { interrupts.enter(.prompt, onCancel: wake) } else { interrupts.enter(.idle) }
+    }
+
     /// Reads and handles input until `/bye`, `/exit` or Ctrl-D; returns the exit code.
     @discardableResult
     public func run() async -> Int32 {
-        interrupts.enter(.idle)
+        awaitInput()
         while true {
             switch lines.read(prompt: ">>> ") {
             case .eof: return 0
@@ -268,7 +281,7 @@ public final class ChatSession {
                 }
             }
         } catch { failure = error }
-        interrupts.enter(.idle)
+        awaitInput()
         let cancelled = userCancel.isSet || final?.stopReason == "cancelled"
         if failure == nil && !cancelled { emit(splitter.flush()) }
         if cancelled || failure != nil {
@@ -410,7 +423,7 @@ public final class ChatSession {
     /// Reloads the current model with a new context length; the conversation is kept.
     private func reload(contextLength: Int) async -> Int32? {
         interrupts.enter(.loading)
-        defer { interrupts.enter(.idle) }
+        defer { awaitInput() }
         do {
             settings.info = try await engine.load(directory: settings.directory, draftDirectory: settings.draftDirectory,
                                                   contextLength: contextLength, sparse: settings.sparse)
@@ -473,7 +486,7 @@ public final class ChatSession {
         do {
             let info = try await engine.load(directory: dir, draftDirectory: settings.draftDirectory,
                                              contextLength: settings.contextLength, sparse: settings.sparse)
-            interrupts.enter(.idle)
+            awaitInput()
             var next = settings
             next.model = name; next.repo = r.repo; next.directory = dir; next.info = info; next.preset = r.preset
             next.parameters = CLI.samplingDefaults(directory: dir, console: console)
@@ -490,7 +503,7 @@ public final class ChatSession {
             }
             return nil
         } catch {
-            interrupts.enter(.idle)
+            awaitInput()
             say("Error: \(CLI.message(for: error))")
             failed = true
             return 1

@@ -59,15 +59,9 @@ extension CLI {
         let destination = try hub.destination(repo)
         let renderer = PullRenderer(console: console)
         let hooks = DownloadHooks(progress: { renderer.update(done: $0, total: $1, speed: $2) }, event: { _ in })
-        let task = Task { try await performDownload(start: { try await hub.download(details, destination, hooks) }) }
-        deps.interrupts.enter(.downloading, onCancel: { task.cancel() })
-        let dir: URL
-        do { dir = try await task.value } catch {
-            renderer.finish()
-            if deps.interrupts.wasInterrupted || error is CancellationError { throw CLIError.interrupted }
-            throw error
+        let dir = try await interruptibleDownload(deps.interrupts, renderer: renderer) {
+            try await hub.download(details, destination, hooks)
         }
-        renderer.finish()
         console.err("verifying sha256 digest\nwriting manifest\nsuccess\n")
         return dir
     }
@@ -118,6 +112,7 @@ extension CLI {
         if interrupts.wasInterrupted { throw CLIError.interrupted }
         console.err("Loaded \(info.name) [\(info.modelType), \(info.quantization), \(info.layers) layers, \(info.chatFormat)]"
                     + "\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s\n")
+        if let requested = inv.int("ctx"), let note = contextNote(requested: requested, info: info) { console.err(note + "\n") }
         console.err(sparseSummary(info) + "\n")
         let thinking: Bool? = inv.bool("no-think") ? false : inv.has("think") ? inv.string("think") != "false" : nil
         guard let prompt = oneShotPrompt else {

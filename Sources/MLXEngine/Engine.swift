@@ -58,6 +58,8 @@ public struct LoadedModelInfo: Sendable, Hashable {
     public var thinksByDefault: Bool = false
     /// The chat template defines native tool calling.
     public var supportsTools: Bool = false
+    /// How the model writes a call inside `<tool_call>` (ChatML): JSON, or XML for Qwen 3.5.
+    public var toolCallSyntax: ToolCallSyntax = .json
     /// Layers that decode with sparse attention from `sparseMinContext` tokens on (0: dense decode).
     public var sparseLayers: Int = 0
     /// Long-range keys per sparse decode step, and the context length where sparse decode starts.
@@ -72,13 +74,13 @@ public struct LoadedModelInfo: Sendable, Hashable {
                 contextLength: Int, layers: Int, hiddenSize: Int, chatFormat: String, supportsThinking: Bool,
                 loadSeconds: Double, thinksByDefault: Bool = false, supportsTools: Bool = false,
                 sparseLayers: Int = 0, sparseTopK: Int = 0, sparseMinContext: Int = 0,
-                sparseNote: String? = nil, draftName: String? = nil) {
+                sparseNote: String? = nil, draftName: String? = nil, toolCallSyntax: ToolCallSyntax = .json) {
         self.name = name; self.directory = directory; self.modelType = modelType; self.quantization = quantization
         self.parameterBytes = parameterBytes; self.contextLength = contextLength; self.layers = layers
         self.hiddenSize = hiddenSize; self.chatFormat = chatFormat; self.supportsThinking = supportsThinking
         self.loadSeconds = loadSeconds; self.thinksByDefault = thinksByDefault; self.supportsTools = supportsTools
         self.sparseLayers = sparseLayers; self.sparseTopK = sparseTopK; self.sparseMinContext = sparseMinContext
-        self.sparseNote = sparseNote; self.draftName = draftName
+        self.sparseNote = sparseNote; self.draftName = draftName; self.toolCallSyntax = toolCallSyntax
     }
 }
 
@@ -338,7 +340,8 @@ public final class InferenceEngine: @unchecked Sendable {
                         sparseLayers: model.sparseAvailable ? model.sparseLayerCount : 0,
                         sparseTopK: model.sparseAvailable ? sparse?.topK ?? 0 : 0,
                         sparseMinContext: model.sparseAvailable ? sparse?.minContext ?? 0 : 0,
-                        sparseNote: sparseNote, draftName: draftDirectory?.lastPathComponent)
+                        sparseNote: sparseNote, draftName: draftDirectory?.lastPathComponent,
+                        toolCallSyntax: tpl.toolCallSyntax)
                     self.info = info
                     cont.resume(returning: info)
                 } catch {
@@ -521,6 +524,8 @@ public final class InferenceEngine: @unchecked Sendable {
         // Constrained name: the text generated so far while a forced tool-call name is open.
         var nameText = ""
         var nameOpen = !(nameChoices ?? []).isEmpty
+        // What closes the name: `",` in a JSON call, `>` in Qwen 3.5's `<function=name>`.
+        let nameEnd = template?.toolCallSyntax == .xml ? ">" : "\","
         let texts = nameOpen ? tokenTextIndex(tok) : nil
         // Speculative decoding: verifying k drafted tokens costs one batched pass, so every
         // accepted draft is a token generated without its own weight read. Drafts come from prompt
@@ -665,7 +670,7 @@ public final class InferenceEngine: @unchecked Sendable {
             history.append(t)
             if nameOpen, let texts {
                 nameText += texts.texts[t]
-                if (nameChoices ?? []).contains(where: { nameText.hasPrefix($0 + "\",") }) { nameOpen = false }
+                if (nameChoices ?? []).contains(where: { nameText.hasPrefix($0 + nameEnd) }) { nameOpen = false }
             }
             if stats.generatedTokens >= maxNew { stats.stopReason = "length"; return false }
             if history.count >= model.maxSeq { stats.stopReason = "context"; return false }
@@ -673,7 +678,7 @@ public final class InferenceEngine: @unchecked Sendable {
         }
         func dist(_ row: UnsafeMutablePointer<Float>) throws -> [(id: Int, p: Float)] {
             if nameOpen, let texts {
-                let allowed = Self.allowedNameTokens(nameChoices ?? [], typed: nameText, texts: texts)
+                let allowed = Self.allowedNameTokens(nameChoices ?? [], typed: nameText, texts: texts, end: nameEnd)
                 if allowed.isEmpty { nameOpen = false } else {
                     let keep = allowed.compactMap { $0 < count ? ($0, row[$0]) : nil }
                     for i in 0..<count { row[i] = -.infinity }
@@ -783,10 +788,10 @@ extension InferenceEngine {
     /// that must follow (`"name": "get_weather", "arguments": …` in every supported format).
     /// A token may run past the comma only with whitespace, so the call cannot close early.
     static func allowedNameTokens(_ names: [String], typed: String,
-                                  texts: (texts: [String], byFirst: [Character: [Int]])) -> Set<Int> {
+                                  texts: (texts: [String], byFirst: [Character: [Int]]), end: String = "\",") -> Set<Int> {
         var allowed = Set<Int>()
         for n in names {
-            let target = n + "\","
+            let target = n + end
             guard target.hasPrefix(typed) else { continue }
             let rest = target.dropFirst(typed.count)
             guard let c = rest.first else { continue }

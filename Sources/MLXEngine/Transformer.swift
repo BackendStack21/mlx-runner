@@ -634,7 +634,7 @@ extension EngineError {
             || d.contains("OutOfMemory") || d.lowercased().contains("insufficient memory") {
             return .outOfMemory("the GPU ran out of memory while running the model. Lower the context length (Settings) or use a smaller model.")
         }
-        return .kernelCompile("GPU error: \(d)")
+        return .gpuFailure(d)
     }
 }
 

@@ -3,15 +3,16 @@ import Testing
 import MLXEngine
 @testable import MLXRCLI
 
-/// SL08: the 2.0.0 release surface: version string, changelog, and the documentation that shows commands.
-@Suite("Release 2.0.0 docs and version (SL08)")
+/// SL08: the release surface: version string, changelog, and the documentation that shows commands.
+@Suite("Release docs and version (SL08)")
 struct ReleaseDocsTests {
     static func read(_ path: String) -> String {
         (try? String(contentsOf: DocsCommands.root.appendingPathComponent(path), encoding: .utf8)) ?? ""
     }
 
-    @Test func versionIs2_0_0() {
-        #expect(MLXRunnerVersion.current == "2.0.0")
+    @Test func versionIsSemantic() {
+        let parts = MLXRunnerVersion.current.split(separator: ".")
+        #expect(parts.count == 3 && parts.allSatisfy { !$0.isEmpty && $0.allSatisfy(\.isNumber) }, "\(MLXRunnerVersion.current)")
     }
 
     @Test func dashVPrintsTheVersion() async {
@@ -19,18 +20,20 @@ struct ReleaseDocsTests {
             let cap = Capture()
             let code = await CLI.run([flag], console: cap.console())
             #expect(code == 0)
-            #expect(cap.stdout == "mlxr version is 2.0.0\n", "\(flag): \(cap.stdout)")
+            #expect(cap.stdout == "mlxr version is \(MLXRunnerVersion.current)\n", "\(flag): \(cap.stdout)")
         }
     }
 
-    @Test func changelogHasA2_0_0Section() {
+    @Test func changelogHasASectionForThisVersion() {
         let text = Self.read("CHANGELOG.md")
         let lines = text.components(separatedBy: "\n")
-        guard let i = lines.firstIndex(of: "## 2.0.0") else {
-            Issue.record("CHANGELOG.md has no '## 2.0.0' section"); return
+        let heading = "## \(MLXRunnerVersion.current)"
+        guard let i = lines.firstIndex(of: heading) else {
+            Issue.record("CHANGELOG.md has no '\(heading)' section"); return
         }
         // It is the newest release: first section heading in the file.
-        #expect(lines.first(where: { $0.hasPrefix("## ") }) == "## 2.0.0")
+        #expect(lines.first(where: { $0.hasPrefix("## ") }) == heading)
+        #expect(lines.contains("## 2.0.0"), "earlier sections stay")
         let body = lines[(i + 1)...].prefix { !$0.hasPrefix("## ") }.joined(separator: "\n")
         #expect(body.trimmingCharacters(in: .whitespacesAndNewlines).count > 80, "section is empty")
     }

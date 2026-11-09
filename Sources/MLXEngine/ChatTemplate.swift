@@ -8,11 +8,15 @@ public struct ChatMessage: Codable, Hashable, Sendable {
     public var toolCalls: [ToolCall]?
     /// For `tool` messages: the call this is the result of.
     public var toolCallID: String?
-    public init(role: Role, content: String, toolCalls: [ToolCall]? = nil, toolCallID: String? = nil) {
+    /// For `assistant` messages: reasoning a client sent back separately (OpenAI-style
+    /// `reasoning_content`), which Qwen 3.5's template prefers over `<think>` in the content.
+    public var reasoning: String?
+    public init(role: Role, content: String, toolCalls: [ToolCall]? = nil, toolCallID: String? = nil, reasoning: String? = nil) {
         self.role = role
         self.content = content
         self.toolCalls = toolCalls
         self.toolCallID = toolCallID
+        self.reasoning = reasoning
     }
 }
 
@@ -65,9 +69,10 @@ public struct ChatTemplate: Sendable {
     let emptyThoughtPrefill: Bool
     /// Qwen 3.5 templates: the generation prompt opens `<think>\n` when thinking is on (and closes an
     /// empty block when it is off), message content is trimmed, and assistant turns before the last
-    /// user message drop their reasoning. Their tool calls use an XML format (`<function=…>`), which
-    /// is not wired up: such templates report no tool support.
+    /// user message drop their reasoning. Their tool calls use an XML format (`<function=…>`).
     let qwen35: Bool
+    /// How the model writes a call inside `<tool_call>`: JSON (Hermes), or XML for Qwen 3.5 templates.
+    public let toolCallSyntax: ToolCallSyntax
 
     /// `toolTemplate`: a separate tool-use template, when the model ships one (checked for tool support).
     public init(template: String?, modelType: String, bosToken: String?, toolTemplate: String? = nil) {
@@ -86,8 +91,11 @@ public struct ChatTemplate: Sendable {
         // opt-in form (thinking only when asked, 0.8B/2B) and opt-out form (4B+) differ only there.
         qwen35 = format == .chatML && supportsThinkingToggle && (template ?? "").contains("{{- '<think>\\n' }}")
         thinksByDefault = supportsThinkingToggle && !(template ?? "").contains("enable_thinking is true")
+        toolCallSyntax = qwen35 && t.contains("<function=") ? .xml : .json
         switch format {
-        case .chatML: supportsTools = t.contains("<tool_call>") && !t.contains("<function=")
+        // The Qwen 3.5 path renders XML calls only; the Hermes path JSON calls only. A template whose
+        // calls do not match its path stays without tools, so prompt and parser never disagree.
+        case .chatML: supportsTools = t.contains("<tool_call>") && (qwen35 ? toolCallSyntax == .xml : !t.contains("<function="))
         case .llama3: supportsTools = llamaDatePreamble && t.contains("ipython")
         case .mistral: supportsTools = t.contains("[AVAILABLE_TOOLS]")
         case .phi3, .gemma, .gemma4, .plain: supportsTools = false
@@ -106,8 +114,10 @@ public struct ChatTemplate: Sendable {
 
     /// Text that starts the assistant turn so the reply must be a tool call: any call for
     /// `.required`, a call to the named function for `.function`. nil otherwise.
-    public static func toolCallPrefill(_ format: ChatFormat, _ choice: ToolChoice) -> String? {
+    public static func toolCallPrefill(_ format: ChatFormat, _ choice: ToolChoice, syntax: ToolCallSyntax = .json) -> String? {
         switch (format, choice) {
+        case (.chatML, .required) where syntax == .xml: return "<tool_call>\n<function="
+        case (.chatML, .function(let n)) where syntax == .xml: return "<tool_call>\n<function=\(n)>\n"
         case (.chatML, .required): return "<tool_call>\n{\"name\": \""
         case (.chatML, .function(let n)): return "<tool_call>\n{\"name\": \"\(n)\", \"arguments\": "
         case (.llama3, .required): return "{\"name\": \""
@@ -115,6 +125,28 @@ public struct ChatTemplate: Sendable {
         case (.mistral, .required): return "[TOOL_CALLS] [{\"name\": \""
         case (.mistral, .function(let n)): return "[TOOL_CALLS] [{\"name\": \"\(n)\", \"arguments\": "
         default: return nil
+        }
+    }
+
+    /// Qwen 3.5's tool-use instructions, verbatim from its template (after `</tools>`).
+    static let qwen35ToolInstructions = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+        + "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+        + "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n"
+        + "</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+        + "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+        + "- Required parameters MUST be specified\n"
+        + "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+        + "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+        + "</IMPORTANT>"
+
+    /// A call argument as Qwen 3.5's template prints it: objects and arrays as JSON (`tojson`), anything
+    /// else through Jinja's `string` filter, i.e. Python's `str` (`True`, `None`, `1.5`).
+    static func qwen35Argument(_ v: JSONValue) -> String {
+        switch v {
+        case .string(let s): return s
+        case .bool(let b): return b ? "True" : "False"
+        case .null: return "None"
+        case .number, .array, .object: return v.serialized(.python)
         }
     }
 
@@ -152,10 +184,24 @@ public struct ChatTemplate: Sendable {
         case .chatML where qwen35:
             func trim(_ x: String) -> String { x.trimmingCharacters(in: .whitespacesAndNewlines) }
             var rest = messages[...]
-            if rest.first?.role == .system {
+            if !tools.isEmpty {
+                // As the template: the tool block first, then the system prompt (if any) after it.
+                lit("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>")
+                for t in tools { lit("\n"); content(t.spec.serialized(.python)) }
+                lit("\n</tools>" + Self.qwen35ToolInstructions)
+                if rest.first?.role == .system {
+                    let system = trim(rest.removeFirst().content)
+                    if !system.isEmpty { lit("\n\n"); content(system) }
+                }
+                lit("<|im_end|>\n")
+            } else if rest.first?.role == .system {
                 lit("<|im_start|>system\n"); content(trim(rest.removeFirst().content)); lit("<|im_end|>\n")
             }
-            let lastQuery = messages.lastIndex { $0.role == .user } ?? -1
+            // The last real query: a user message that is not a wrapped tool response.
+            let lastQuery = messages.lastIndex {
+                let c = trim($0.content)
+                return $0.role == .user && !(c.hasPrefix("<tool_response>") && c.hasSuffix("</tool_response>"))
+            } ?? -1
             for i in rest.indices {
                 let m = messages[i]
                 switch m.role {
@@ -166,7 +212,9 @@ public struct ChatTemplate: Sendable {
                 case .assistant:
                     // As the template: reasoning is what precedes the first </think>, content what follows the last.
                     var text = trim(m.content), reasoning = ""
-                    if text.contains("</think>") {
+                    if let r = m.reasoning {
+                        reasoning = trim(r)   // the template's `message.reasoning_content is string` branch
+                    } else if text.contains("</think>") {
                         let parts = text.components(separatedBy: "</think>")
                         var r = parts[0]
                         while r.hasSuffix("\n") { r.removeLast() }
@@ -176,7 +224,18 @@ public struct ChatTemplate: Sendable {
                     }
                     lit("<|im_start|>assistant\n")
                     if i > lastQuery { lit("<think>\n"); content(reasoning); lit("\n</think>\n\n") }
-                    content(text); lit("<|im_end|>\n")
+                    content(text)
+                    for (j, c) in (m.toolCalls ?? []).enumerated() {
+                        lit(j > 0 ? "\n" : trim(text).isEmpty ? "" : "\n\n")
+                        lit("<tool_call>\n<function="); content(c.name); lit(">\n")
+                        if case .object(let args) = c.argumentsValue {
+                            for (k, v) in args {
+                                lit("<parameter="); content(k); lit(">\n"); content(Self.qwen35Argument(v)); lit("\n</parameter>\n")
+                            }
+                        }
+                        lit("</function>\n</tool_call>")
+                    }
+                    lit("<|im_end|>\n")
                 default:
                     lit("<|im_start|>\(m.role.rawValue)\n"); content(trim(m.content)); lit("<|im_end|>\n")
                 }

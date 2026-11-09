@@ -33,7 +33,7 @@ struct TextTests {
             ? "{%- if enable_thinking is defined and enable_thinking is true %}\(opener){%- else %}\(closed){%- endif %}"
             : "{%- if enable_thinking is defined and enable_thinking is false %}\(closed){%- else %}\(opener){%- endif %}"
         let t = ChatTemplate(template: "<|im_start|><tool_call>\n<function=example>\(generation)", modelType: "qwen3_5_text", bosToken: nil)
-        #expect(t.format == .chatML && t.supportsThinkingToggle && t.qwen35 && !t.supportsTools)
+        #expect(t.format == .chatML && t.supportsThinkingToggle && t.qwen35 && t.supportsTools && t.toolCallSyntax == .xml)
         #expect(t.thinksByDefault == !optIn)
         let msgs = [ChatMessage(role: .user, content: " Hi ")]
         let head = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"

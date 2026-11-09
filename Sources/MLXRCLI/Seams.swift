@@ -40,6 +40,25 @@ func performDownload(start: () async throws -> URL) async throws -> URL {
     }
 }
 
+/// A model download that Ctrl-C cancels: the partial files stay for the next attempt, and a second
+/// Ctrl-C leaves at once. The phase is back to `.idle` afterwards. `performDownload` wraps every error
+/// but its own, so only the router can tell a stop by the user: then `CLIError.interrupted`.
+func interruptibleDownload(_ interrupts: Interrupts, renderer: PullRenderer,
+                           _ download: @escaping @Sendable () async throws -> URL) async throws -> URL {
+    let task = Task { try await performDownload(start: download) }
+    interrupts.enter(.downloading, onCancel: { task.cancel() })
+    defer { interrupts.enter(.idle) }
+    do {
+        let dir = try await task.value
+        renderer.finish()
+        return dir
+    } catch {
+        renderer.finish()
+        if interrupts.wasInterrupted { throw CLIError.interrupted }
+        throw error
+    }
+}
+
 /// Starts the server; a failure becomes `cannot start server: <reason>`.
 func startServer(_ start: () throws -> Void) throws {
     do { try start() } catch { throw CLIError.failure("cannot start server: \(error.localizedDescription)") }

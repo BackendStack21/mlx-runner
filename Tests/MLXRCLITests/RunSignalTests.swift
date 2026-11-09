@@ -67,3 +67,44 @@ struct RunSignalTests {
         #expect(r.code == 0 && !h.interrupts.wasInterrupted)
     }
 }
+
+@Suite("Ctrl-C in the other commands")
+struct CommandSignalTests {
+    let model = "qwen3:0.6b"
+
+    @Test func ctrlCDuringPullCancelsItAndExits130() async throws {
+        let h = try RunHarness(installed: false)
+        let interrupts = h.interrupts
+        let fake = h.hub.services
+        h.hubOverride = HubServices(details: fake.details, destination: fake.destination,
+                                    download: { _, _, _ in interrupts.fire(); throw CancellationError() })
+        let r = await h.run(["pull", model])
+        #expect(r.code == 130, "\(r.err)")
+        #expect(!r.err.contains("Error:"), "\(r.err)")
+        #expect(h.exits.codes.isEmpty, "the command unwinds by itself and keeps the partial files")
+        #expect(h.interrupts.wasInterrupted)
+        #expect(r.out.isEmpty, "no saved path for an unfinished pull")
+    }
+
+    /// Ctrl-C during `rm a b`: the delete in progress finishes (a half-deleted model directory can still
+    /// look installed), then the command stops before the next one.
+    @Test func ctrlCDuringRmFinishesTheCurrentDeleteThenStops() async throws {
+        let f = LibraryFixture.standard()
+        let log = ExitLog()
+        let interrupts = Interrupts(exit: { log.add($0) })
+        let base = f.library
+        let library = ModelLibrary(scan: base.scan, delete: { m in
+            interrupts.fire()
+            #expect(log.codes.isEmpty, "the delete is not cut short")
+            try base.delete(m)
+        })
+        let table = CLI.commands(services: FakeServices().services, library: library, presets: f.presets, catalog: .standard,
+                                 now: { LibraryFixture.now }, interrupts: interrupts)
+        let cap = Capture()
+        let code = await CLI.run(["rm", LibraryFixture.qwen8, LibraryFixture.qwen06], console: cap.console(), commands: table)
+        #expect(log.codes == [130], "\(cap.stderr)")
+        #expect(code == 130)
+        #expect(f.deleted == [LibraryFixture.qwen8], "the second model stays")
+        #expect(cap.stdout == "deleted '\(LibraryFixture.qwen8)'\n")
+    }
+}

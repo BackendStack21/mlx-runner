@@ -72,10 +72,10 @@ extension CLI {
                             throw CLIError.failure("serve needs a model for now: mlxr serve MODEL (serving without a model comes with the background server in a later release)")
                         }
                         try await legacyServe(model: model, port: UInt16(inv.int("port") ?? 1234),
-                                              ctx: inv.int("ctx") ?? 8192, lan: inv.bool("lan"), apiKey: inv.string("api-key"),
-                                              draft: inv.string("draft"), sparse: inv.string("sparse"))
+                                              ctx: inv.int("ctx"), lan: inv.bool("lan"), apiKey: inv.string("api-key"),
+                                              draft: inv.string("draft"), sparse: inv.string("sparse"), interrupts: interrupts)
                     }),
-            pullCommand(library: library, presets: presets, catalog: catalog, hub: hub),
+            pullCommand(library: library, presets: presets, catalog: catalog, hub: hub, interrupts: interrupts),
             showCommand(library: library, presets: presets, catalog: catalog),
             Command(name: "search", summary: "Search Hugging Face for MLX models", args: [Arg("QUERY", variadic: true)],
                     options: [
@@ -102,7 +102,7 @@ extension CLI {
                     group: "Developer", run: { inv, console in
                         try await services.bench(BenchOptions(model: inv.positionals[0], decodeOnly: inv.bool("decode"), contexts: inv.string("ctx")), console)
                     }),
-        ] + modelCommands(library: library, presets: presets, catalog: catalog, now: now) + [upgradeCommand(updater: updater)]
+        ] + modelCommands(library: library, presets: presets, catalog: catalog, now: now, interrupts: interrupts) + [upgradeCommand(updater: updater, interrupts: interrupts)]
         return table + [completionCommand(table: table)]
     }
 }

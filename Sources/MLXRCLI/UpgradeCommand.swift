@@ -10,13 +10,14 @@ extension CLI {
 
     /// `upgrade` (alias `update`): installs the latest signed release over the running binary.
     /// The updater is built lazily, so no other command ever reaches the update code.
-    static func upgradeCommand(updater: @escaping @Sendable () -> Updater) -> Command {
+    static func upgradeCommand(updater: @escaping @Sendable () -> Updater, interrupts: Interrupts = .shared) -> Command {
         Command(name: "upgrade", aliases: ["update"], summary: "Update mlxr to the latest release",
                 options: [Opt(long: "check", help: "only report whether a newer release exists")],
-                run: { inv, console in try await executeUpgrade(inv, console, updater()) })
+                run: { inv, console in try await executeUpgrade(inv, console, updater(), interrupts: interrupts) })
     }
 
-    static func executeUpgrade(_ inv: Invocation, _ console: Console, _ updater: Updater) async throws {
+    static func executeUpgrade(_ inv: Invocation, _ console: Console, _ updater: Updater,
+                               interrupts: Interrupts = .shared) async throws {
         // A source build is updated with git, whether or not a newer release exists.
         if updater.install.kind == .source {
             throw CLIError.failure("mlxr is running from a source build; update it with git pull")
@@ -34,10 +35,45 @@ extension CLI {
         // The updater reports a percentage only, so the bar shows no sizes or speed.
         let bar = UpgradeBar(console: console)
         defer { bar.finish() }
-        let applied = try await updater.apply(reuseCheck: true, progress: { phase in
-            if case .download(let f) = phase { bar.update(f) }
-        })
+        // Ctrl-C cancels the download (the updater removes its staging folder); once the install
+        // starts it runs to the end, since a half-replaced binary is worse than a late exit. The
+        // phase is entered before the task starts, so the task's `.writing` always comes after it.
+        let canceller = TaskCanceller()
+        // After the first Ctrl-C, further ones are held rather than forcing the exit: the updater removes
+        // its staging folder (next to the binary) only when `apply` unwinds.
+        interrupts.enter(.downloading, onCancel: { canceller.cancel(); interrupts.enter(.writing) })
+        defer { interrupts.enter(.idle) }
+        let task = Task {
+            try await updater.apply(reuseCheck: true, progress: { phase in
+                if case .download(let f) = phase { bar.update(f) }
+                if phase == .install { interrupts.enter(.writing) }
+            })
+        }
+        canceller.set { task.cancel() }
+        let applied: AppliedUpdate
+        do { applied = try await task.value } catch {
+            if interrupts.wasInterrupted { throw CLIError.interrupted }
+            throw error
+        }
         console.out("upgraded mlxr \(current) -> \(applied.version)\n")
+    }
+}
+
+/// Holds how to cancel a task that starts after the Ctrl-C phase meant to cancel it: a Ctrl-C that
+/// arrives first cancels the task as soon as it is set.
+final class TaskCanceller: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (@Sendable () -> Void)?
+    private var cancelled = false
+
+    func set(_ cancel: @escaping @Sendable () -> Void) {
+        let now = lock.withLock { () -> Bool in action = cancel; return cancelled }
+        if now { cancel() }
+    }
+
+    func cancel() {
+        let pending = lock.withLock { () -> (@Sendable () -> Void)? in cancelled = true; return action }
+        pending?()
     }
 }
 

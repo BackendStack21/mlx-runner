@@ -4,7 +4,8 @@ import MLXEngine
 extension CLI {
     /// `pull MODEL` (alias `download`): Hugging Face download with Ollama's progress on stderr; the
     /// saved path goes to stdout.
-    static func pullCommand(library: ModelLibrary, presets: PresetStore, catalog: Catalog, hub: HubServices) -> Command {
+    static func pullCommand(library: ModelLibrary, presets: PresetStore, catalog: Catalog, hub: HubServices,
+                            interrupts: Interrupts = .shared) -> Command {
         let resolver = ModelResolver(library: library, presets: presets, catalog: catalog)
         return Command(
             name: "pull", aliases: ["download"], summary: "Download a model from Hugging Face", args: [Arg("MODEL", kind: .model)],
@@ -26,14 +27,9 @@ extension CLI {
                 let destination = try hub.destination(repo)
                 let renderer = PullRenderer(console: console)
                 let hooks = DownloadHooks(progress: { renderer.update(done: $0, total: $1, speed: $2) }, event: { _ in })
-                let dir: URL
-                do {
-                    dir = try await performDownload(start: { try await hub.download(details, destination, hooks) })
-                } catch {
-                    renderer.finish()
-                    throw error
+                let dir = try await interruptibleDownload(interrupts, renderer: renderer) {
+                    try await hub.download(details, destination, hooks)
                 }
-                renderer.finish()
                 console.err("verifying sha256 digest\nwriting manifest\nsuccess\n")
                 console.out(dir.path + "\n")
             })

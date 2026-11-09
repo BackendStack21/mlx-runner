@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.0.1
+
+Fixes for Ctrl-C in the command line and for errors from the local server, and tool calling for Qwen 3.5.
+
+**Fixes**
+
+- **Ctrl-C stops every command.** In 2.0.0 only `run` handled it: `serve` (which prints "Ctrl-C to stop"), `bench`, `pull`, `upgrade` and the other commands ignored it. A command without handling of its own now exits 130. `serve` exits 0 once it is listening. `pull` cancels the download and keeps the partial files, and a second Ctrl-C leaves at once. `upgrade` finishes an install it has started, and `rm` finishes the delete in progress before it stops.
+- **Ctrl-C at the chat prompt** prints `Use Ctrl + d or /bye to exit.` and discards the line being typed, as the 2.0.0 notes said. It did nothing, and the typed text was joined to the next line.
+- **The server no longer turns failures into empty replies.** A prompt longer than the context came back as HTTP 200 with no text; it is now a 400 `context_length_exceeded` (an error event when streaming). Other engine failures are 500s with their message. A GPU failure now reads "GPU error: …" instead of "Metal kernel compilation failed".
+
+**New**
+
+- **Qwen 3.5 tool calling.** The server renders tools and tool history as Qwen 3.5's template does and returns its XML calls (`<function=…>` with one `<parameter=…>` per argument) as OpenAI `tool_calls`, typed by each tool's parameter schema. A call cut short (by `max_tokens` or a stop sequence) is returned as text, not as a call. Reasoning a client sends back as `reasoning_content` goes into the prompt as the template does. `tool_choice` `required` and named functions work too.
+- **The context length is visible.** `/v1/models` reports `context_length` (clients such as go-llm-sdk use it to budget their prompts), `serve` prints it when the model loads, and `run` and `serve` say when `--ctx` asked for more than the model supports and was lowered.
+
 ## 2.0.0
 
 The command line now follows Ollama: the same verbs, flags, help layout and error messages, in one process with no background server. The app, the engine and the server are unchanged. Breaking changes for scripts are listed first.
