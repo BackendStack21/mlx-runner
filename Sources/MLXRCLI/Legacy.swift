@@ -21,6 +21,13 @@ func sparseSummary(_ info: LoadedModelInfo) -> String {
     return "sparse attention off" + (info.sparseNote.map { ": \($0)" } ?? "")
 }
 
+/// A note when the model holds fewer tokens than `--ctx` asked for (its `max_position_embeddings`
+/// caps the context); nil otherwise.
+func contextNote(requested: Int, info: LoadedModelInfo) -> String? {
+    guard requested > info.contextLength else { return nil }
+    return "note: \(info.name) supports at most \(info.contextLength) tokens of context; --ctx \(requested) was lowered to \(info.contextLength)"
+}
+
 func formatBytes(_ b: Int) -> String {
     ByteCountFormatter.string(fromByteCount: Int64(b), countStyle: .file)
 }
@@ -408,7 +415,10 @@ func serveKeyNotice(key: String?, generated: Bool) -> String? {
                      : "API key required: send it as 'Authorization: Bearer <key>'"
 }
 
-func legacyServe(model: String, port: UInt16, ctx: Int, lan: Bool, apiKey: String?, draft: String?, sparse: String?) async throws {
+/// `ctx`: the `--ctx` flag (nil: 8192, and no note when the model holds fewer tokens).
+func legacyServe(model: String, port: UInt16, ctx requested: Int?, lan: Bool, apiKey: String?, draft: String?, sparse: String?,
+                 interrupts: Interrupts = .shared) async throws {
+    let ctx = requested ?? 8192
     let sparseArg = try sparseSetting(sparse)
     // LAN mode always needs a key: use --api-key / MLXR_API_KEY, or generate one.
     var key = apiKey ?? ProcessInfo.processInfo.environment["MLXR_API_KEY"]
@@ -416,11 +426,14 @@ func legacyServe(model: String, port: UInt16, ctx: Int, lan: Bool, apiKey: Strin
     if generated { key = OpenAIServer.generateAPIKey() }
     let dir = try installedModelDirectory(model, resolver: .live)
     let info = try await InferenceEngine.shared.load(directory: dir, draftDirectory: try draftDirectory(draft, target: dir), contextLength: ctx, sparse: sparseArg)
-    print("Loaded \(info.name)\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s")
+    print("Loaded \(info.name)\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s"
+          + ", context \(info.contextLength) tokens")
+    if let requested, let note = contextNote(requested: requested, info: info) { print(note) }
     print(sparseSummary(info))
     let server = OpenAIServer(port: port, allowLAN: lan, apiKey: key)
     server.onLog = { print($0) }
     try startServer { try server.start() }
+    interrupts.enter(.serving)   // Ctrl-C stops the server (exit 0); during the load it exits 130
     print("OpenAI-compatible server on http://\(lan ? "0.0.0.0" : "127.0.0.1"):\(port)/v1  (Ctrl-C to stop)")
     if let notice = serveKeyNotice(key: key, generated: generated) { print(notice) }
     while true { try await Task.sleep(nanoseconds: 3_600_000_000_000) }

@@ -350,6 +350,10 @@ public struct ToolCall: Codable, Hashable, Sendable {
     var argumentsValue: JSONValue { (try? JSONValue.parse(arguments)) ?? .object([]) }
 }
 
+/// How a ChatML model writes the call inside `<tool_call>`: a JSON object (Hermes: Qwen2.5, Qwen3), or
+/// Qwen 3.5's XML, `<function=name>` with one `<parameter=key>` block per argument.
+public enum ToolCallSyntax: String, Sendable, Hashable { case json, xml }
+
 public enum ToolChoice: Sendable, Equatable {
     case none, auto, required
     case function(String)
@@ -375,6 +379,8 @@ public struct ToolRequest: Sendable {
 
 /// Extracts tool calls from a model's reply in its native format:
 /// - ChatML/Hermes (Qwen2.5, Qwen3): `<tool_call>\n{"name": …, "arguments": {…}}\n</tool_call>`, repeatable.
+/// - ChatML/XML (Qwen 3.5): `<tool_call>\n<function=name>\n<parameter=key>\nvalue\n</parameter>\n</function>\n</tool_call>`.
+///   Each `<tool_call>` body is read as whichever of the two forms it is.
 /// - Llama 3.1+: a bare JSON object `{"name": …, "parameters": {…}}` (optionally after `<|python_tag|>`).
 /// - Mistral v3: `[TOOL_CALLS] [{"name": …, "arguments": {…}, "id": …}]`.
 /// Only calls to defined tools are accepted; anything else is left as text.
@@ -439,6 +445,12 @@ public enum ToolCallParser {
             while let r = rest.range(of: open) {
                 content += rest[..<r.lowerBound]
                 let body = rest[r.upperBound...]
+                if body.drop(while: { $0.isWhitespace }).hasPrefix("<function=") {
+                    guard let c = xmlCall(body, tools: tools) else { return nil }
+                    calls.append(ToolCall(id: ToolCall.newID(), name: c.name, arguments: c.arguments.serialized(.compact)))
+                    rest = c.rest
+                    continue
+                }
                 let end = body.range(of: close)
                 let json = end.map { body[..<$0.lowerBound] } ?? body
                 guard let v = lenientObject(json), add(v, argsKeys: ["arguments", "parameters"]) else { return nil }
@@ -472,6 +484,89 @@ public enum ToolCallParser {
         case .phi3, .gemma, .gemma4, .plain:
             return nil
         }
+    }
+
+    /// One call in Qwen 3.5's XML form, read from the start of `text` (just after `<tool_call>`):
+    /// `<function=name>`, per argument `<parameter=key>\nvalue\n</parameter>`, then `</function>` and
+    /// an optional `</tool_call>`. Each value ends at its own `</parameter>`, so a value may hold
+    /// `</function>` or `</tool_call>` (one holding `</parameter>` is ambiguous in this format). nil when
+    /// the function is not a defined tool, anything but whitespace sits between the blocks, or the call
+    /// is not closed by `</function>`: a reply cut short by `max_tokens` is not a call to run. `rest`
+    /// is what follows the call.
+    static func xmlCall(_ text: Substring, tools: [ToolDefinition]) -> (name: String, arguments: JSONValue, rest: Substring)? {
+        var s = text.drop(while: { $0.isWhitespace })
+        guard s.hasPrefix("<function=") else { return nil }
+        s = s.dropFirst("<function=".count)
+        guard let gt = s.firstIndex(of: ">") else { return nil }
+        let name = s[..<gt].trimmingCharacters(in: .whitespaces)
+        guard let tool = tools.first(where: { $0.name == name }) else { return nil }
+        let properties = tool.spec["function"]?["parameters"]?["properties"]
+        s = s[s.index(after: gt)...]
+        var args: [(String, JSONValue)] = []
+        while true {
+            s = s.drop(while: { $0.isWhitespace })
+            if s.hasPrefix("</function>") {
+                s = s.dropFirst("</function>".count)
+                let after = s.drop(while: { $0.isWhitespace })
+                if after.hasPrefix("</tool_call>") { s = after.dropFirst("</tool_call>".count) }
+                return (name, .object(args), s)
+            }
+            guard s.hasPrefix("<parameter=") else { return nil }
+            let tag = s.dropFirst("<parameter=".count)
+            guard let gt = tag.firstIndex(of: ">") else { return nil }
+            let key = tag[..<gt].trimmingCharacters(in: .whitespaces)
+            guard !key.isEmpty else { return nil }
+            let after = tag[tag.index(after: gt)...]
+            guard let close = after.range(of: "</parameter>") else { return nil }
+            // The template writes "\n" around each value; a value's own newlines are kept.
+            var value = String(after[..<close.lowerBound])
+            if value.hasPrefix("\n") { value.removeFirst() }
+            if value.hasSuffix("\n") { value.removeLast() }
+            args.removeAll { $0.0 == key }
+            args.append((key, xmlArgument(value, schema: properties?[key])))
+            s = after[close.upperBound...]
+        }
+    }
+
+    /// An XML argument's text as the JSON value its schema asks for (as vLLM's qwen3_coder parser
+    /// converts them). Text stays a string when the schema says string, when the tool does not define
+    /// the parameter, or when it does not parse as the declared type.
+    static func xmlArgument(_ raw: String, schema: JSONValue?) -> JSONValue {
+        guard let schema else { return .string(raw) }
+        let types: [String]
+        switch schema["type"] {
+        case .string(let t)?: types = [t.lowercased()]
+        case .array(let a)?: types = a.compactMap { $0.stringValue?.lowercased() }
+        default: types = []
+        }
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.utf8.count == 4, text.lowercased() == "null", types != ["string"] { return .null }
+        // Parsed once, and only for a type that needs it: a large string value is never parsed.
+        var cached: JSONValue?? = nil
+        func parsed() -> JSONValue? {
+            if cached == nil { cached = .some(try? JSONValue.parse(text)) }
+            return cached!
+        }
+        for t in types {
+            switch t {
+            case "string", "str", "text", "varchar", "char", "enum":
+                return .string(raw)
+            case "integer", "int", "number", "float", "double":
+                if let v = parsed(), case .number = v { return v }
+            case "boolean", "bool":
+                if text.lowercased() == "true" { return .bool(true) }
+                if text.lowercased() == "false" { return .bool(false) }
+            case "object", "dict":
+                if let v = parsed(), case .object = v { return v }
+            case "array", "list":
+                if let v = parsed(), case .array = v { return v }
+            default:
+                continue
+            }
+        }
+        // No usable type (anyOf, $ref, a missing type): any JSON value, else the text.
+        if types.isEmpty, let v = parsed() { return v }
+        return .string(raw)
     }
 }
 

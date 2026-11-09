@@ -577,6 +577,36 @@ struct ServerModelTests {
     }
 
     @Test(.enabled(if: installedModel(repo) != nil))
+    func modelsReportTheContextLength() async throws {
+        let engine = try await Self.loadedEngine()
+        let s = try makeServer(engine: engine); defer { s.stop() }
+        let list = await httpRequest(s.boundPort, "GET", "/v1/models")
+        let entry = try #require((list.json?["data"] as? [[String: Any]])?.first)
+        #expect(entry["context_length"] as? Int == 2048)
+        let one = await httpRequest(s.boundPort, "GET", "/v1/models/\(engine.info!.name)")
+        #expect(one.json?["context_length"] as? Int == 2048)
+    }
+
+    /// A prompt longer than the context is a 400, not an empty successful reply: the engine cancels its
+    /// token whenever its stream ends, which the server used to read as its own cancellation.
+    @Test(.enabled(if: installedModel(repo) != nil))
+    func aPromptThatDoesNotFitIsAnError() async throws {
+        let s = try makeServer(engine: try await Self.loadedEngine()); defer { s.stop() }
+        let long = String(repeating: " hello", count: 3000)
+        let r = await post(s.boundPort, "/v1/chat/completions", ["messages": [["role": "user", "content": long]], "max_tokens": 8])
+        expectErrorSchema(r, status: 400, code: "context_length_exceeded")
+        let st = await post(s.boundPort, "/v1/chat/completions",
+                            ["messages": [["role": "user", "content": long]], "max_tokens": 8, "stream": true])
+        let events = Self.sse(st.body).data
+        #expect(events.contains { ($0["error"] as? [String: Any])?["code"] as? String == "context_length_exceeded" }, "\(st.body)")
+        #expect(!events.contains { ($0["choices"] as? [[String: Any]])?.first?["finish_reason"] as? String == "stop" })
+        // The server still answers what fits.
+        let ok = await post(s.boundPort, "/v1/chat/completions",
+                            ["messages": [["role": "user", "content": "Say hi."]], "max_tokens": 8, "temperature": 0])
+        #expect(ok.status == 200, "\(ok.body)")
+    }
+
+    @Test(.enabled(if: installedModel(repo) != nil))
     func chatNonStreamingSplitsReasoning() async throws {
         let s = try makeServer(engine: try await Self.loadedEngine()); defer { s.stop() }
         let r = await post(s.boundPort, "/v1/chat/completions", [
@@ -785,5 +815,83 @@ struct ServerModelTests {
         let r = await post(port, "/v1/chat/completions", ["messages": userMsg, "max_tokens": 2])
         #expect(r.status == 200)
         #expect(Date().timeIntervalSince(start) < 3)
+    }
+}
+
+// MARK: - Qwen 3.5 tool calls (XML format)
+
+@Suite("OpenAI server (Qwen 3.5 0.8B tools)", .serialized)
+struct ServerQwen35ToolTests {
+    static let repo = "mlx-community/Qwen3.5-0.8B-4bit"
+    static let engine = InferenceEngine()
+
+    static func loadedEngine() async throws -> InferenceEngine {
+        if engine.info == nil {
+            _ = try await engine.load(directory: installedModel(repo)!, contextLength: 4096)
+        }
+        return engine
+    }
+
+    static let tools: [[String: Any]] = [
+        ["type": "function", "function": ["name": "get_weather", "description": "Get the current weather for a city",
+                                          "parameters": ["type": "object", "properties": ["city": ["type": "string"]], "required": ["city"]]]],
+        ["type": "function", "function": ["name": "get_time", "description": "Current local time in a timezone",
+                                          "parameters": ["type": "object", "properties": ["timezone": ["type": "string"]], "required": ["timezone"]]]],
+    ]
+
+    static func arguments(_ call: [String: Any]?) -> [String: Any]? {
+        guard let s = (call?["function"] as? [String: Any])?["arguments"] as? String else { return nil }
+        return (try? JSONSerialization.jsonObject(with: Data(s.utf8))) as? [String: Any]
+    }
+
+    @Test(.enabled(if: installedModel(repo) != nil))
+    func requiredCallComesBackAsOpenAIJSON() async throws {
+        let engine = try await Self.loadedEngine()
+        #expect(engine.info?.supportsTools == true && engine.info?.toolCallSyntax == .xml)
+        let s = try makeServer(engine: engine); defer { s.stop() }
+        let r = await post(s.boundPort, "/v1/chat/completions", [
+            "messages": [["role": "user", "content": "What's the weather like in Paris right now?"]],
+            "tools": Self.tools, "tool_choice": "required", "temperature": 0, "max_tokens": 200,
+        ])
+        #expect(r.status == 200, "\(r.body)")
+        let choice = try #require((r.json?["choices"] as? [[String: Any]])?.first)
+        #expect(choice["finish_reason"] as? String == "tool_calls", "\(r.body)")
+        let call = (choice["message"] as? [String: Any]).flatMap { ($0["tool_calls"] as? [[String: Any]])?.first }
+        #expect((call?["function"] as? [String: Any])?["name"] as? String == "get_weather", "\(r.body)")
+        #expect((Self.arguments(call)?["city"] as? String)?.contains("Paris") == true, "\(r.body)")
+    }
+
+    @Test(.enabled(if: installedModel(repo) != nil))
+    func namedCallStreams() async throws {
+        let s = try makeServer(engine: try await Self.loadedEngine()); defer { s.stop() }
+        let r = await post(s.boundPort, "/v1/chat/completions", [
+            "messages": [["role": "user", "content": "What time is it in Tokyo?"]], "stream": true,
+            "tools": Self.tools, "tool_choice": ["type": "function", "function": ["name": "get_time"]],
+            "temperature": 0, "max_tokens": 200,
+        ])
+        let deltas = ServerModelTests.sse(r.body).data.compactMap { ($0["choices"] as? [[String: Any]])?.first?["delta"] as? [String: Any] }
+        let calls = deltas.compactMap { ($0["tool_calls"] as? [[String: Any]])?.first }
+        #expect(calls.contains { ($0["function"] as? [String: Any])?["name"] as? String == "get_time" }, "\(r.body)")
+        let args = calls.compactMap { ($0["function"] as? [String: Any])?["arguments"] as? String }.joined()
+        let parsed = (try? JSONSerialization.jsonObject(with: Data(args.utf8))) as? [String: Any]
+        #expect(parsed?["timezone"] is String, "\(args)")
+    }
+
+    /// A conversation holding a call and its result renders and gets an answer.
+    @Test(.enabled(if: installedModel(repo) != nil))
+    func answersFromAToolResult() async throws {
+        let s = try makeServer(engine: try await Self.loadedEngine()); defer { s.stop() }
+        let r = await post(s.boundPort, "/v1/chat/completions", [
+            "messages": [
+                ["role": "user", "content": "What's the weather in Paris?"],
+                ["role": "assistant", "content": NSNull(), "tool_calls": [["id": "call_1", "type": "function",
+                                                                          "function": ["name": "get_weather", "arguments": "{\"city\":\"Paris\"}"]]]],
+                ["role": "tool", "tool_call_id": "call_1", "content": "18 C and sunny"],
+            ],
+            "tools": Self.tools, "temperature": 0, "max_tokens": 200,
+        ])
+        #expect(r.status == 200, "\(r.body)")
+        let msg = try #require(((r.json?["choices"] as? [[String: Any]])?.first)?["message"] as? [String: Any])
+        #expect((msg["content"] as? String)?.contains("18") == true, "\(r.body)")
     }
 }

@@ -391,7 +391,10 @@ public final class OpenAIServer: @unchecked Sendable {
     static func modelObject(_ info: LoadedModelInfo) -> [String: Any] {
         let attrs = try? FileManager.default.attributesOfItem(atPath: info.directory.path)
         let created = (attrs?[.creationDate] as? Date) ?? Date()
-        return ["id": info.name, "object": "model", "created": Int(created.timeIntervalSince1970), "owned_by": "mlx-runner"]
+        // `context_length` (as OpenRouter and Together name it): the tokens the loaded model holds, so
+        // clients can budget their prompts (odek's go-llm-sdk reads it to size its trimming).
+        return ["id": info.name, "object": "model", "created": Int(created.timeIntervalSince1970), "owned_by": "mlx-runner",
+                "context_length": info.contextLength]
     }
 
     // MARK: - Request parsing
@@ -644,7 +647,15 @@ public final class OpenAIServer: @unchecked Sendable {
             }
         }
         guard let tools, tools.active else { return nil }
-        return ChatTemplate.toolCallPrefill(format, tools.choice)
+        return ChatTemplate.toolCallPrefill(format, tools.choice, syntax: info.toolCallSyntax)
+    }
+
+    /// The engine stopped because generation was cancelled, as opposed to failing (a prompt that does
+    /// not fit, a GPU error).
+    static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let e = error as? EngineError, case .cancelled = e { return true }
+        return false
     }
 
     static func toolCallJSON(_ c: ToolCall) -> [String: Any] {
@@ -672,6 +683,7 @@ public final class OpenAIServer: @unchecked Sendable {
             let role = try Self.role(roleStr, param: "\(p).role")
             let content = try Self.textContent(m["content"], param: "\(p).content", textTypes: ["text"])
             var msg = ChatMessage(role: role, content: content)
+            if role == .assistant, let r = m["reasoning_content"] as? String, !r.isEmpty { msg.reasoning = r }
             if role == .assistant, let tc = m["tool_calls"], !(tc is NSNull) {
                 let calls = try Self.toolCalls(tc, param: "\(p).tool_calls")
                 if !calls.isEmpty { msg.toolCalls = calls }
@@ -1205,9 +1217,10 @@ public final class OpenAIServer: @unchecked Sendable {
                     if !alive { token.cancel() }
                 }
             }
-        } catch where stopped || !alive || token.isCancelled {
+        } catch where stopped || !alive || Self.isCancellation(error) {
             // We cancelled (stop sequence, disconnect, write timeout): not an error whichever way
-            // the engine reports cancellation.
+            // the engine reports cancellation. The token alone cannot tell: the engine cancels it
+            // whenever its stream ends, failures included.
         } catch let e as EngineError {
             if case .contextFull = e {
                 throw APIError(status: 400, message: "The prompt does not fit in the model's context window",

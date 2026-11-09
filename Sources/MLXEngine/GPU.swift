@@ -12,6 +12,8 @@ public enum EngineError: LocalizedError {
     case outOfMemory(String)
     case cancelled
     case invalidOutput(String)
+    /// A command buffer failed while running (not an out-of-memory failure).
+    case gpuFailure(String)
 
     public var errorDescription: String? {
         switch self {
@@ -20,6 +22,7 @@ public enum EngineError: LocalizedError {
         case .cancelled: return "Cancelled."
         case .invalidOutput(let s): return "The model produced invalid output: \(s)"
         case .kernelCompile(let s): return "Metal kernel compilation failed: \(s)"
+        case .gpuFailure(let s): return "GPU error: \(s)"
         case .missingPipeline(let s): return "Missing Metal kernel: \(s)"
         case .invalidFile(let s): return "Invalid model file: \(s)"
         case .missingTensor(let s): return "Missing tensor: \(s)"

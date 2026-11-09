@@ -6,7 +6,7 @@ extension CLI {
 
     /// list, rm, cp, ps, stop and the commands mlxr does not have.
     static func modelCommands(library: ModelLibrary, presets: PresetStore, catalog: Catalog,
-                              now: @escaping @Sendable () -> Date) -> [Command] {
+                              now: @escaping @Sendable () -> Date, interrupts: Interrupts = .shared) -> [Command] {
         let resolver = ModelResolver(library: library, presets: presets, catalog: catalog)
         return [
             Command(name: "list", aliases: ["ls"], summary: "List installed models", args: [Arg("PREFIX", optional: true)],
@@ -17,7 +17,9 @@ extension CLI {
                     }),
             Command(name: "rm", summary: "Remove a model", args: [Arg("MODEL", kind: .model, variadic: true)],
                     options: [Opt(long: "yes", short: "y", help: "do not ask before deleting from the Hugging Face cache")],
-                    run: { inv, console in try remove(inv, console, library: library, presets: presets, resolver: resolver) }),
+                    run: { inv, console in
+                        try remove(inv, console, library: library, presets: presets, resolver: resolver, interrupts: interrupts)
+                    }),
             Command(name: "cp", summary: "Copy a model", args: [Arg("SOURCE", kind: .model), Arg("DESTINATION")],
                     run: { inv, console in
                         let dest = inv.positionals[1]
@@ -93,7 +95,7 @@ extension CLI {
     private enum Removal { case preset(String), model(LocalModel) }
 
     private static func remove(_ inv: Invocation, _ console: Console, library: ModelLibrary, presets: PresetStore,
-                               resolver: ModelResolver) throws {
+                               resolver: ModelResolver, interrupts: Interrupts) throws {
         let models = library.scan()
         var plan: [(arg: String, what: Removal)] = []
         var seen = Set<String>()
@@ -117,12 +119,17 @@ extension CLI {
                 }
             }
         }
+        // Ctrl-C waits for the delete in progress (a half-deleted model directory can still look
+        // installed), then stops before the next one.
+        defer { interrupts.enter(.idle) }
         for (arg, what) in plan {
+            interrupts.enter(.writing)
             switch what {
             case .preset(let name): try presets.delete(name)
             case .model(let m): try library.delete(m)
             }
             console.out("deleted '\(arg)'\n")
+            if interrupts.finishWriting() { throw CLIError.interrupted }
         }
     }
 }

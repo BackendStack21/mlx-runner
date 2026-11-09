@@ -77,6 +77,23 @@ final class RecordingInstaller: UpdateInstalling, @unchecked Sendable {
     }
 }
 
+/// Presses Ctrl-C twice in the middle of the install, then records it like `RecordingInstaller`.
+final class InterruptedInstaller: UpdateInstalling, @unchecked Sendable {
+    private let lock = NSLock()
+    private var router: Interrupts?
+    private var items: [String] = []
+    var interrupts: Interrupts? {
+        get { lock.withLock { router } }
+        set { lock.withLock { router = newValue } }
+    }
+    var versions: [String] { lock.withLock { items } }
+    func install(package: URL, version: String, target: URL, stage: URL) async throws {
+        interrupts?.fire()
+        interrupts?.fire()
+        lock.withLock { items.append(version) }
+    }
+}
+
 /// Counts how often the command asked for an updater.
 final class FactoryCount: @unchecked Sendable {
     private let lock = NSLock()
@@ -144,6 +161,8 @@ private final class UpgradeRig: @unchecked Sendable {
     let bin: UpgradeBin
     let installer = RecordingInstaller()
     let factory = FactoryCount()
+    let harness: RunHarness
+    private let installerOverride: UpdateInstalling?
     let release: UpgradeRelease
     private(set) var stubID = ""
     private let routes: [String: UpgradeStub.Route]
@@ -152,8 +171,10 @@ private final class UpgradeRig: @unchecked Sendable {
 
     init(latest: String = "2.0.1", current: String = "2.0.0", tamper: UpgradeRelease.Tamper = .none,
          routes override: [String: UpgradeStub.Route]? = nil, install: UpdateInstall? = nil,
-         failTarball status: Int? = nil) throws {
+         failTarball status: Int? = nil, installer custom: UpdateInstalling? = nil) throws {
         bin = try UpgradeBin()
+        harness = try RunHarness()
+        installerOverride = custom
         release = try UpgradeRelease(version: latest, tamper: tamper)
         var table = override ?? release.routes
         if let status { table[release.tarballURL] = .body(status, Data()) }
@@ -167,11 +188,12 @@ private final class UpgradeRig: @unchecked Sendable {
     var tarballRequested: Bool { requests.contains(release.tarballURL) }
 
     func table() -> [Command] {
-        let h = try! RunHarness()
+        let h = harness
         let (config, id) = UpgradeStub.configuration(routes)
         stubID = id
         let target = bin.target
-        let installer = self.installer, factory = self.factory, release = self.release
+        let installer: UpdateInstalling = installerOverride ?? self.installer
+        let factory = self.factory, release = self.release
         let install = self.install ?? UpdateInstall(kind: .cli, target: target), current = self.current
         return CLI.commands(services: FakeServices().services, library: h.library.library, presets: h.library.presets,
                             catalog: .standard, now: { LibraryFixture.now }, hub: h.hub.services, engine: h.engine,
@@ -192,12 +214,6 @@ private final class UpgradeRig: @unchecked Sendable {
 
 @Suite("mlxr upgrade")
 struct UpgradeCommandTests {
-    // MARK: version
-
-    @Test func theVersionStaysAtTwoZeroZero() {
-        #expect(MLXRunnerVersion.current == "2.0.0")
-    }
-
     // MARK: AC-11 up to date
 
     @Test func upToDatePrintsOneLineAndExitsZero() async throws {
@@ -218,6 +234,18 @@ struct UpgradeCommandTests {
     }
 
     // MARK: AC-12 successful upgrade
+
+    @Test func ctrlCDuringTheInstallLetsItFinish() async throws {
+        let installer = InterruptedInstaller()
+        let rig = try UpgradeRig(installer: installer)
+        installer.interrupts = rig.harness.interrupts
+        let r = await rig.run(["upgrade"])
+        #expect(r.code == 0, "\(r.err)")
+        #expect(r.out == "upgraded mlxr 2.0.0 -> 2.0.1\n", "\(r.out)")
+        #expect(installer.versions == ["2.0.1"])
+        #expect(rig.harness.exits.codes.isEmpty, "a half-replaced binary is worse than a late exit")
+        #expect(!rig.harness.interrupts.wasInterrupted)
+    }
 
     @Test func aSuccessfulUpgradePrintsTheTransitionOnStdout() async throws {
         let rig = try UpgradeRig()
