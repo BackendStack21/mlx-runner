@@ -336,10 +336,15 @@ struct ModelTests {
         }
         msgs.append(ChatMessage(role: .user, content: "Say hi."))
         var finished = false
+        var dropped: Int?
         for try await ev in engine.chat(msgs, parameters: p, enableThinking: false) {
+            if case .promptProcessed(let s) = ev { dropped = s.droppedMessages }
             if case .finished = ev { finished = true }
         }
         #expect(finished)
+        // The app marks where the model's view of the chat starts from this count.
+        let d = try #require(dropped, "a trimmed prompt reports how many turns it left out")
+        #expect(d > 0 && d < 13 && d % 2 == 0, "cuts land on user turns (got \(d))")
 
         // The next turn of the same overflowing chat must reuse the KV cache (sticky cut point).
         msgs.append(ChatMessage(role: .assistant, content: "Hi."))
@@ -350,6 +355,26 @@ struct ModelTests {
         }
         // 12 tokens = system prompt only (the old, non-sticky behaviour); more means history is reused.
         #expect(cached > 15, "trimmed conversation should still hit the prefix cache (got \(cached))")
+    }
+
+    @Test(.enabled(if: installedModel(qwen3) != nil))
+    func failedLoadKeepsThePreviousModel() async throws {
+        let engine = InferenceEngine()
+        let first = try await engine.load(directory: installedModel(Self.qwen3)!, contextLength: 2048)
+        // A directory that cannot be a model fails its checks before anything is unloaded.
+        let empty = FileManager.default.temporaryDirectory.appendingPathComponent("mlxr-not-a-model-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: empty) }
+        await #expect(throws: (any Error).self) { _ = try await engine.load(directory: empty, contextLength: 2048) }
+        #expect(engine.info?.directory == first.directory)
+        var p = SamplingParameters()
+        p.temperature = 0
+        p.maxTokens = 4
+        var text = ""
+        for try await ev in engine.chat([ChatMessage(role: .user, content: "Say hi.")], parameters: p, enableThinking: false) {
+            if case .text(let t) = ev { text += t }
+        }
+        #expect(!text.isEmpty, "the previous model still generates")
     }
 
     @Test(.enabled(if: installedModel(qwen3) != nil))
@@ -368,10 +393,12 @@ struct ModelTests {
                      ChatMessage(role: .user, content: "Say hi.")]
         let full = engine.encode(engine.renderChat(short, enableThinking: false)).count
         var prompt = 0
+        var dropped: Int? = -1
         for try await ev in engine.chat(short, parameters: p, enableThinking: false) {
-            if case .promptProcessed(let s) = ev { prompt = s.promptTokens }
+            if case .promptProcessed(let s) = ev { prompt = s.promptTokens; dropped = s.droppedMessages }
         }
         #expect(prompt == full)
+        #expect(dropped == nil, "a chat that fits reports no dropped turns")
     }
 
     @Test(.enabled(if: installedModel(phi) != nil))

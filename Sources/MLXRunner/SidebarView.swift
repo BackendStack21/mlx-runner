@@ -1,11 +1,16 @@
+import AppKit
 import MLXEngine
 import SwiftUI
 
 struct SidebarView: View {
     @Environment(AppState.self) private var state
+    @Environment(\.undoManager) private var undoManager
     @State private var renaming: UUID?
     @State private var renameText = ""
+    @FocusState private var renameFocused: Bool
     @State private var search = ""
+    /// Start of today; moved on at midnight (`NSCalendarDayChanged`) so the day sections stay right.
+    @State private var today = Calendar.current.startOfDay(for: Date())
 
     var body: some View {
         @Bindable var state = state
@@ -21,6 +26,7 @@ struct SidebarView: View {
             .padding(.horizontal, 14)
             .padding(.top, 8)
             .padding(.bottom, 10)
+            .accessibilityElement(children: .combine)
 
             Button {
                 state.newChat()
@@ -30,27 +36,33 @@ struct SidebarView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 8)
                     .foregroundStyle(.white)
-                    .background(Theme.gradient, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .background(Theme.fillGradient, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     .shadow(color: Theme.accent.opacity(0.35), radius: 8, y: 3)
             }
             .buttonStyle(.plain)
+            .help("New Chat (⌘N)")
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
 
             List(selection: $state.selection) {
                 Section {
                     navRow("Discover", "safari", .discover)
-                    navRow("My Models", "shippingbox", .models, badge: state.localModels.count)
-                    navRow("Local Server", "network", .server)
+                    navRow("My Models", "shippingbox", .models) { ModelsRowStatus() }
+                    navRow("Local Server", "network", .server) { ServerRowStatus() }
                 }
-                Section("Chats") {
-                    ForEach(filteredChats) { c in
-                        chatRow(c).tag(SidebarItem.chat(c.id))
+                ForEach(ChatGroups.group(filteredChats, today: today), id: \.title) { group in
+                    Section(group.title) {
+                        ForEach(group.chats) { c in
+                            chatRow(c).tag(SidebarItem.chat(c.id))
+                        }
                     }
                 }
             }
             .listStyle(.sidebar)
             .searchable(text: $search, placement: .sidebar, prompt: "Search chats")
+            .onReceive(NotificationCenter.default.publisher(for: .NSCalendarDayChanged)) { _ in
+                today = Calendar.current.startOfDay(for: Date())
+            }
 
             ModelStatusFooter()
         }
@@ -58,21 +70,20 @@ struct SidebarView: View {
 
     private var filteredChats: [Conversation] {
         let q = search.trimmingCharacters(in: .whitespaces).lowercased()
-        let sorted = state.conversations.sorted { $0.updated > $1.updated }
+        let sorted = state.sortedChats
         guard !q.isEmpty else { return sorted }
         return sorted.filter { c in
             c.title.lowercased().contains(q) || c.messages.contains { $0.content.lowercased().contains(q) }
         }
     }
 
-    private func navRow(_ title: String, _ icon: String, _ item: SidebarItem, badge: Int = 0) -> some View {
+    private func navRow<Trailing: View>(_ title: String, _ icon: String, _ item: SidebarItem,
+                                        @ViewBuilder trailing: () -> Trailing = { EmptyView() }) -> some View {
         Label {
             HStack {
                 Text(title)
                 Spacer()
-                if badge > 0 {
-                    Text("\(badge)").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-                }
+                trailing()
             }
         } icon: {
             Image(systemName: icon).foregroundStyle(Theme.accent)
@@ -83,25 +94,28 @@ struct SidebarView: View {
     @ViewBuilder
     private func chatRow(_ c: Conversation) -> some View {
         if renaming == c.id {
-            TextField("Title", text: $renameText, onCommit: {
-                state.renameChat(c.id, renameText)
-                renaming = nil
-            })
-            .textFieldStyle(.plain)
+            TextField("Title", text: $renameText)
+                .textFieldStyle(.plain)
+                .focused($renameFocused)
+                .onSubmit { commitRename(c.id) }
+                .onExitCommand { renaming = nil }
+                // Like Finder: clicking elsewhere keeps the new name.
+                .onChange(of: renameFocused) { _, focused in if !focused { commitRename(c.id) } }
+                .onAppear { DispatchQueue.main.async { renameFocused = true } }
+                .accessibilityLabel("Chat title")
         } else {
             HStack(spacing: 8) {
-                if state.generatingConversation == c.id {
-                    ProgressView().controlSize(.mini)
+                if state.generatingConversation == c.id || state.pendingSend == c.id {
+                    ProgressView().controlSize(.mini).accessibilityLabel("Generating")
                 } else {
                     Image(systemName: "bubble.left").foregroundStyle(.secondary).font(.system(size: 11))
+                        .accessibilityHidden(true)
                 }
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(c.title).lineLimit(1)
-                    Text(c.updated, style: .relative).font(.system(size: 10)).foregroundStyle(.tertiary)
-                }
+                Text(c.title).lineLimit(1)
             }
+            .help("\(c.title)\nUpdated \(c.updated.formatted(date: .abbreviated, time: .shortened))")
             .contextMenu {
-                Button("Rename") { renameText = c.title; renaming = c.id }
+                Button("Rename") { startRename(c) }
                 Button("Duplicate") {
                     var copy = c
                     copy.id = UUID()
@@ -111,43 +125,145 @@ struct SidebarView: View {
                     state.scheduleSave()
                 }
                 Divider()
-                Button("Delete", role: .destructive) { state.deleteChat(c.id) }
+                Button("Delete", role: .destructive) { state.deleteChat(c.id, undoManager: undoManager) }
             }
+            .accessibilityActions {
+                Button("Rename") { startRename(c) }
+                Button("Delete") { state.deleteChat(c.id, undoManager: undoManager) }
+            }
+        }
+    }
+
+    private func startRename(_ c: Conversation) {
+        renameText = c.title
+        renaming = c.id
+    }
+
+    private func commitRename(_ id: UUID) {
+        guard renaming == id else { return }
+        let t = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { state.renameChat(id, t) }   // an empty title keeps the old one
+        renaming = nil
+    }
+}
+
+/// Chats grouped by when they were last updated, newest first.
+enum ChatGroups {
+    struct Group { let title: String; let chats: [Conversation] }
+
+    static func group(_ chats: [Conversation], today: Date, calendar: Calendar = .current) -> [Group] {
+        var order: [String] = []
+        var buckets: [String: [Conversation]] = [:]
+        for c in chats {
+            let t = title(for: c.updated, today: today, calendar: calendar)
+            if buckets[t] == nil { order.append(t) }
+            buckets[t, default: []].append(c)
+        }
+        return order.map { Group(title: $0, chats: buckets[$0] ?? []) }
+    }
+
+    static func title(for date: Date, today: Date, calendar: Calendar = .current) -> String {
+        let day = calendar.startOfDay(for: date)
+        let days = calendar.dateComponents([.day], from: day, to: today).day ?? 0
+        switch days {
+        case ...0: return "Today"
+        case 1: return "Yesterday"
+        case 2...7: return "Previous 7 Days"
+        case 8...30: return "Previous 30 Days"
+        default: return date.formatted(.dateTime.month(.wide).year())
         }
     }
 }
 
-/// Bottom-of-sidebar status: loaded model and memory.
+/// "My Models" row status: the model count, or an active-download count while downloads run. Reads only
+/// counts that change when a download starts or ends (not the 10 Hz progress), so the sidebar doesn't re-render per tick.
+private struct ModelsRowStatus: View {
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        if state.activeDownloadCount > 0 {
+            Label("\(state.activeDownloadCount)", systemImage: "arrow.down.circle.fill")
+                .labelStyle(CompactLabel())
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(Theme.accent)
+                .accessibilityLabel(state.activeDownloadCount == 1 ? "1 download in progress" : "\(state.activeDownloadCount) downloads in progress")
+        } else if !state.localModels.isEmpty {
+            Text("\(state.localModels.count)").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                .accessibilityLabel("\(state.localModels.count) models")
+        }
+    }
+}
+
+/// "Local Server" row status when the server runs: its port, and whether it has a model to serve.
+private struct ServerRowStatus: View {
+    @Environment(AppState.self) private var state
+    @State private var server = ServerController.shared
+
+    var body: some View {
+        if server.running {
+            let ready = state.loadedInfo != nil
+            HStack(spacing: 4) {
+                Circle().fill(ready ? Theme.good : .orange).frame(width: 6, height: 6)
+                Text(ready ? String(server.port) : "No model").font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(ready ? "Running on port \(server.port)" : "Running on port \(server.port), no model loaded")
+            .help(ready ? "Serving on port \(server.port)" : "Running on port \(server.port): requests fail until a model is loaded")
+        }
+    }
+}
+
+/// Bottom-of-sidebar status: loaded model and memory. Clicking it opens the model picker.
 struct ModelStatusFooter: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             UpdatePill()
-            switch state.loadState {
-            case .loaded(let info):
-                HStack(spacing: 6) {
-                    Circle().fill(Theme.good).frame(width: 7, height: 7)
-                        .shadow(color: Theme.good, radius: 4)
-                    Text(info.name).font(.system(size: 11, weight: .semibold)).lineLimit(1)
+            Button { state.openModelPicker() } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    switch state.loadState {
+                    case .loaded(let info):
+                        HStack(spacing: 6) {
+                            Circle().fill(Theme.good).frame(width: 7, height: 7)
+                                .shadow(color: Theme.good, radius: 4)
+                            Text(info.name).font(.system(size: 11, weight: .semibold)).lineLimit(1)
+                        }
+                        MemoryBar(used: info.parameterBytes, total: Fmt.physicalMemory)
+                    case .loading(let name):
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.mini)
+                            Text("Loading \(name)…").font(.system(size: 11)).lineLimit(1)
+                        }
+                    default:
+                        HStack(spacing: 6) {
+                            Circle().fill(.secondary.opacity(0.5)).frame(width: 7, height: 7)
+                            Text("No model loaded").font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                    }
                 }
-                MemoryBar(used: info.parameterBytes, total: Fmt.physicalMemory)
-            case .loading(let name):
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.mini)
-                    Text("Loading \(name)…").font(.system(size: 11)).lineLimit(1)
-                }
-            default:
-                HStack(spacing: 6) {
-                    Circle().fill(.secondary.opacity(0.5)).frame(width: 7, height: 7)
-                    Text("No model loaded").font(.system(size: 11)).foregroundStyle(.secondary)
-                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .help("Choose a model (⌘L)")
+            .accessibilityLabel(footerLabel)
+            .accessibilityHint("Choose a model to load")
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(cornerRadius: 12)
         .padding(10)
+    }
+
+    private var footerLabel: String {
+        switch state.loadState {
+        case .loaded(let info):
+            return "Loaded: \(info.name), \(Fmt.bytes(info.parameterBytes)) of weights, \(Fmt.bytes(Fmt.physicalMemory)) of memory"
+        case .loading(let name): return "Loading \(name)"
+        default: return "No model loaded"
+        }
     }
 }
 

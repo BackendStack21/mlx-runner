@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.1.0
+
+A usability pass on the app. The engine, the server and the command line are unchanged, except that a model which fails to load no longer unloads the one before it.
+
+**New**
+
+- **Read while a reply streams.** Scrolling up during a reply keeps your place: the chat no longer jumps back to the bottom with every update. "Jump to latest" brings you back, and sending a message follows the new reply again.
+- **The context window is visible.** The composer shows how full the model's context was after the last reply ("3.1K / 8.2K", orange from 75%, red from 95%). When older messages were left out to fit, a line in the chat marks where the model's view begins.
+- **Sending loads the model.** With no model loaded, sending a message loads the last model you used and answers once it is ready; an empty chat offers "Load <model> · <size>". Unsent text is kept per chat instead of following you to the next one.
+- **When MLX Runner opens** (Settings, both off by default): load the last model, and start the local server. A server started this way always binds to localhost; serving on the local network is chosen each session.
+- **Stopped replies say why**: "Reached the reply limit", "Ran out of tokens while thinking" or "The context window is full", with Raise Limit, Raise Context (reloads the model) and Regenerate.
+- **Settings that need a reload say so.** Changing the context length, draft model or sparse attention shows "Reload <model> to apply the new settings" in the inspector. "Reset to Model Defaults" restores the loaded model's own sampling settings (its `generation_config.json`).
+- **Chat list**: grouped by day (Today, Yesterday, Previous 7 Days, Previous 30 Days, then by month) without ticking timestamps. Rename focuses the title, Esc cancels and clicking away keeps the new name. Edit ▸ Undo Delete Chat puts a deleted chat back.
+- **Keyboard**: ⌘L Load Model… (type to filter, ↑/↓, ⏎), ⌃⌘I inspector, ⌘R regenerate, ⇧⌘C copy the last reply, ⇧⌘] / ⇧⌘[ next and previous chat, ⇧⌘L Local Server. In a message being edited, Esc cancels and ⌘⏎ sends.
+- **Status at a glance**: the sidebar shows the server's port while it runs (orange when no model is loaded) and the number of active downloads. The model card at the bottom of the sidebar opens the model picker, and a finished download bounces the Dock icon when the app is in the background.
+- **Accessibility**: VoiceOver labels for the send and stop button, the composer, the inspector sliders, the model bar and the icon buttons; messages are headings with Copy, Edit and Regenerate actions; announcements when a reply finishes, a model loads or a chat is deleted. An unsupported architecture is marked with a symbol, not only in orange. Reduce Motion stills the background and the typing animations. White text on the user bubbles, New Chat and Send now has at least 4.5:1 contrast: their gradient ends in a deeper blue.
+
+**Fixes**
+
+- **A model that fails to load no longer leaves nothing loaded.** The tokenizer, draft-model and memory checks now run before the current model is unloaded, so picking a model too large for the Mac keeps the previous one loaded and the local server answering.
+- **Delete All Chats asks first.** It deleted every chat at once.
+- ⌘. was bound twice (Model ▸ Stop Generating and the send button).
+
 ## 2.0.1
 
 Fixes for Ctrl-C in the command line and for errors from the local server, and tool calling for Qwen 3.5.

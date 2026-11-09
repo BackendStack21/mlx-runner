@@ -37,13 +37,36 @@ struct MLXRunnerApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") { state.newChat() }.keyboardShortcut("n")
             }
+            InspectorCommands()
+            // Enablement reads only cheap state (`isGenerating`, `selection`, `loadState`): the menu is
+            // rebuilt whenever what it reads changes, so nothing here reads `conversations`.
+            CommandMenu("Chat") {
+                Button("Regenerate Reply") {
+                    if let id = state.selectedChatID { state.regenerate(in: id) }
+                }
+                .keyboardShortcut("r")
+                .disabled(state.isGenerating || state.selectedChatID == nil)
+                Button("Copy Last Reply") { state.copyLastReply() }
+                    .keyboardShortcut("c", modifiers: [.command, .shift])
+                    .disabled(state.selectedChatID == nil)
+                Divider()
+                Button("Next Chat") { state.selectAdjacentChat(1) }
+                    .keyboardShortcut("]", modifiers: [.command, .shift])
+                Button("Previous Chat") { state.selectAdjacentChat(-1) }
+                    .keyboardShortcut("[", modifiers: [.command, .shift])
+            }
             CommandMenu("Model") {
+                Button("Load Model…") { state.openModelPicker() }.keyboardShortcut("l")
+                Divider()
                 Button("Discover Models") { state.selection = .discover }.keyboardShortcut("d", modifiers: [.command, .shift])
                 Button("My Models") { state.selection = .models }.keyboardShortcut("m", modifiers: [.command, .shift])
+                Button("Local Server") { state.selection = .server }.keyboardShortcut("l", modifiers: [.command, .shift])
                 Divider()
                 Button("Stop Generating") { state.stopGeneration() }
                     .keyboardShortcut(".", modifiers: .command)
                     .disabled(!state.isGenerating)
+                Button("Reload Model") { state.reloadModel() }
+                    .disabled(state.loadedInfo == nil || state.isGenerating)
                 Button("Eject Model") { state.eject() }
                     .keyboardShortcut("e", modifiers: [.command, .shift])
                     .disabled(state.loadedInfo == nil)
@@ -158,6 +181,7 @@ struct WelcomeView: View {
                     Button("Discover Models") { state.selection = .discover }.buttonStyle(.borderedProminent)
                     Button("New Chat") { state.newChat() }
                 }
+                .accessibilityElement(children: .contain)
             }
         }
     }

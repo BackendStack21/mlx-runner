@@ -69,7 +69,10 @@ gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx
 - Streaming responses with Markdown rendering: headings, lists, tables, quotes, and code blocks with syntax highlighting and copy.
 - Qwen3 and Qwen 3.5 thinking mode: reasoning appears in a collapsible "Thought for N s" block. A per-model toggle turns it on or off; each model starts with its own default (Qwen3.5 0.8B and 2B answer directly, as their model cards advise).
 - Live tok/s while generating. Each reply also shows tok/s, token count and time to first token.
-- Edit and resend, regenerate, copy, a per-chat system prompt, and searchable, persistent chat history.
+- A context meter shows how full the model's context window is, and the chat marks where older messages were left out to fit. A reply that stops early says why (reply limit, full context) and offers to raise the limit.
+- Sending with no model loaded loads the last one used. Optionally (Settings), the last model loads and the local server starts when the app opens.
+- Edit and resend, regenerate, copy, a per-chat system prompt, and searchable, persistent chat history grouped by day, with undo for a deleted chat.
+- Keyboard shortcuts for the common actions (⌘L load a model, ⌘R regenerate, ⇧⌘] / ⇧⌘[ switch chats), VoiceOver labels and actions throughout, and Reduce Motion support.
 - An inspector panel for temperature, top-p, top-k, min-p, repeat penalty, max tokens, context length, draft model and long-context sparse attention.
 
 **Local Server**
@@ -85,7 +88,7 @@ gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx
 - Chat message text is tokenized as plain text, so a message can't inject control tokens and forge turns.
 - Links in model cards and replies open only for https (with a confirmation for non-Hugging Face hosts) and mailto.
 - Chat history is never overwritten if it can't be read; it is saved on send and on quit.
-- A memory guard refuses models that won't fit in GPU-addressable memory, with a clear message.
+- A memory guard refuses models that won't fit in GPU-addressable memory, with a clear message; the model already loaded stays loaded.
 - Long chats are trimmed to fit the context window, oldest turns first. The system prompt and the latest message are always kept.
 - Cancellation is per request, so the server and the chat UI never cancel each other.
 - Errors such as a gated model, a network failure, a full context or an unsupported architecture surface in the UI.
