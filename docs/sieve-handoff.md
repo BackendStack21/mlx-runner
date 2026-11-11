@@ -6,6 +6,11 @@ this repository but no Mac, no Swift toolchain and no Metal. Read it before
 
 ## State of the branch
 
+**Update, 2026-11-11:** steps 0 to 4 are done on an M2 Pro. Read
+[sieve-phase0-results.md](sieve-phase0-results.md) first: H1 failed, no installed export holds the
+multi-token head, and the specification is corrected from the measurements. Steps 5 to 7 wait for
+the owner's decisions. The rest of this file is the task as it was handed over.
+
 - Branch `feat/sieve-architecture-spec`, two commits on top of `main`, both documentation:
   `docs/sieve-architecture.md` (the specification) and this file.
 - **Nothing is implemented.** No kernel, no importer, no command, no test.

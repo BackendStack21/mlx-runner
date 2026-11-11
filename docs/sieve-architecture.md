@@ -1,10 +1,12 @@
 # Sieve: a touch-sparse model architecture for MLX (specification)
 
-**Status: a design for an architecture that does not exist yet. Nothing here is implemented, and
-nothing was measured for this document.** It was written on 2026-11-10 without access to a Mac. Every
-speed figure is either one of this repository's own measurements (README, CHANGELOG,
-[sparse-decode-attention.md](sparse-decode-attention.md); M2 Pro, 16 GB, 4-bit weights) or arithmetic
-on them, and is labelled. The numbers called "on paper" assume the operating points of
+**Status: a design for an architecture that does not exist yet. Nothing here is implemented.** It was
+written on 2026-11-10 without access to a Mac. On 2026-11-11 the first part of phase 0 was measured on
+an M2 Pro (16-core GPU, 16 GB): [sieve-phase0-results.md](sieve-phase0-results.md). Sections 1, 3, 4, 6
+and 13 are corrected from it, and **Head's certificate ([5.2](#52-head-the-vocabulary-axis)) failed its
+gate**, so no part of the design is lossless any more. Every speed figure is either a measurement
+(this repository's README and CHANGELOG, or the phase 0 results) or a projection from measurements,
+and is labelled. The numbers called "on paper" assume the operating points of
 [section 6](#6-flagships-and-on-paper-operating-points) can be reached at acceptable quality; whether
 they can is what [section 13](#13-plan-and-gates) tests first.
 [Section 15](#15-sources-and-what-was-not-verified) lists what could not be verified.
@@ -57,21 +59,24 @@ importer never changes a weight: it adds what the screens need (a sketch, router
 in closed form by least squares or eigendecomposition on text the model reads or writes itself. No
 loss function, no gradient step.
 
-**Where that puts the targets, on paper.** Speeds below are this repository's measured rates times
-the cost model's ratio at the operating point named (section 6). They are what the design aims at,
-not results.
+**Where that puts the targets, on paper.** Projections from this Mac's measurements (M2 Pro,
+2026-11-11): the measured dense rate times the cost model's ratio at the operating point named
+(section 6), with the measured constants and the real model shapes. The operating points themselves
+are still assumptions. They are what the design aims at, not results. As first written, before
+anything was measured, the four decode figures were 620, 440, 260 and 130.
 
 | Model | Source | Profile | Decode, M2 Pro | Prefill, M2 Pro | Decode, 500 GB/s Mac | Prefill, 10 TFLOPS Mac | Intelligence |
 |---|---|---|---|---|---|---|---|
-| Sieve-0.8B | Qwen3.5-0.8B | `fast` | 620 | 5,670 | 880 | 17,000 | its source's, less the profile's loss |
-| Sieve-1B | Llama 3.2 1B | `fast` | 440 | 5,530 | 740 | 16,800 | its source's, less the profile's loss |
-| Sieve-4B-A1 | Qwen3.5-4B | `max` | 260 | 900 | 450 | 2,700 | the 4B's, less the loss; above it only by spending speed ([12](#12-the-intelligence-target)) |
-| Sieve-9B-A2 | Qwen3.5-9B | `max` | 130 | 470 | 280 | 1,400 | the 9B's, less the loss; beats the 4B if it loses under 3.4 MMLU-Pro points |
+| Sieve-0.8B | Qwen3.5-0.8B | `fast` | 410 | 4,930 | 550 | 14,200 | its source's, less the profile's loss |
+| Sieve-1B | Llama 3.2 1B | `fast` | 400 | 5,910 | 610 | 16,600 | its source's, less the profile's loss |
+| Sieve-4B-A1 | Qwen3.5-4B | `max` | 180 | 1,030 | 310 | 2,900 | the 4B's, less the loss; above it only by spending speed ([12](#12-the-intelligence-target)) |
+| Sieve-9B-A2 | Qwen3.5-9B | `max` | 120 | 620 | 240 | 1,700 | the 9B's, less the loss; beats the 4B if it loses under 3.4 MMLU-Pro points |
 
 Read as targets:
 
-- **T1 and T2 at 1B, on the reference M2 Pro: in range.** Qwen3.5-0.8B at 620 / 5,670 and Llama 3.2
-  1B at 440 / 5,530 in `fast`, 610 / 6,580 in `max`. Today they run at 271 / 2,780 and 202 / 1,720.
+- **T2 at 1B, on the reference M2 Pro: in range. T1: only at the furthest profile.** In `fast`,
+  Llama 3.2 1B projects to 400 / 5,910 and Qwen3.5-0.8B to 410 / 4,930; 500 tok/s needs `max`
+  (560 and 550), with an output-changing Head. Measured today: 203 / 1,724 and 253 / 2,779.
 - **T3 needs a source that is already better than the 4B.** An import is at best its source, and no
   1B-parameter open model is near a 4B Qwen ([4.3](#43-intelligence-a-1b-budget-not-a-1b-source)).
   The architecture's answer is to separate *stored* from *touched*: import a 4B or 9B model and
@@ -84,8 +89,8 @@ Read as targets:
 
 | Axis | Evidence | Risk |
 |---|---|---|
-| Head | The proof is elementary; how tight it is on real hidden states is unmeasured. | Low; one day decides it. |
-| Stride | Reported gains of 4–57% in other MLX runtimes, acceptance 44–88%. | Medium; depends on a cheaper 2-token pass. |
+| Head | **Measured: the certificate failed** (it certifies the whole vocabulary on four models). An uncertified screen by rows may reach 27–29% of the head's bytes at 99.9% agreement on the argmax; that is Bounded and its effect on text is unmeasured. | Decided for the certificate; medium for the Bounded screen. |
+| Stride | Reported gains of 4–57% in other MLX runtimes, acceptance 44–88%. **No mlx-community 4-bit export of Qwen 3.5 holds the head's weights.** A 2-token pass measures 1.40 steps. | Medium to high; needs its own export first. |
 | Experts | Channel-level sparsity of 40–70% is published for 7B+ models, expert-level routing for ReLU models; neither for 1B-class SiLU models. | Medium to high. |
 | Pyramid, prefill | A published training-free method reports 2.2× on larger models; `fast` asks for a mean depth of 0.4, which is 2.5× from depth alone, on smaller ones. | High. |
 | Pyramid, decode | Early exit is published mostly with training; exits through fitted lenses on untouched weights are untested. | Highest. |
@@ -95,8 +100,8 @@ Read as targets:
 
 1. **Is "1B" the stored size or the touched size?** T3 is only coherent for touched size. [Both:
    Sieve-0.8B and Sieve-1B carry T1 and T2; an A1 import of a larger model carries T3.]
-2. **Is an output-changing, opt-in mode acceptable?** Everything except Head and Stride changes
-   output. [Yes, with sparse decode attention's treatment: off means untouched, the lossless profile
+2. **Is an output-changing, opt-in mode acceptable?** Since phase 0, everything except Stride changes
+   output, and Stride has no weights in the installed exports: without this there is nothing to build. [Yes, with sparse decode attention's treatment: off means untouched, the lossless profile
    stays token-identical, the divergence of the others is measured and published.]
 3. **Which Mac is the reference?** [Keep the M2 Pro as the measured baseline and state every target
    per machine with the formulas of section 3.]
@@ -157,16 +162,25 @@ Two things follow.
 - **Small models are half overhead.** Qwen3 0.6B spends 1.71 ms reading weights and 1.79 ms on
   everything else. Cutting bytes alone cannot double its speed; cutting the layers that run cuts
   both terms, which is why depth is an axis.
-- **The constants are a fit, not a measurement.** Three parameters, seven points, one machine, and
-  the hybrid Qwen 3.5 layers have a different dispatch count from the others. `mlxr bench` prints the
-  real split (`decode step @16: … without qkv … lmhead …`, `tiny dependent dispatch`, `lm_head matvec`).
-  Replacing η, c0 and c1 with those lines is the first task on a Mac.
+- **The constants above are a fit, and phase 0 replaced them** (M2 Pro, 2026-11-11, three rounds of
+  `mlxr bench` on five models; [results](sieve-phase0-results.md)):
+  - The body's bytes are read at about 183 GB/s (η = 0.93), the head at 171–188 GB/s.
+  - **c1 is 56–101 µs per layer, by model** (Qwen3 0.6B 56, Qwen3.5 0.8B 66, Llama 3.2 1B 68,
+    Qwen3.5 4B 101, 9B 92). About 47 µs of it is the fixed cost of a layer's four matvec dispatches
+    (10–16 µs each, whatever their size); the small kernels add 14–31 µs, and a linear-attention
+    layer of the larger Qwen 3.5 models reads and writes 4 MB of state.
+  - **c0 is about 0.05 ms**, not 0.25.
+  - A dependent dispatch alone costs 1.5–1.8 µs: latency between dispatches is not the overhead.
+  - Reading a result back between two command buffers costs **0.18 ms** (0.25 on the 4B).
+
+  The fixed cost per matvec is what Experts cannot remove: it shrinks the bytes of a layer's MLP
+  matvecs, not their number.
 
 ### 3.2 Multi-token passes
 
 A pass that advances T tokens reads the weights once. Its cost relative to a single step is c_v(T).
-Measured here (CHANGELOG 1.3.0): **c_v(2) ≈ 1.5** (Qwen3 0.6B: 5.4 ms against 3.5; Qwen3 8B: 40.7 ms
-against 26.2) and **c_v(3…8) ≈ 3** on an M2 Pro, where the small-batch kernel is bound by arithmetic,
+Measured in phase 0 (GPU time, M2 Pro, 2026-11-11): **c_v(2) = 1.40** (Qwen3 0.6B: 4.89 ms against
+3.51; Llama 3.2 1B: 6.86 against 4.91; CHANGELOG 1.3.0 had about 1.5) and **c_v(3…8) ≈ 3** on an M2 Pro, where the small-batch kernel is bound by arithmetic,
 not by loads.
 
 With γ drafted tokens per pass, each accepted with probability α, and a draft cost of c_d steps:
@@ -193,7 +207,9 @@ operations per token. With an effective GEMM rate F,
 
 The README's prefill rates at 512 tokens imply F = 3.06 TFLOPS (Qwen2.5 0.5B, 0.358B body, 4,270
 tok/s), 2.66 (Qwen3 0.6B, 0.440B, 3,020) and 3.35 (Llama 3.2 1B, 0.973B, 1,720), against the 3.5
-TFLOPS the 64×64 tile measures on its own. This document uses **F = 3.3 TFLOPS** for the M2 Pro.
+TFLOPS the 64×64 tile measures on its own. This document used **F = 3.3 TFLOPS** for the M2 Pro. Measured in phase 0 (`layer GEMMs at T=512`,
+five models): **3.46–3.57 TFLOPS**. The projection GEMMs are 77–78% of a 512-token prefill on the two
+smallest models and 92–95% on the others.
 
 ## 4. Budgets: what each target demands
 
@@ -210,7 +226,10 @@ TFLOPS the 64×64 tile measures on its own. This document uses **F = 3.3 TFLOPS*
 | 500 GB/s | 16 | 462 MB | 629 MB |
 | 500 GB/s | 24 | 294 MB | 545 MB |
 
-A 1B model is 560–700 MB at 4 bits. On an M2 Pro a token may touch about **a third of it**, which no
+(With the measured per-layer cost of 56–68 µs on the 1B-class models the left column's budgets are
+smaller still: 16 layers at 68 µs leave 0.86 ms, about 157 MB.)
+
+A 1B model is 560–700 MB at 4 bits. On an M2 Pro a token may touch about **a quarter to a third of it**, which no
 single mechanism delivers and the product of three does: a quarter of the head, 60% of the depth, 45%
 of the MLP in the layers that run.
 
@@ -301,6 +320,17 @@ logits: the argmax when greedy, otherwise the exact top k (`sample_token` builds
 `top_k` logits, or the top 512 when top-k is off, capped at `SMP_CAP`).
 
 Head computes exactly those logits and proves that no other row can be among them.
+
+> **Measured in phase 0: the proof holds and proves nothing useful.** On Qwen3 0.6B, Qwen3.5 0.8B,
+> Llama 3.2 1B and Qwen3.5 4B, at r = d/16, d/8 and d/4, the certified set is the whole vocabulary:
+> the bound is ±25 to ±56 logits where the top two logits are 1.3 to 1.8 apart. The final hidden
+> states are not low-rank (a quarter of the dimensions hold 81–86% of their variance), so ρ stays
+> large. **Gate H1 failed; Head is not Exact.** What is left is the fixed-budget screen named at the
+> end of this section, which works by rows and not by blocks of 64 (26% of the head's bytes for a
+> 4-bit sketch of rank d/4, and the 700–1,800 best rows hold the dense argmax in 99.9% of states).
+> The rest of this section describes the mechanism as designed; read "proves" and "Exact" in it as
+> the design that was tested, not as properties of anything that can be built.
+> See [sieve-phase0-results.md](sieve-phase0-results.md).
 
 **Fitted by the importer:**
 - μ, the mean final hidden state over a calibration text (d values);
@@ -515,6 +545,10 @@ disabled for Qwen 3.5 because the recurrent state cannot drop a rejected token.
 
 Stride adds the drafter that costs almost nothing, and the state handling Qwen 3.5 needs.
 
+> **Phase 0:** none of the mlx-community 4-bit exports of Qwen 3.5 (0.8B, 2B, 4B, 9B) contains an
+> `mtp.` tensor, though every config declares the head. The original `Qwen/Qwen3.5-0.8B` holds 15
+> (41 MB in bf16). Stride needs an export that keeps them, or a sidecar that carries them.
+
 **The drafter.** Qwen 3.5 and 3.6 checkpoints ship a multi-token-prediction head
 (`mtp_num_hidden_layers: 1`). As described in mlx-lm pull request 990: it predicts token t+2 from the
 backbone's hidden state at t and the embedding of token t+1, through `pre_fc_norm_hidden`,
@@ -610,55 +644,65 @@ importer will find the real ones, model by model.
 | `fast` | 40% | 45% at 0.375, 25% at 0.625 | 0.63 | 0.40 |
 | `max` | 35% | 60% at 0.25, 25% at 0.50 | 0.43 | 0.35 |
 
-Decode, tok/s. M2 Pro rows are the README's measured dense rate times the cost model's ratio; the 500
-GB/s rows are the model alone (same c0 and c1 assumed, nothing measured). Touched bytes per token and
-the A-number are for `max`.
+**Projections from this Mac's measurements (M2 Pro, 2026-11-11).** Dense rates are measured
+(`mlxr bench`, medians of three rounds); the rest is `swift scripts/sieve-budget.swift --measured`:
+the measured constants of section 3.1, the real shapes, a readback of 0.18 ms per exit test, and Head
+as the uncertified screen (27% of the head per evaluation, Bounded). The 500 GB/s rows are the cost
+model alone, with nothing measured on such a Mac. `--spec` prints the tables this section was first
+written with; their `fast` and `max` decode figures are in the last column.
 
-| Model | Dense | `balanced` | `fast` | `max` | `max` touches |
+Decode, tok/s. Touched bytes per token and the A-number are for `max`.
+
+| Model | Dense | `balanced` | `fast` | `max` | `max` touches | First written as (`fast` / `max`) |
+|---|---|---|---|---|---|---|
+| **M2 Pro** | | | | | | |
+| Qwen3 0.6B | 288 | 350 | 460 | 620 | 104 MB, A0.2 | 500 / 680 |
+| Qwen3.5 0.8B | 253 | 320 | 410 | 550 | 141 MB, A0.3 | 620 / 830 |
+| Llama 3.2 1B | 203 | 300 | 400 | 560 | 178 MB, A0.3 | 440 / 610 |
+| Qwen3.5 4B | 61.8 | 95 | 130 | 180 | 675 MB, A1.2 | 180 / 260 |
+| Qwen3.5 9B | 36.6 | 61 | 84 | 120 | 1.19 GB, A2.1 | 88 / 130 |
+| **500 GB/s, assumed** | | | | | | |
+| Qwen3 0.6B | 430 (model) | 460 | 590 | 800 | | 690 / 920 |
+| Qwen3.5 0.8B | 390 (model) | 440 | 550 | 750 | | 880 / 1,160 |
+| Llama 3.2 1B | 380 (model) | 470 | 610 | 830 | | 740 / 980 |
+| Qwen3.5 4B | 120 (model) | 170 | 220 | 310 | | 315 / 450 |
+| Qwen3.5 9B | 80 (model) | 120 | 170 | 240 | | 190 / 280 |
+
+With the dense head instead (Head off), `fast` and `max` on the M2 Pro project to 360 / 470 (Qwen3
+0.6B), 290 / 380 (Qwen3.5 0.8B), 290 / 380 (Llama 3.2 1B), 97 / 130 (4B) and 63 / 87 (9B).
+
+Prefill, tok/s on an M2 Pro (multiply by F / 3.5 for a GPU with effective rate F):
+
+| Model | Dense (measured) | `balanced` | `fast` | `max` | First written as (`fast` / `max`) |
 |---|---|---|---|---|---|
-| **M2 Pro** | | | | | |
-| Qwen3 0.6B | 286 | 390 | 500 | 680 | 102 MB, A0.2 |
-| Qwen3.5 0.8B | 271 | 490 | 620 | 830 | 104 MB, A0.2 |
-| Llama 3.2 1B | 202 | 330 | 440 | 610 | 176 MB, A0.3 |
-| Qwen3.5 4B | 62 | 130 | 180 | 260 | 666 MB, A1.2 |
-| A 9B model (size assumed) | 30 (model) | 64 | 88 | 130 | 1.2 GB, A2.2 |
-| **500 GB/s, assumed** | | | | | |
-| Qwen3 0.6B | 440 (model) | 550 | 690 | 920 | |
-| Qwen3.5 0.8B | 437 (model) | 710 | 880 | 1,160 | |
-| Llama 3.2 1B | 398 (model) | 580 | 740 | 980 | |
-| Qwen3.5 4B | 119 (model) | 230 | 315 | 450 | |
-| A 9B model (size assumed) | 69 (model) | 140 | 190 | 280 | |
+| Qwen3 0.6B | 3,025 | 4,250 | 6,900 | 7,760 | 6,990 / 7,850 |
+| Qwen3.5 0.8B | 2,779 | 3,530 | 4,930 | 5,310 | 5,670 / 6,180 |
+| Llama 3.2 1B | 1,724 | 3,140 | 5,910 | 7,080 | 5,530 / 6,580 |
+| Qwen3.5 4B | 454 | 650 | 940 | 1,030 | 820 / 900 |
+| Qwen3.5 9B | 244 | 370 | 560 | 620 | 430 / 470 |
 
-Prefill, tok/s on an M2 Pro (multiply by F / 3.3 for a GPU with effective rate F):
-
-| Model | Dense (README) | `balanced` | `fast` | `max` |
-|---|---|---|---|---|
-| Qwen3 0.6B | 3,020 | 4,350 | 6,990 | 7,850 |
-| Qwen3.5 0.8B | 2,780 | 3,910 | 5,670 | 6,180 |
-| Llama 3.2 1B | 1,720 | 2,980 | 5,530 | 6,580 |
-| Qwen3.5 4B | 403 | 570 | 820 | 900 |
-
-Assumptions behind both tables, all to be replaced by measurements:
-- Head touches 26% of the head per evaluation; an exit test costs one evaluation and 0.05 ms of
-  synchronisation (assumed).
-- Experts touches the kept rows, all of Dᵀ's scales and biases, and the router.
-- Qwen 3.5 bodies are split 35% mixer and attention, 65% MLP (assumed: their configurations were not
-  available), with 24 and 32 layers; the 9B's size (5.6 GB), head (0.5 GB) and 40 layers are assumed.
-- Qwen 3.5 imports include Stride at 1.25× (an acceptance near 0.75 with a 2-token pass near 1.3).
-- Prefill: GEMMs are 85% of today's prefill time; tiles over token subsets run at 80% of today's
-  efficiency (assumed; small batches are slower today, see README "Limitations").
-- Extra dispatches for the router and exits are not counted beyond the synchronisation cost.
+Behind both tables:
+- Measured: dense rates; bytes of the head, the mixers and attention, and the MLPs; the per-layer and
+  per-step costs; the head's read rate; the GEMM share of prefill per model (77–95%); the readback.
+- Measured and negative: Head is not exact. The tables use the uncertified screen by rows (27% of the
+  head, three extra dispatches of 0.04 ms together per evaluation); its effect on output is unmeasured.
+- No Stride: the installed Qwen 3.5 exports have no multi-token head. With one, at an acceptance of
+  0.75 and the measured 2-token pass of 1.40 steps, section 3.2 gives about 1.2×.
+- Still assumed: the operating points of the first table of this section; that Experts touches the
+  kept rows, all of Dᵀ's scales and biases, and the router; tiles over token subsets at 80% of
+  today's efficiency; no cost for the router's and the fills' extra dispatches (each would add the
+  10–16 µs measured per matvec dispatch).
 
 What the tables say:
 
-- **Sieve-0.8B** (Qwen3.5-0.8B, `fast`): 620 tok/s decode and 5,670 tok/s prefill on an M2 Pro. T1
-  and T2, on the reference Mac, with the smallest model that has a multi-token head.
-- **Sieve-1B** (Llama 3.2 1B): 440 / 5,530 in `fast`, 610 / 6,580 in `max`. The plain-transformer
-  control: no Stride, the largest MLP share.
-- **Sieve-4B-A1** (Qwen3.5-4B, `max`): a 4B model touching 666 MB per token, 260 tok/s on an M2 Pro
-  against 62 dense. T1 at about 600 GB/s; T2 at about 18 effective TFLOPS.
-- **Sieve-9B-A2** (Qwen3.5-9B, `max`): the T3 candidate that needs no voting. 130 tok/s on an M2 Pro
-  on paper, against a 4B's 62.
+- **Sieve-1B** (Llama 3.2 1B): 400 / 5,910 in `fast`, 560 / 7,080 in `max`. The plain-transformer
+  control and now the best case: the largest MLP share (83% of the body).
+- **Sieve-0.8B** (Qwen3.5-0.8B): 410 / 4,930 in `fast`, 550 / 5,310 in `max`. Half its body is mixers
+  and attention, which Experts does not touch and a frozen position mostly still pays.
+- **T1 is met only in `max`** on the 1B-class models, and only with the output-changing Head.
+- **Sieve-4B-A1** (Qwen3.5-4B, `max`): 675 MB per token, 180 tok/s on an M2 Pro against 61.8 dense.
+- **Sieve-9B-A2** (Qwen3.5-9B, `max`): 120 tok/s on an M2 Pro on paper, against the dense 4B's 61.8
+  and its own 36.6.
 
 ## 7. Container format
 
@@ -917,17 +961,19 @@ be cut open at any layer; the quickest way is mlx-lm in a scratch repository out
 
 | # | Hypothesis | Measurement | Gate |
 |---|---|---|---|
-| 0 | The cost model | `mlxr bench` on Qwen3 0.6B, Llama 3.2 1B, Qwen3.5 0.8B; record the profile lines and the `verify step` lines | Replaces η, c0, c1 and c_v(2). |
-| H1 | Head's certificate is tight | Dump 20K final hidden states; fit μ and Q; count certified rows for k = 1, 2 and 64, r ∈ {d/16, d/8, d/4} | Median certified rows ≤ 2% of V and expected bytes ≤ 40% of the dense head for some r ≤ d/4. Otherwise Head becomes a fixed-budget, Bounded screen. |
+| 0 | The cost model | `mlxr bench` on Qwen3 0.6B, Llama 3.2 1B, Qwen3.5 0.8B; record the profile lines and the `verify step` lines | Replaces η, c0, c1 and c_v(2). **Done 2026-11-11** (section 3.1). |
+| H1 | Head's certificate is tight | Dump 20K final hidden states; fit μ and Q; count certified rows for k = 1, 2 and 64, r ∈ {d/16, d/8, d/4} | Median certified rows ≤ 2% of V and expected bytes ≤ 40% of the dense head for some r ≤ d/4. Otherwise Head becomes a fixed-budget, Bounded screen. **Failed 2026-11-11 on four models: 100% of V certified, 113–149% of the dense head's bytes.** |
 | H2 | A minority of experts carries the MLP | Cluster channels; with oracle selection, then with the fitted router, text NLL at 50, 40 and 35% of experts kept; the same per channel for comparison | NLL change ≤ +0.02 at ≤ 50% kept with the fitted router on the 1B-class candidates. Otherwise Experts is for 2B and larger only, or falls back to channel selection in decode. |
-| H3 | The multi-token head drafts well | Which installed Qwen 3.5 exports hold `mtp.*`; greedy acceptance on chat text | Acceptance ≥ 0.6. |
+| H3 | The multi-token head drafts well | Which installed Qwen 3.5 exports hold `mtp.*`; greedy acceptance on chat text | Acceptance ≥ 0.6. **No installed export holds the weights; acceptance not measured.** |
 | H4 | Tokens can leave early | Fit lenses at three depths; agreement of the lens argmax with the full model's against the margin; the share of positions that pass at δ = 1% and 2%; then the same with frozen states feeding later tokens | A mean depth ≤ 0.8 at δ = 1% and ≤ 0.65 at δ = 2%, with text NLL inside the profile's target. Otherwise Pyramid is prefill-only. |
 | H5 | Prompt tokens need few layers | Staged prefill with attention-scored keeping; NLL of the continuation and passkey recall against the mean depth | NLL change ≤ +0.02 at mean depth ≤ 0.7 and ≤ +0.05 at ≤ 0.4. Otherwise T2 is out of reach on an M2 Pro above a 0.33B body. |
 | H6 | The axes compose | All Bounded axes together at the `fast` and `max` points on Qwen3.5-0.8B, -4B and -9B; the suite of section 11 on the two larger ones | `fast` inside its NLL target. For T3: route R1 or R2 of section 12 holds on at least MMLU-Pro and GPQA. |
 
 **Phase 1: Head and the `exact` profile (1–2 weeks).** Importer steps 1–4 and 9, the four head
 kernels, `--sieve exact`. Gate: `exact` is exact on every installed model, and decode improves by at
-least 8% on Qwen3.5 0.8B and Llama 3.2 1B.
+least 8% on Qwen3.5 0.8B and Llama 3.2 1B. **Withdrawn after phase 0: H1 failed, so there is no exact
+Head to build.** A Bounded Head (a row-level screen) would belong with phase 3 or 4, behind decision 2
+and its own measurement of text NLL.
 
 **Phase 2: Stride (1–2 weeks).** The multi-token head, per-token state outputs, the cycle; then the
 2-token pass (c_v from 1.5 toward 1.2) as its own performance pass. Gate: token-identical, and at
@@ -945,8 +991,9 @@ combined budget. Gate: `fast` inside its target; on Qwen3.5 0.8B, decode ≥ 500
 
 **Phase 6: per-layer overhead (open-ended).** E1–E3, each measured alone.
 
-Order of value if the plan is cut short: phase 1 is a lossless gain for every model and every user;
-phases 3 and 4 are where the targets live.
+Order of value if the plan is cut short, after phase 0: there is no lossless phase left on the
+installed exports. Phases 3 and 4 are where the targets live, and each needs its hypothesis (H2, H4,
+H5) tested first; Stride (phase 2) is lossless but needs an export with the multi-token head and H3.
 
 ## 14. Risks, open questions and what was ruled out
 
@@ -1053,15 +1100,19 @@ Cited from memory, not read for this document (titles and figures to be checked)
 
 Not verified, and to be checked before any number here is quoted elsewhere:
 
-- **Nothing was run.** No kernel, no importer, no benchmark, no experiment. Every "on paper" figure
-  is arithmetic on the README's numbers at assumed operating points.
+- **Only steps 0 to 4 of phase 0 were run** (2026-11-11, [results](sieve-phase0-results.md)): the
+  benchmarks, the cost model's constants, the model shapes, and H1. No kernel, no importer, no
+  experiment on Experts, Pyramid or Stride. Every "on paper" figure is arithmetic on measured dense
+  rates at assumed operating points.
 - **The operating points are assumptions.** No source shows a 1B-class model holding its quality at
   40% of its experts and 63% of its depth together.
-- **Qwen 3.5 configurations.** huggingface.co was not reachable while writing. Hidden sizes (1,024
-  for the 0.8B, 2,560 for the 4B) and the vocabulary size (about 248K) are taken from this
-  repository's CHANGELOG; MLP sizes, layer counts and everything about the 9B are assumed.
+- **Qwen 3.5 configurations** were assumed when this was written and are now read from the exports
+  ([results](sieve-phase0-results.md), step 2): 24 layers for the 0.8B and 2B, 32 for the 4B and the
+  9B, a vocabulary of 248,320. Section 5 still quotes some first estimates (a 143 MB head for the
+  0.8B is right; the 4B's "3.03 GB" was its file with the vision tower, its text model is 2.37 GB).
 - **Benchmark scores** come from search summaries of the model cards, not from the cards.
 - **The papers** were not read: arxiv.org was not reachable.
 - **GPU peak rates and other Macs' bandwidths** are quoted figures, not measurements with this
   engine.
-- **The cost model** is a three-parameter fit to seven rows of one table.
+- **The cost model** was a three-parameter fit to seven rows of one table; section 3.1 now carries
+  the measured constants next to it.
