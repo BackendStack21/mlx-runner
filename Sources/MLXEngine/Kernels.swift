@@ -2786,6 +2786,64 @@ kernel void head_exact(device const uchar* w      [[buffer(0)]],
     if (lane == 0) y[row] = v;
 }
 
+// ---------------------------------------------------------------------------
+// Sieve experiment hooks (SieveProbe.swift): encoded only when a test sets Transformer.probe.
+// ---------------------------------------------------------------------------
+struct ProbeParams { int cols; int layer; int group; float threshold; };
+
+// Rows that exited at or before `layer` contribute nothing: their block output is zeroed.
+kernel void probe_exit(device float*        block [[buffer(0)]],
+                       device const int*    exits [[buffer(1)]],
+                       constant ProbeParams& p    [[buffer(2)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= p.cols) return;
+    if (exits[gid.y] <= p.layer) block[gid.y * uint(p.cols) + gid.x] = 0.0f;
+}
+
+kernel void probe_copy(device const float*  src [[buffer(0)]],
+                       device float*        dst [[buffer(1)]],
+                       constant ProbeParams& p  [[buffer(2)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= p.cols) return;
+    dst[gid.y * uint(p.cols) + gid.x] = src[gid.y * uint(p.cols) + gid.x];
+}
+
+// One threadgroup of 256 threads per row of act [T][cols]: a group of `group` neurons is kept when
+// its best |act| * norm reaches threshold * the row's best, and zeroed otherwise.
+kernel void probe_mlp(device float*        act      [[buffer(0)]],
+                      device const float*  norms    [[buffer(1)]],
+                      constant ProbeParams& p       [[buffer(2)]],
+                      device atomic_uint*  counters [[buffer(3)]],
+                      uint3 tg  [[threadgroup_position_in_grid]],
+                      uint tid  [[thread_index_in_threadgroup]],
+                      uint sg   [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tmax[8];
+    device float* row = act + ulong(tg.y) * ulong(p.cols);
+    const int G = p.group, ng = p.cols / G;
+    float m = 0.0f;
+    for (int g = int(tid); g < ng; g += 256)
+        for (int i = 0; i < G; i++) m = max(m, fabs(row[g * G + i]) * norms[g * G + i]);
+    const float sm = simd_max(m);
+    if (lane == 0) tmax[sg] = sm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float top = 0.0f;
+    for (int i = 0; i < 8; i++) top = max(top, tmax[i]);
+    uint kept = 0u, seen = 0u;
+    for (int g = int(tid); g < ng; g += 256) {
+        float gm = 0.0f;
+        for (int i = 0; i < G; i++) gm = max(gm, fabs(row[g * G + i]) * norms[g * G + i]);
+        seen++;
+        if (gm >= p.threshold * top) { kept++; continue; }
+        for (int i = 0; i < G; i++) row[g * G + i] = 0.0f;
+    }
+    kept = simd_sum(kept); seen = simd_sum(seen);
+    if (lane == 0) {
+        atomic_fetch_add_explicit(counters, kept, memory_order_relaxed);
+        atomic_fetch_add_explicit(counters + 1, seen, memory_order_relaxed);
+    }
+}
+
 // Explicit instantiations ----------------------------------------------------
 #define INST_QMM(B, T, TN, TT) \
   template [[host_name("qmm_" #B "_" #TN "_" #TT)]] kernel void qmm<B, T, TT>( \

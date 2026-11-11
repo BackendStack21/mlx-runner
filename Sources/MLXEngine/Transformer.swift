@@ -805,6 +805,8 @@ public final class Transformer {
     private var prepared: (cb: MTLCommandBuffer, offset: Int)?
     /// Developer profiling only (`profile`): kernel classes left out of `encode`.
     var profileSkip: Set<String> = []
+    /// Experiment hooks (tests only; nil in the app and the CLI). See `SieveProbe`.
+    var probe: SieveProbe? { didSet { prepared = nil } }
 
     /// Sparse decode attention (experimental, changes outputs; see `SparseAttention`): its budget,
     /// or nil for dense decode. It takes effect only when the model was loaded with sparse attention
@@ -1349,7 +1351,9 @@ public final class Transformer {
         // Sparse decode attention: one plan per step (the blocks every eligible layer scores).
         var sparsePlan: SparsePlan?
         if decode, !dense, sparseScores != nil, let sp = sparse { sparsePlan = sp.plan(position: offset) }
+        let probe = self.probe
         for (li, layer) in layers.enumerated() {
+            probe?.encodeCapture(enc, h: h, layer: li, T: T)
             let spec = layer.spec
             let D = spec.headDim, nKV = spec.numKVHeads, qkvCols = layer.qkvCols, I = layer.intermediate
             if let g = layer.gdn {
@@ -1514,6 +1518,7 @@ public final class Transformer {
             }
 
             if !skipO { layer.o.encode(enc, x: attnBuf, xStride: layer.o.inDim, y: tmp, yStride: H, T: T) }
+            probe?.encodeExit(enc, block: tmp, layer: li, T: T)
             if !skipNorm { layer.mlpNorm.encodeAdd(enc, h: h, residual: tmp, normedBy: layer.attnOutNorm, y: xn, dim: H, rows: T) }
 
             // MLP block: [gate|up] → act(gate)·up → down_proj
@@ -1534,7 +1539,9 @@ public final class Transformer {
             enc.dispatchThreads(MTLSize(width: I, height: T, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             }
+            probe?.encodeMLP(enc, act: mlpBuf, layer: li, intermediate: I, T: T)
             if !skipDown { layer.down.encode(enc, x: mlpBuf, xStride: I, y: tmp, yStride: H, T: T) }
+            probe?.encodeExit(enc, block: tmp, layer: li, T: T)
 
             // Residual add fused with the next norm (next layer's input norm, or the final norm).
             // The last layer's output only matters for the logits.
