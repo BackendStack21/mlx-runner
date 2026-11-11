@@ -11,7 +11,10 @@ may use 12.7 GB (`recommendedMaxWorkingSetSize`). Nothing else used the GPU duri
 > `--sieve balanced`: about +8% decode on four models, measured. See [sieve-head.md](sieve-head.md).
 > The projections below assumed the head at 27% of its bytes at the dense byte rate; the built
 > screen reads 19–32% of them at a lower rate, so its measured gain is below the "with Head"
-> columns.
+> columns. The other hypotheses were then measured on the models under 1B
+> ([steps 5 and 6](#steps-5-and-6-h2-h3-h4-and-h5-on-the-models-under-1b)): Experts and Pyramid
+> failed, Stride passed its gate with little projected gain. The `fast` and `max` projections further
+> down assumed operating points that those measurements rule out on these models.
 
 ## In short
 
@@ -303,13 +306,137 @@ H5 would have to confirm.
   and the 9B to 120 (was 130; its dense rate is higher than assumed, its gains lower). Three `max`
   answers from the 4B would take about as long as one dense answer, not 70% of it.
 
+## Steps 5 and 6. H2, H3, H4 and H5 on the models under 1B
+
+Measured on 2026-11-11 on the same Mac, after the owner asked for the remaining axes, on models
+under 1B only: Qwen3 0.6B (28 layers) and Qwen3.5 0.8B (24 layers). All in Swift in this engine, with
+the experiment hooks of `SieveProbe` (tests only). Text: this repository's own prose (README,
+CHANGELOG, docs) and code (the engine's Swift sources), 512-token chunks, the first 16 positions of
+each not scored. Quality only; nothing here is a speed measurement unless it says so.
+
+| Hypothesis | Gate | Result |
+|---|---|---|
+| H2, Experts | NLL ≤ +0.02 at ≤ 50% of the MLP kept | **Failed.** A perfect selector needs 55–67% of single neurons, and 96–99% of 64-neuron groups. |
+| H4, Pyramid in decode | mean depth ≤ 0.8 at δ = 1% | **Failed.** Mean depth 0.98–0.99. |
+| H5, Pyramid in prefill | NLL ≤ +0.02 at depth ≤ 0.7 | **Failed.** Needs depth 0.79 on both models. |
+| H3, Stride | acceptance ≥ 0.6 | **Passed**: 0.68 on the model's own answers. Its cost side leaves a few percent at best (below). |
+
+### H2: Experts (`SieveExpertsTests`)
+
+After the activation, a neuron (or a group of 64 consecutive neurons, the only unit the down
+projection's quantization lets a kernel skip without changing a weight) is kept when its score
+|h_n| · ‖down column n‖ reaches a share τ of the row's best. This is an oracle: it reads the true
+activations. 7,936 scored positions per domain; ΔNLL is prose / code.
+
+| Model | Unit | Kept | ΔNLL | Top-1 agreement with dense |
+|---|---|---|---|---|
+| Qwen3 0.6B | neuron | 61.4% | 0.000 / +0.003 | 91.4% / 94.2% |
+| | neuron | 54.9% | +0.008 / +0.016 | 88.6% / 92.1% |
+| | neuron | 47.8% | +0.027 / +0.040 | 85.3% / 89.5% |
+| | neuron | 32.7% | +0.150 / +0.159 | 73.5% / 79.7% |
+| | group of 64 | 96.3% | −0.004 / +0.001 | 95.1% / 96.3% |
+| | group of 64 | 90.7% | +0.025 / +0.026 | 87.6% / 90.3% |
+| | group of 64 | 73.8% | +0.21 / +0.23 | 69.2% / 76.3% |
+| Qwen3.5 0.8B | neuron | 66.9% | +0.013 / +0.018 | 92.7% / 94.0% |
+| | neuron | 60.2% | +0.023 / +0.026 | 89.8% / 91.7% |
+| | neuron | 53.1% | +0.043 / +0.052 | 86.4% / 88.8% |
+| | group of 64 | 96.5% | +0.026 / +0.027 | 90.9% / 92.1% |
+| | group of 64 | 79.6% | +0.18 / +0.22 | 75.2% / 79.3% |
+
+- Cheap predictors of the oracle's top half (chance is 50% recall): the previous token's set 59%, a
+  static set 60%, a rank-256 projection of the MLP input through the exact gate/up 71%, at 2.4 to 2.7
+  times the oracle's output error.
+- On Qwen3 0.6B the upper half of the layers alone tolerates 36% kept at no cost; Qwen3.5 0.8B shows
+  no such difference.
+- Not tested: clustered (non-consecutive) groups, which would need the down projection re-quantized;
+  per-layer thresholds; the specification's ridge router.
+
+### H4 and H5: Pyramid (`SievePyramidTests`)
+
+A row that exits at layer E contributes nothing from there on; the layers above still compute their
+K/V rows (or recurrent state) from its frozen state (the specification's frozen fill, with β = 0).
+
+**H5.** The first 384 rows of each chunk exit at E, the last 128 run every layer and are scored
+(4,096 tokens per domain).
+
+| Depth E / L | Qwen3 0.6B ΔNLL prose / code | Qwen3.5 0.8B ΔNLL prose / code |
+|---|---|---|
+| 0.25 | +0.545 / +0.781 | +0.453 / +0.676 |
+| 0.46 | +0.268 / +0.424 | +0.189 / +0.340 |
+| 0.57–0.58 | +0.124 / +0.194 | +0.203 / +0.335 |
+| 0.67–0.68 | +0.061 / +0.096 | +0.051 / +0.092 |
+| 0.75 | +0.016 / +0.027 | +0.034 / +0.032 |
+| 0.79 | +0.008 / +0.016 | +0.013 / +0.012 |
+| 0.86–0.88 | +0.003 / +0.004 | +0.012 / +0.009 |
+
++0.02 needs 79% of the layers on both models, +0.05 needs 75%. Keeping the last 8 or 32 prompt tokens
+dense moves that by at most one layer.
+
+**H4.** Exits decided causally from the logit lens at candidate layers.
+
+- The raw lens is unusable: at three quarters of the depth it agrees with the full model on 30–32% of
+  tokens (Qwen3 0.6B) and 4–10% (Qwen3.5 0.8B).
+- With a fitted affine lens (fitted on other chunks of the same text, so optimistic), the points
+  inside the targets let 4–11% of tokens exit, all in the top quarter of the stack: mean depth
+  0.98–0.99.
+
+Not tested: the β-extrapolated fill, attention-scored keeping of prompt tokens, passkey recall,
+contexts beyond 512 tokens, text outside this repository.
+
+### H3: Stride (`SieveStrideTests`)
+
+No mlx-community export keeps the multi-token head (mlx-lm's converter drops `mtp.*`). A third-party
+export does: `fcobos/Qwen3.5-0.8B-oQ4-mtp` (661 MB, mixed 4/5/6-bit). The head is
+`fc([norm(embed(x_t+1)) | norm(h_t)])`, one full-attention block with its own context, a norm and the
+tied output projection (per vLLM and llama.cpp; run here on the CPU in the test, with the block
+checked against the engine on all six full-attention layers of the backbone to 3.4e-4).
+
+| Text | Drafts | Acceptance |
+|---|---|---|
+| The model's own greedy answers (8 prompts) | 1,797 | 0.679 (0.476 to 0.887 per prompt) |
+| Repository prose, teacher-forced | 7,904 | 0.616 |
+| Repository code, teacher-forced | 7,904 | 0.672 |
+
+- h_t is the final norm's output: the pre-norm state scores 0.574 and 0.267.
+- The head's own confidence is calibrated: drafting only at ≥ 0.5 covers 59% of tokens at 0.898.
+- It needs its context: with a window of 8 positions acceptance falls to 0.573, with 1 to 0.444.
+- The head's wiring has no reference check (no other inference stack was used).
+
+**The cost side, measured** (`SieveTimingTests.twoTokenPassAgainstOneTokenStep`, body only):
+
+| Model | One token | Two tokens | Ratio |
+|---|---|---|---|
+| Qwen3.5 0.8B, 4-bit (mlx-community) | 3.36 ms | 4.75 ms | 1.42 |
+| Qwen3.5 0.8B, mixed 6-bit (the export with the head) | 3.98 ms | 16.23 ms | 4.07 |
+| Qwen3 0.6B, 4-bit | 3.66 ms | 5.09 ms | 1.39 |
+
+A Stride cycle is one two-token pass, three head evaluations (two rows and the draft) and the extra
+block, for 1.68 tokens. **Projected, not measured**, for the 4-bit Qwen3.5 0.8B with the head's
+weights added as a sidecar:
+
+- with dense heads (the lossless form): about 6.6 ms for 1.68 tokens, 3.9 ms per token, the same as
+  dense decode today. No gain.
+- with Sieve Head on all three evaluations: about 5.7 ms, 3.4 ms per token, 295 tok/s against 275
+  with Sieve Head alone (+7%). Drafting only when the head is confident projects to about +11%.
+- less the CPU round trip each cycle needs to learn whether the draft was accepted (0.18 ms,
+  step 1), and with the acceptance on a 4-bit backbone unmeasured.
+
+On the only export that holds the head, a two-token pass costs four single steps (no multi-token
+kernel exists for 6-bit weights), so Stride loses there as it stands.
+
+### What this leaves
+
+On models under 1B, on this Mac: Head is built and worth about 8%. Experts and Pyramid fail their
+gates. Stride passes its gate and projects to a few percent on one model family, for the largest
+engineering cost of the five axes. The targets T1 (500 tok/s) and T2 (5,000 tok/s prefill) are not
+reachable by this design on these models. Larger models were not tested in this round.
+
 ## Not tested
 
 | Step | Why |
 |---|---|
-| 5 (H3) | No installed export holds the multi-token head. The quick route needs decision 4 (mlx-lm outside this repository) and the original weights of a model (`Qwen/Qwen3.5-0.8B`, 1.7 GB in bf16). |
-| 6 (H2, H4, H5) | Decisions 2 and 4. |
-| 7 (H6) | Needs two of H2, H4, H5 to pass, and the evaluation suite's data. |
+| H2, H4, H5 on models of 1B and above | The owner asked for models under 1B first. |
+| 7 (H6) | Needs two of H2, H4, H5 to pass. None did. |
 
 ## Reproducing
 
@@ -321,7 +448,13 @@ swift scripts/sieve-budget.swift
 MLXR_SIEVE_TIMING=mlx-community/Qwen3-0.6B-4bit swift test -c release -Xswiftc -enable-testing --filter SieveTiming
 MLXR_SIEVE_H1=mlx-community/Qwen3-0.6B-4bit MLXR_SIEVE_TEXT=prose.txt,code.txt \
     swift test -c release -Xswiftc -enable-testing --filter SieveHead
+MLXR_SIEVE_EXPERTS=mlx-community/Qwen3-0.6B-4bit swift test -c release -Xswiftc -enable-testing --filter SieveExperts
+MLXR_SIEVE_PYRAMID=mlx-community/Qwen3-0.6B-4bit MLXR_SIEVE_PART=h5 MLXR_SIEVE_CHUNKS=32 \
+    swift test -c release -Xswiftc -enable-testing --filter SievePyramid
+MLXR_SIEVE_PYRAMID=mlx-community/Qwen3-0.6B-4bit MLXR_SIEVE_PART=h4 MLXR_SIEVE_CHUNKS=16 MLXR_SIEVE_LENS=fit \
+    swift test -c release -Xswiftc -enable-testing --filter SievePyramid
+MLXR_SIEVE_STRIDE=fcobos/Qwen3.5-0.8B-oQ4-mtp swift test -c release -Xswiftc -enable-testing --filter SieveStride
 ```
 
-The two tests are skipped unless their variable is set. H1 takes one to three minutes per model in a
+Every one of these tests is skipped unless its variable is set. H1 takes one to three minutes per model in a
 release build, and needs about 6 GB for the 4B.

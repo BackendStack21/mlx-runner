@@ -2,7 +2,10 @@
 
 **Status: a design. One part is implemented:** Head, as the uncertified row screen, opt-in
 (`--sieve balanced`), measured at about +8% decode on four models
-([sieve-head.md](sieve-head.md), 2026-11-11). Experts, Pyramid and Stride are not built or tested. It was
+([sieve-head.md](sieve-head.md), 2026-11-11). On models under 1B, Experts (H2) and Pyramid (H4, H5) then failed their gates and Stride (H3) passed
+its acceptance gate with little projected gain
+([results](sieve-phase0-results.md#steps-5-and-6-h2-h3-h4-and-h5-on-the-models-under-1b)); none of
+the three is built. It was
 written on 2026-11-10 without access to a Mac. On 2026-11-11 the first part of phase 0 was measured on
 an M2 Pro (16-core GPU, 16 GB): [sieve-phase0-results.md](sieve-phase0-results.md). Sections 1, 3, 4, 6
 and 13 are corrected from it, and **Head's certificate ([5.2](#52-head-the-vocabulary-axis)) failed its
@@ -965,10 +968,10 @@ be cut open at any layer; the quickest way is mlx-lm in a scratch repository out
 |---|---|---|---|
 | 0 | The cost model | `mlxr bench` on Qwen3 0.6B, Llama 3.2 1B, Qwen3.5 0.8B; record the profile lines and the `verify step` lines | Replaces η, c0, c1 and c_v(2). **Done 2026-11-11** (section 3.1). |
 | H1 | Head's certificate is tight | Dump 20K final hidden states; fit μ and Q; count certified rows for k = 1, 2 and 64, r ∈ {d/16, d/8, d/4} | Median certified rows ≤ 2% of V and expected bytes ≤ 40% of the dense head for some r ≤ d/4. Otherwise Head becomes a fixed-budget, Bounded screen. **Failed 2026-11-11 on four models: 100% of V certified, 113–149% of the dense head's bytes.** |
-| H2 | A minority of experts carries the MLP | Cluster channels; with oracle selection, then with the fitted router, text NLL at 50, 40 and 35% of experts kept; the same per channel for comparison | NLL change ≤ +0.02 at ≤ 50% kept with the fitted router on the 1B-class candidates. Otherwise Experts is for 2B and larger only, or falls back to channel selection in decode. |
-| H3 | The multi-token head drafts well | Which installed Qwen 3.5 exports hold `mtp.*`; greedy acceptance on chat text | Acceptance ≥ 0.6. **No installed export holds the weights; acceptance not measured.** |
-| H4 | Tokens can leave early | Fit lenses at three depths; agreement of the lens argmax with the full model's against the margin; the share of positions that pass at δ = 1% and 2%; then the same with frozen states feeding later tokens | A mean depth ≤ 0.8 at δ = 1% and ≤ 0.65 at δ = 2%, with text NLL inside the profile's target. Otherwise Pyramid is prefill-only. |
-| H5 | Prompt tokens need few layers | Staged prefill with attention-scored keeping; NLL of the continuation and passkey recall against the mean depth | NLL change ≤ +0.02 at mean depth ≤ 0.7 and ≤ +0.05 at ≤ 0.4. Otherwise T2 is out of reach on an M2 Pro above a 0.33B body. |
+| H2 | A minority of experts carries the MLP | Cluster channels; with oracle selection, then with the fitted router, text NLL at 50, 40 and 35% of experts kept; the same per channel for comparison | NLL change ≤ +0.02 at ≤ 50% kept with the fitted router on the 1B-class candidates. Otherwise Experts is for 2B and larger only, or falls back to channel selection in decode. **Failed 2026-11-11 on Qwen3 0.6B and Qwen3.5 0.8B: an oracle needs 55–67% of single neurons, 96–99% of 64-neuron groups.** |
+| H3 | The multi-token head drafts well | Which installed Qwen 3.5 exports hold `mtp.*`; greedy acceptance on chat text | Acceptance ≥ 0.6. **Passed 2026-11-11 on a third-party export that keeps the head: 0.68 on the model's own answers. The cost side projects to +7% at best with Sieve Head, nothing without.** |
+| H4 | Tokens can leave early | Fit lenses at three depths; agreement of the lens argmax with the full model's against the margin; the share of positions that pass at δ = 1% and 2%; then the same with frozen states feeding later tokens | A mean depth ≤ 0.8 at δ = 1% and ≤ 0.65 at δ = 2%, with text NLL inside the profile's target. Otherwise Pyramid is prefill-only. **Failed 2026-11-11 on both models under 1B: mean depth 0.98–0.99.** |
+| H5 | Prompt tokens need few layers | Staged prefill with attention-scored keeping; NLL of the continuation and passkey recall against the mean depth | NLL change ≤ +0.02 at mean depth ≤ 0.7 and ≤ +0.05 at ≤ 0.4. Otherwise T2 is out of reach on an M2 Pro above a 0.33B body. **Failed 2026-11-11 on both models under 1B: +0.02 needs depth 0.79.** |
 | H6 | The axes compose | All Bounded axes together at the `fast` and `max` points on Qwen3.5-0.8B, -4B and -9B; the suite of section 11 on the two larger ones | `fast` inside its NLL target. For T3: route R1 or R2 of section 12 holds on at least MMLU-Pro and GPQA. |
 
 **Phase 1: Head and the `exact` profile (1–2 weeks).** Importer steps 1–4 and 9, the four head

@@ -88,4 +88,31 @@ struct SieveTimingTests {
         }
         _ = sink
     }
+
+    /// Stride's cost side: a pass over two tokens against a single-token step, without the head
+    /// (`profileSkip`), in consecutive positions as decode runs them. Alternating blocks.
+    @Test func twoTokenPassAgainstOneTokenStep() throws {
+        guard let repo = ProcessInfo.processInfo.environment["MLXR_SIEVE_TIMING"], let dir = installedModel(repo) else {
+            print("SIEVE TIMING: model not installed"); return
+        }
+        let t = try Transformer(directory: dir, contextLength: 4096, sparse: nil)
+        t.profileSkip = ["lmhead"]
+        defer { t.profileSkip = [] }
+        var pos = 0
+        _ = try t.forward((0..<16).map { Int32(1000 + $0 * 37) }, offset: 0); pos = 16
+        func block(_ n: Int, tokens: Int) throws -> Double {
+            let s = DispatchTime.now().uptimeNanoseconds
+            for i in 0..<n {
+                _ = try t.forward((0..<tokens).map { Int32(2000 + (pos + i + $0) % 5000) }, offset: pos)
+                pos += tokens
+            }
+            return Double(DispatchTime.now().uptimeNanoseconds - s) / 1e6 / Double(n)
+        }
+        _ = try block(30, tokens: 1); _ = try block(30, tokens: 2)
+        var one: [Double] = [], two: [Double] = []
+        for _ in 0..<6 { one.append(try block(60, tokens: 1)); two.append(try block(60, tokens: 2)) }
+        one.sort(); two.sort()
+        print(String(format: "SIEVE TIMING %@: body only, positions 16 to %d: one token %.3f ms, two tokens %.3f ms per pass (median of 6 blocks of 60): ratio %.2f",
+                     repo as NSString, pos, one[3], two[3], two[3] / one[3]))
+    }
 }
