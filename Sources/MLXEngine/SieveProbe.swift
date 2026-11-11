@@ -15,6 +15,8 @@ struct ProbeParams { var cols: Int32; var layer: Int32; var group: Int32; var th
 /// - **MLP mask** (Experts): after the activation, groups of `mlpGroup` intermediate neurons are
 ///   kept when their best score |h_n| · ‖down column n‖ reaches `mlpThreshold` times the row's
 ///   best, and zeroed otherwise. `counters` accumulates groups kept and groups seen.
+/// - **MLP capture** (Experts): the MLP input [T × hidden] and the activation's output
+///   [T × intermediate] (before the mask) of layer `captureMLPLayer`, after `prepareMLPCapture`.
 final class SieveProbe {
     let exitLayer: MTLBuffer        // [maxBatch] Int32
     var exitsActive = false
@@ -25,6 +27,9 @@ final class SieveProbe {
     var mlpLayers: Range<Int> = 0..<Int.max
     private(set) var columnNorms: [MTLBuffer] = []   // per layer [intermediate] Float
     let counters: MTLBuffer         // [2] UInt32: groups kept, groups seen
+    var captureMLPLayer: Int?
+    private(set) var mlpInput: MTLBuffer?        // [maxBatch × hidden] Float
+    private(set) var mlpActivation: MTLBuffer?   // [maxBatch × intermediate] Float
     let exitPSO, copyPSO, mlpPSO: MTLComputePipelineState
     private let hidden: Int
 
@@ -57,6 +62,23 @@ final class SieveProbe {
             let p = b.contents().bindMemory(to: Float.self, capacity: w.cols)
             for c in 0..<w.cols { p[c] = n[c].squareRoot() }
             return b
+        }
+    }
+
+    func prepareMLPCapture(_ t: Transformer) throws {
+        mlpInput = try GPU.shared.buffer(t.maxBatch * hidden * 4)
+        mlpActivation = try GPU.shared.buffer(t.maxBatch * (t.layers.map(\.intermediate).max() ?? 0) * 4)
+    }
+
+    /// Copies the MLP input `x` and the activation's output `act` of layer `captureMLPLayer`.
+    func encodeMLPCapture(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, act: MTLBuffer, layer: Int, intermediate: Int, T: Int) {
+        guard captureMLPLayer == layer, let mlpInput, let mlpActivation, T * intermediate * 4 <= mlpActivation.length else { return }
+        enc.setComputePipelineState(copyPSO)
+        for (src, dst, cols) in [(x, mlpInput, hidden), (act, mlpActivation, intermediate)] {
+            enc.set(src, 0, 0)
+            enc.set(dst, 0, 1)
+            enc.params(ProbeParams(cols: Int32(cols), layer: 0, group: 1, threshold: 0), 2)
+            enc.dispatchThreads(MTLSize(width: cols, height: T, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }
     }
 

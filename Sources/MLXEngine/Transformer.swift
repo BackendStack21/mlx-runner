@@ -1539,6 +1539,7 @@ public final class Transformer {
             enc.dispatchThreads(MTLSize(width: I, height: T, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             }
+            probe?.encodeMLPCapture(enc, x: xn, act: mlpBuf, layer: li, intermediate: I, T: T)
             probe?.encodeMLP(enc, act: mlpBuf, layer: li, intermediate: I, T: T)
             if !skipDown { layer.down.encode(enc, x: mlpBuf, xStride: I, y: tmp, yStride: H, T: T) }
             probe?.encodeExit(enc, block: tmp, layer: li, T: T)
