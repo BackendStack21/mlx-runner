@@ -11,7 +11,8 @@ struct ProbeParams { var cols: Int32; var layer: Int32; var group: Int32; var th
 ///   residual stays what it was after the layers below. The layers above still run on that frozen
 ///   state, which writes their K/V rows and advances a recurrent state from it: the design's
 ///   "frozen fill". The final norm and the head then see the frozen state (the logit lens).
-/// - **Capture**: the residual stream [T × hidden] as it enters layer `captureLayer`.
+/// - **Capture**: the residual stream [T × hidden] as it enters layer `captureLayer` (the layer
+///   count: as it enters the final norm).
 /// - **MLP mask** (Experts): after the activation, groups of `mlpGroup` intermediate neurons are
 ///   kept when their best score |h_n| · ‖down column n‖ reaches `mlpThreshold` times the row's
 ///   best, and zeroed otherwise. `counters` accumulates groups kept and groups seen.

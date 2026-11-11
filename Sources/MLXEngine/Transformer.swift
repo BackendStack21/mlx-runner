@@ -1569,6 +1569,8 @@ public final class Transformer {
             }
             next.encodeAdd(enc, h: h, residual: tmp, normedBy: residualNorm, hScale: layer.layerScalar, y: xn, dim: H, rows: T)
         }
+        // captureLayer == layers.count: the residual as it enters the final norm (passes that compute logits).
+        probe?.encodeCapture(enc, h: h, layer: layers.count, T: T)
 
         if skipLMHead {
         } else if computeLogits && allLogits {
