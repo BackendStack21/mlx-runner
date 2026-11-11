@@ -1,6 +1,8 @@
 # Sieve: a touch-sparse model architecture for MLX (specification)
 
-**Status: a design for an architecture that does not exist yet. Nothing here is implemented.** It was
+**Status: a design. One part is implemented:** Head, as the uncertified row screen, opt-in
+(`--sieve balanced`), measured at about +8% decode on four models
+([sieve-head.md](sieve-head.md), 2026-11-11). Experts, Pyramid and Stride are not built or tested. It was
 written on 2026-11-10 without access to a Mac. On 2026-11-11 the first part of phase 0 was measured on
 an M2 Pro (16-core GPU, 16 GB): [sieve-phase0-results.md](sieve-phase0-results.md). Sections 1, 3, 4, 6
 and 13 are corrected from it, and **Head's certificate ([5.2](#52-head-the-vocabulary-axis)) failed its

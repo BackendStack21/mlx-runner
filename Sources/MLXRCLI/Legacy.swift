@@ -327,7 +327,9 @@ func legacyBench(_ model: String) throws {
     let dir = try installedModelDirectory(model, resolver: .live)
     // Long-context decode (opt-in): MLXR_BENCH_CTX=8192,32768 adds a section at the end.
     let longBench = LongBench(env: ProcessInfo.processInfo.environment)
-    let t = try Transformer(directory: dir, contextLength: max(4096, (longBench.contexts.max() ?? 0) + longBench.margin + 64))
+    let t = try Transformer(directory: dir, contextLength: max(4096, (longBench.contexts.max() ?? 0) + longBench.margin + 64),
+                            sieve: SieveProfile.fromEnvironment)
+    if let h = t.sieveInfo { print("sieve: " + CLI.sieveLine(h)) } else if let why = t.sieveOffReason { print("sieve: off (\(why))") }
     print("weights: \(formatBytes(t.weightBytes))")
     if let sp = t.sparse {
         print(t.sparseAvailable
@@ -417,19 +419,21 @@ func serveKeyNotice(key: String?, generated: Bool) -> String? {
 
 /// `ctx`: the `--ctx` flag (nil: 8192, and no note when the model holds fewer tokens).
 func legacyServe(model: String, port: UInt16, ctx requested: Int?, lan: Bool, apiKey: String?, draft: String?, sparse: String?,
-                 interrupts: Interrupts = .shared) async throws {
+                 sieve: String? = nil, interrupts: Interrupts = .shared) async throws {
     let ctx = requested ?? 8192
     let sparseArg = try sparseSetting(sparse)
+    let sieveArg = try CLI.sieveSetting(sieve)
     // LAN mode always needs a key: use --api-key / MLXR_API_KEY, or generate one.
     var key = apiKey ?? ProcessInfo.processInfo.environment["MLXR_API_KEY"]
     let generated = lan && key == nil
     if generated { key = OpenAIServer.generateAPIKey() }
     let dir = try installedModelDirectory(model, resolver: .live)
-    let info = try await InferenceEngine.shared.load(directory: dir, draftDirectory: try draftDirectory(draft, target: dir), contextLength: ctx, sparse: sparseArg)
+    let info = try await InferenceEngine.shared.load(directory: dir, draftDirectory: try draftDirectory(draft, target: dir), contextLength: ctx, sparse: sparseArg, sieve: sieveArg)
     print("Loaded \(info.name)\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s"
           + ", context \(info.contextLength) tokens")
     if let requested, let note = contextNote(requested: requested, info: info) { print(note) }
     print(sparseSummary(info))
+    if let line = CLI.sieveSummary(info) { print(line) }
     let server = OpenAIServer(port: port, allowLAN: lan, apiKey: key)
     server.onLog = { print($0) }
     try startServer { try server.start() }

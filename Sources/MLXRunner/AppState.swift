@@ -104,6 +104,7 @@ struct LoadSettings: Equatable {
     var contextLength: Int
     var draftModel: String
     var sparse: SparseAttention?
+    var sieve: SieveProfile?
 }
 
 /// A load that failed while another model stayed loaded (the engine checks before it unloads).
@@ -188,6 +189,13 @@ final class AppState {
     var sparseConfig: SparseAttention? {
         sparseAttention ? SparseAttention(topK: sparseKeys, perHead: sparsePerHead) : nil
     }
+    /// Sieve (off by default): the output projection by rows, for models that have a fitted sidecar.
+    /// Faster decode, changed output.
+    var sieve: Bool = false { didSet { saveSettings() } }
+    var sieveProfile: SieveProfile? { sieve ? .balanced : nil }
+    /// Progress of a running Sieve fit (nil: none running), and the last fit's failure.
+    var sieveFitStatus: String?
+    var sieveFitError: String?
     var lastModelPath: String? { didSet { saveSettings() } }
 
     @ObservationIgnored private var activeDownloads: [String: ModelDownload] = [:]
@@ -247,7 +255,7 @@ final class AppState {
 
     /// Settings as the next load would use them.
     var currentLoadSettings: LoadSettings {
-        LoadSettings(contextLength: contextLength, draftModel: draftModel, sparse: sparseConfig)
+        LoadSettings(contextLength: contextLength, draftModel: draftModel, sparse: sparseConfig, sieve: sieveProfile)
     }
 
     /// Load-time settings changed since the loaded model was loaded.
@@ -311,6 +319,7 @@ final class AppState {
         let ctx = contextLength
         let draftSetting = draftModel
         let sparse = sparseConfig
+        let sieve = sieveProfile
         let settings = currentLoadSettings
         let models = localModels
         Task {
@@ -330,7 +339,7 @@ final class AppState {
                         return d.directory
                     }
                 }.value
-                let info = try await engine.load(directory: model.directory, draftDirectory: draft, contextLength: ctx, sparse: sparse)
+                let info = try await engine.load(directory: model.directory, draftDirectory: draft, contextLength: ctx, sparse: sparse, sieve: sieve)
                 loadState = .loaded(info)
                 loadedWith = settings
                 lastModelPath = model.directory.path
@@ -359,6 +368,34 @@ final class AppState {
                     }
                 }
             }
+        }
+    }
+
+    /// Fits the loaded model's Sieve sidecar (a minute or more with the GPU to itself: the model is
+    /// unloaded for it), turns Sieve on and loads the model again.
+    func fitSieve() {
+        guard sieveFitStatus == nil, let dir = loadedInfo?.directory,
+              let model = localModels.first(where: { $0.directory == dir }) else { return }
+        stopGeneration()
+        sieveFitError = nil
+        sieveFitStatus = "Starting"
+        loadState = .loading(model.name)
+        loadedWith = nil
+        Task {
+            do {
+                _ = try await engine.fitSieve(directory: dir) { line in
+                    Task { @MainActor in if self.sieveFitStatus != nil { self.sieveFitStatus = line } }
+                }
+                sieveFitStatus = nil
+                sieve = true
+                announce("Sieve fitted for \(model.name)")
+            } catch {
+                sieveFitStatus = nil
+                sieveFitError = error.localizedDescription
+                announce("Couldn't fit Sieve for \(model.name)")
+            }
+            loadState = .idle
+            load(model)
         }
     }
 
@@ -775,6 +812,7 @@ final class AppState {
         sparseAttention = d.object(forKey: "sparseAttention") as? Bool ?? true
         sparseKeys = d.object(forKey: "sparseKeys") as? Int ?? SparseAttention.standard.topK
         sparsePerHead = d.object(forKey: "sparsePerHead") as? Bool ?? true
+        sieve = d.object(forKey: "sieve") as? Bool ?? false
         lastModelPath = d.string(forKey: "lastModelPath")
     }
 
@@ -789,6 +827,7 @@ final class AppState {
         d.set(sparseAttention, forKey: "sparseAttention")
         d.set(sparseKeys, forKey: "sparseKeys")
         d.set(sparsePerHead, forKey: "sparsePerHead")
+        d.set(sieve, forKey: "sieve")
         d.set(lastModelPath, forKey: "lastModelPath")
     }
 }

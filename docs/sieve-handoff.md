@@ -11,6 +11,10 @@ this repository but no Mac, no Swift toolchain and no Metal. Read it before
 multi-token head, and the specification is corrected from the measurements. Steps 5 to 7 wait for
 the owner's decisions. The rest of this file is the task as it was handed over.
 
+Later the same day the owner asked for Sieve to be integrated into the CLI and the app: the row
+screen of step 4 is built as the opt-in `--sieve balanced` ([sieve-head.md](sieve-head.md)). That
+answers decision 2 (an output-changing, opt-in mode) with a yes; decisions 1, 3 and 4 are still open.
+
 - Branch `feat/sieve-architecture-spec`, two commits on top of `main`, both documentation:
   `docs/sieve-architecture.md` (the specification) and this file.
 - **Nothing is implemented.** No kernel, no importer, no command, no test.

@@ -7,6 +7,12 @@ below unless it is called a projection.
 **Machine.** Apple M2 Pro, 10 CPU cores, 16-core GPU, 16 GB, macOS 27.2 (26B123), Swift 6.4.2. The GPU
 may use 12.7 GB (`recommendedMaxWorkingSetSize`). Nothing else used the GPU during a measurement.
 
+> **Update, 2026-11-11.** The uncertified row screen of step 4 has since been built as the opt-in
+> `--sieve balanced`: about +8% decode on four models, measured. See [sieve-head.md](sieve-head.md).
+> The projections below assumed the head at 27% of its bytes at the dense byte rate; the built
+> screen reads 19–32% of them at a lower rate, so its measured gain is below the "with Head"
+> columns.
+
 ## In short
 
 | # | Hypothesis | Gate | Measured | Verdict |
