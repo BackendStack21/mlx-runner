@@ -1,37 +1,37 @@
-# Sieve Head: the output layer by rows
+# Sieve
 
-Status: built, opt-in, off by default. Measured on a MacBook Pro M2 Pro (16-core GPU, 16 GB),
-macOS 27.2, on 2026-11-11.
+The last layer of a model (the output projection, or head) scores every token of the vocabulary on
+every step, and reads its whole weight matrix to do it. The sampler then uses a handful of those
+scores. Sieve scores every token with a small approximation of the head, and computes the real
+score only for the most likely ones.
 
-**It changes output.** Without `--sieve`, nothing in the engine changes: there is no Sieve buffer and
-no Sieve dispatch, and greedy output is byte-identical to the build before it.
+It needs no training, but each model has to be **fitted** once: a step of one to four minutes that
+builds the approximation from the model's own weights and writes it next to the model.
 
-## What it does
+Status:
+- **Off by default.** With Sieve off, nothing changes: there is no Sieve buffer and no Sieve
+  dispatch, and greedy output is byte-identical to the build before it.
+- **It changes output** when on. That is an exception to the token-identical default path that
+  AGENTS.md otherwise requires.
+- **Speed** (M2 Pro, 4-bit): about 8% faster decode on the four models measured.
+- **Quality:** the likeliest token is kept in 99.66 to 100% of held-out states, and 0.01 to 0.37% of
+  sampled tokens change. See "Measured" for what was not measured.
+- **Only fitted models.** A model that has not been fitted runs at its normal speed.
 
-The output projection (the head) computes one logit per vocabulary row, and reads the whole matrix
-to do it: 88 MB on Qwen3 0.6B, 357 MB on Qwen3.5 4B, 12 to 20% of a decode step. The sampler then uses
-a handful of those logits.
-
-With Sieve on, a step that samples on the GPU does this instead, in the same command buffer:
-
-1. Projects the final hidden state onto r fitted directions (r is an eighth or a quarter of the
-   hidden size).
-2. Scores every row with a 4-bit sketch of the head in those directions (`head_sketch`).
-3. Finds the cut below which at most 16,384 rows remain (`head_cut`, `head_hist`, `head_cut2`).
-4. Computes the head's own logit for those rows (`head_select`, `head_exact`).
-
-The other rows keep their sketch value. The sampler runs unchanged on the result.
-
-The screen is not exact: a row the sketch ranks below the cut keeps its sketch value even when the
-head would have ranked it higher. So it is fitted and measured per model.
-
-Passes that hand logits to the CPU use the dense head as before: `forward`, speculative
-verification, scoring, tool-call sampling over a constrained set.
+Measured on a MacBook Pro M2 Pro (16-core GPU, 16 GB), macOS 27.2, on 2026-11-11.
 
 ## Using it
 
-Each model is fitted once. That takes one to four minutes with nothing else on the GPU, and writes
-`sieve/head.safetensors` into the model's directory (11 to 46 MB).
+**In the app:** the chat inspector's **Sieve** section has:
+- the **Sieve** switch. Like context length, it applies the next time a model is loaded;
+- a **Fit** button for the loaded model. Fitting unloads the model, fits it and loads it again with
+  Sieve on;
+- a warning when the switch is on and the loaded model is not fitted, or its fit cannot be used.
+
+The inspector's **Model** section shows whether Sieve is active for the loaded model.
+
+**On the command line:** `mlxr sieve` fits a model, and `mlxr run` and `mlxr serve` take
+`--sieve off|balanced`. `balanced` is the only profile.
 
 ```bash
 mlxr sieve mlx-community/Qwen3-0.6B-4bit
@@ -41,27 +41,53 @@ mlxr sieve mlx-community/Qwen3-0.6B-4bit --info
 mlxr sieve mlx-community/Qwen3-0.6B-4bit --remove
 ```
 
+- `--info` shows what the fit measured, and `--remove` deletes it.
 - `MLXR_SIEVE=balanced` is the same as `--sieve balanced`, and also applies to `mlxr bench`.
-- In the app: the inspector's Sieve section has the switch and a "Fit" button. Fitting unloads the
-  model, fits it and loads it again with Sieve on.
-- A model that has not been fitted, or whose sidecar was fitted to other weights, loads dense and
+- A model that has not been fitted, or whose fit belongs to other weights, loads without Sieve and
   says so.
-- `balanced` is the only profile.
 
-## The fit
+## Fitting a model
+
+The fit writes `sieve/head.safetensors` into the model's directory (11 to 46 MB). Keep the GPU free
+while it runs. The file is tied to the exact weights: another quantization or fine-tune of the same
+model needs its own fit.
 
 `mlxr sieve MODEL` collects about 9,000 final hidden states from the model's own answers to 40
 built-in prompts (temperature 0.8; every fourth prompt is held out), or from text files given with
 `--text`. It then:
 
 - takes the leading eigenvectors of the states' second moment as the directions;
-- multiplies the dequantized head by them and quantizes the result to 4 bits in groups of 64;
+- multiplies the dequantized head by them and quantizes the result to 4 bits in groups of 64 (the
+  sketch);
 - measures, on the held-out states, the screen as the kernels run it against the dense head.
 
 It tries a rank of an eighth of the hidden size first, then a quarter, then a half, and keeps the
-first that meets the target: the dense argmax kept in at least 99.5% of held-out states, and at most
-1% of sampled tokens changed (the total variation between the two sampling distributions at
-top-k 40, temperature 1). These limits are a proposal; the owner sets the final values.
+first that meets the target:
+
+- the dense head's likeliest token is kept in at least 99.5% of held-out states;
+- at most 1% of sampled tokens change (the total variation between the two sampling distributions
+  at top-k 40, temperature 1).
+
+A fit that misses the target at every rank is still written, and the command says that it missed.
+
+## How a step runs
+
+The head is 88 MB on Qwen3 0.6B and 357 MB on Qwen3.5 4B, and reading it is 12 to 20% of a decode
+step. With Sieve on, a step that samples on the GPU does this instead, in the same command buffer:
+
+1. Projects the final hidden state onto the r fitted directions.
+2. Scores every vocabulary row with the sketch (`head_sketch`).
+3. Finds the cut below which at most 16,384 rows remain (`head_cut`, `head_hist`, `head_cut2`).
+4. Computes the head's own logit for those rows (`head_select`, `head_exact`).
+
+The other rows keep their sketch value, and the sampler runs unchanged on the result.
+
+The screen is not exact: a row the sketch ranks below the cut keeps its sketch value even when the
+head would have ranked it higher. That is why it is fitted and measured per model.
+
+Passes that hand logits to the CPU use the dense head as before: `forward`, speculative
+verification, scoring, and tool-call sampling over a constrained set. Prefill is unchanged too: only
+the sampled last row of a prompt goes through the screen.
 
 ## Measured
 
@@ -90,7 +116,7 @@ What the numbers do not show:
 - **The calibration is the model's own writing.** Agreement on text unlike it (other languages,
   unusual formats) was not measured beyond what the 40 prompts cover.
 - **No benchmark score was measured** with Sieve on.
-- **Prefill is unchanged.** Only the sampled last row of a prompt goes through the screen.
+- **Other models were not measured.** The four above are the only ones fitted so far.
 
 ## Why it is 8% and not more
 

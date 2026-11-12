@@ -1170,6 +1170,8 @@ struct InspectorView: View {
                 }
                 Text("Reads a small sketch of the output layer to find the likely next tokens, and computes only those exactly: faster generation, with a small change in output. Each model has to be fitted once. Applies when the model is (re)loaded.")
                     .font(.caption).foregroundStyle(.secondary)
+                Link("How Sieve works and what was measured", destination: Self.sieveDoc)
+                    .font(.caption)
             }
             if let info = state.loadedInfo {
                 Section("Model") {
@@ -1191,6 +1193,7 @@ struct InspectorView: View {
 
     /// Kubicek et al., "Latent Sparse Attention: Towards Subquadratic Ultra-Long Context Attention".
     static let sparsePaper = URL(string: "https://arxiv.org/abs/2610.42147")!
+    static let sieveDoc = URL(string: "https://github.com/BackendStack21/mlx-runner/blob/main/docs/sieve-head.md")!
 
     /// Long-range key budgets offered (plus a saved value that is not one of them).
     static func sparseKeyChoices(including current: Int) -> [Int] {
