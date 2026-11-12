@@ -72,13 +72,15 @@ struct SieveTests {
     }
 
     /// Runs the screen on the GPU for one state: the logits and the number of exact rows.
-    static func run(_ f: Fixture, _ sh: SieveHead, x: [Float]) throws -> (logits: [Float], rows: Int) {
+    static func run(_ f: Fixture, _ sh: SieveHead, x: [Float], vocab: Int? = nil, fill: Float = 0) throws -> (logits: [Float], rows: Int) {
         let gpu = GPU.shared
         let xb = try gpu.buffer(f.d * 4), lb = try gpu.buffer(f.V * 4)
         x.withUnsafeBytes { xb.contents().copyMemory(from: $0.baseAddress!, byteCount: f.d * 4) }
+        let lp = lb.contents().bindMemory(to: Float.self, capacity: f.V)
+        for i in 0..<f.V { lp[i] = fill }
         let cb = gpu.queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
-        sh.encode(enc, head: f.head, x: xb, xOffset: 0, logits: lb)
+        sh.encode(enc, head: f.head, x: xb, xOffset: 0, logits: lb, vocab: vocab ?? f.V)
         enc.endEncoding()
         cb.commit(); cb.waitUntilCompleted()
         if let e = cb.error { throw e }
@@ -246,5 +248,264 @@ struct SieveTests {
         let ref = try generate(dense)
         let same = zip(first, ref).prefix { $0 == $1 }.count
         print("SIEVE: greedy tokens identical to dense for the first \(same) of \(ref.count)")
+    }
+
+    // MARK: The fit
+
+    /// A projection from packed 4-bit codes and f16 scales and biases, as the engine loads one.
+    static func linear(codes: Data, scales: Data, biases: Data, rows: Int, cols: Int) throws -> Linear {
+        func tensor(_ data: Data, _ dtype: DType, _ shape: [Int]) throws -> Tensor {
+            let b = try GPU.shared.buffer(data.count)
+            data.withUnsafeBytes { b.contents().copyMemory(from: $0.baseAddress!, byteCount: data.count) }
+            return Tensor(buffer: b, offset: 0, dtype: dtype, shape: shape)
+        }
+        return try Linear(weight: tensor(codes, .u32, [rows, cols / 8]), scales: tensor(scales, .f16, [rows, cols / 64]),
+                          biases: tensor(biases, .f16, [rows, cols / 64]), bias: nil, inDim: cols, outDim: rows, name: "test")
+    }
+
+    /// The directions come out strongest first: states built from two known directions give those two back.
+    @Test func basisFindsTheDominantDirectionsInOrder() throws {
+        let d = 64, n = 4000
+        var rng = RNG(s: 21)
+        var u = [Float](repeating: 0, count: d), v = u
+        u[3] = 0.6; u[10] = 0.8                       // unit, orthogonal to v
+        v[20] = 1
+        var x = [Float](repeating: 0, count: n * d)
+        for i in 0..<n {
+            let a = rng.signed() * 5, b = rng.signed() * 2
+            for j in 0..<d { x[i * d + j] = a * u[j] + b * v[j] + rng.signed() * 0.05 }
+        }
+        let q = try SieveImporter.basis(x, n: n, d: d, r: 3)
+        func dot(_ k: Int, _ w: [Float]) -> Float { (0..<d).reduce(0) { $0 + q[k * d + $1] * w[$1] } }
+        #expect(abs(dot(0, u)) > 0.999)
+        #expect(abs(dot(1, v)) > 0.999)
+        #expect(abs(dot(2, u)) < 0.05 && abs(dot(2, v)) < 0.05)
+        for k in 0..<3 { #expect(abs((0..<d).reduce(0) { $0 + q[k * d + $1] * q[k * d + $1] } - 1) < 1e-4) }
+    }
+
+    /// The packed sketch decodes, by the engine's own reading of a 4-bit projection, to the values the
+    /// fit measured with, and those lie within half a quantization step of the input.
+    @Test func quantizedSketchIsWhatTheEngineReads() throws {
+        let V = 300, r = 128
+        var rng = RNG(s: 9)
+        let s = SieveImporter.Matrix(V, r)
+        var original = [Float](repeating: 0, count: V * r)
+        for i in 0..<(V * r) { original[i] = rng.signed() * (1 + Float(i % 7)); s.p[i] = original[i] }
+        let packed = SieveImporter.quantize4(s)
+        let read = try SieveImporter.dequantize(try Self.linear(codes: packed.codes, scales: packed.scales, biases: packed.biases, rows: V, cols: r))
+        for row in 0..<V {
+            for g in 0..<(r / 64) {
+                let range = (row * r + g * 64)..<(row * r + g * 64 + 64)
+                let step = (original[range].max()! - original[range].min()!) / 15
+                for i in range {
+                    #expect(abs(read.p[i] - s.p[i]) <= 1e-5 * max(1, abs(s.p[i])))
+                    #expect(abs(s.p[i] - original[i]) <= step * 0.51 + 0.002 * max(1, abs(original[i])))
+                }
+            }
+        }
+    }
+
+    /// Fit, tune and test never share a prompt or a chunk, and each gets its share.
+    @Test func calibrationSplits() {
+        let prompts = (0..<SieveImporter.seedPrompts.count).map(SieveImporter.split(prompt:))
+        #expect(SieveImporter.seedPrompts.count == 40)
+        #expect(prompts.filter { $0 == .test }.count == 10)
+        #expect(prompts.filter { $0 == .tune }.count == 5)
+        #expect(prompts.filter { $0 == .fit }.count == 25)
+        let chunks = (0..<10).map(SieveImporter.split(chunk:))
+        #expect(chunks.filter { $0 == .test }.count == 2 && chunks.filter { $0 == .tune }.count == 2)
+    }
+
+    /// The fingerprint changes with any scale, any bias and a weight in the middle of the matrix.
+    @Test func fingerprintCoversScalesBiasesAndWeights() throws {
+        var rng = RNG(s: 4)
+        let (_, parts) = try Self.randomLinear(rows: 512, cols: 128, scale: 0.02, rng: &rng)
+        func print(_ edit: (inout [Data]) -> Void) throws -> String {
+            var p = parts
+            edit(&p)
+            return SieveHead.fingerprint(of: try Self.linear(codes: p[0], scales: p[1], biases: p[2], rows: 512, cols: 128))
+        }
+        let base = try print { _ in }
+        #expect(try print { _ in } == base)
+        #expect(try print { $0[0][$0[0].count / 2] ^= 1 } != base)
+        #expect(try print { $0[1][$0[1].count / 2] ^= 1 } != base)
+        #expect(try print { $0[2][$0[2].count - 1] ^= 1 } != base)
+    }
+
+    /// Text and flags read from a sidecar that may have come with a downloaded model.
+    @Test func sidecarMetadataIsSanitized() {
+        let hostile = "ok\u{1b}[31m\u{07}\n\u{9b}" + String(repeating: "x", count: 5000)
+        let info = SieveHead.info(from: ["calibration": hostile, "meets_target": "0", "rank": "abc", "rows": "64"])
+        #expect(info.calibration.hasPrefix("ok[31m"))
+        #expect(info.calibration.count == 200)
+        #expect(info.calibration.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value != 0x7f && !(0x80...0x9f).contains($0.value) })
+        #expect(!info.meetsTarget)
+        #expect(info.rank == 0 && info.rows == 64)
+        #expect(SieveHead.info(from: ["meets_target": "1"]).meetsTarget)
+    }
+
+    /// The sidecar is never written through a link planted in the model directory, and a failed
+    /// write leaves nothing behind.
+    @Test func writerRefusesLinks() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("mlxr-sieve-link-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+        let outside = root.appendingPathComponent("outside"), model = root.appendingPathComponent("model")
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        try fm.createDirectory(at: model, withIntermediateDirectories: true)
+        let tensors: [(name: String, dtype: DType, shape: [Int], data: Data)] = [("a", .f16, [2], Data([1, 2, 3, 4]))]
+
+        // `sieve` is a link to another directory.
+        try fm.createSymbolicLink(at: model.appendingPathComponent("sieve"), withDestinationURL: outside)
+        #expect(throws: EngineError.self) { try SafeTensorWriter.write(to: SieveHead.url(in: model), tensors: tensors, metadata: [:]) }
+        #expect(try fm.contentsOfDirectory(atPath: outside.path).isEmpty)
+
+        // `head.safetensors` is a link to a file elsewhere.
+        try fm.removeItem(at: model.appendingPathComponent("sieve"))
+        try fm.createDirectory(at: model.appendingPathComponent("sieve"), withIntermediateDirectories: true)
+        let victim = outside.appendingPathComponent("victim")
+        try Data("keep".utf8).write(to: victim)
+        try fm.createSymbolicLink(at: SieveHead.url(in: model), withDestinationURL: victim)
+        #expect(throws: EngineError.self) { try SafeTensorWriter.write(to: SieveHead.url(in: model), tensors: tensors, metadata: [:]) }
+        #expect(try Data(contentsOf: victim) == Data("keep".utf8))
+
+        // A regular file is replaced, and nothing else is left in the directory.
+        try fm.removeItem(at: SieveHead.url(in: model))
+        try Data("old".utf8).write(to: SieveHead.url(in: model))
+        try SafeTensorWriter.write(to: SieveHead.url(in: model), tensors: tensors, metadata: ["k": "v"])
+        #expect(try SieveHead.metadata(of: SieveHead.url(in: model))["k"] == "v")
+        #expect(try fm.contentsOfDirectory(atPath: model.appendingPathComponent("sieve").path) == ["head.safetensors"])
+    }
+
+    /// Options the fit cannot honour are refused before anything is loaded.
+    @Test func fitRefusesARowBudgetItHasNoMarginFor() {
+        var o = SieveImportOptions()
+        o.rows = 700
+        #expect(throws: EngineError.self) { _ = try SieveImporter.importHead(directory: URL(fileURLWithPath: "/nonexistent-model"), options: o) }
+    }
+
+    /// The screen scores and lists only the rows the sampler considers: head rows without a token
+    /// are neither written nor counted.
+    @Test func rowsBeyondTheSamplerVocabularyAreLeftAlone() throws {
+        let f = try Self.fixture(V: 1000, rows: 100, delta: 1000)
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let sh = try SieveHead(directory: f.directory, head: f.head)
+        var rng = RNG(s: 13)
+        let x = (0..<f.d).map { _ in rng.signed() }
+        let vocab = 700
+        let (got, count) = try Self.run(f, sh, x: x, vocab: vocab, fill: 12345)
+        let ref = Self.reference(f, x: x)
+        #expect(count > 0 && count <= 100)
+        for i in vocab..<f.V { #expect(got[i] == 12345) }
+        for i in 0..<vocab { #expect(Self.close(got[i], ref.exact[i]) || Self.close(got[i], ref.sketch[i])) }
+        // The best row by sketch value among the sampler's rows is exact, whatever the rows beyond it hold.
+        let best = (0..<vocab).max { ref.sketch[$0] < ref.sketch[$1] }!
+        #expect(Self.close(got[best], ref.exact[best]))
+    }
+
+    /// The whole fit on an installed model, into a scratch copy of its directory (the model's own
+    /// sidecar is not touched): the sidecar loads, the screen keeps the dense head's likeliest token
+    /// on states nothing was fitted or tuned on, and generation runs within the row budget.
+    @Test func fitOfAnInstalledModelLoadsAndAgrees() throws {
+        guard let dir = installedModel("mlx-community/Qwen3-0.6B-4bit") else { return }
+        let fm = FileManager.default
+        let copy = fm.temporaryDirectory.appendingPathComponent("mlxr-sieve-fit-\(UUID().uuidString)")
+        try fm.createDirectory(at: copy, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: copy) }
+        for name in try fm.contentsOfDirectory(atPath: dir.path) where name != "sieve" {
+            try fm.createSymbolicLink(at: copy.appendingPathComponent(name), withDestinationURL: dir.appendingPathComponent(name))
+        }
+        var o = SieveImportOptions()
+        o.tokens = 3000
+        let report = try SieveImporter.importHead(directory: copy, options: o)
+        let info = report.info
+        #expect(info.heldOutStates >= 256)
+        #expect(info.agreement >= 0.98)
+        #expect(info.sampledChange <= 0.05)
+        #expect(info.rowsMean > 0 && info.rowsMean <= Double(info.rows))
+        #expect(report.rowsMax <= info.rows)
+        #expect(report.tried.last == info)
+        #expect(SieveImporter.sidecarInfo(directory: copy) == info)
+
+        let t = try Transformer(directory: copy, contextLength: 512, sparse: nil, sieve: .balanced)
+        #expect(t.sieveInfo == info, "the fit's own sidecar must load: \(t.sieveOffReason ?? "")")
+        var sp = SamplingParameters()
+        sp.temperature = 0; sp.repetitionPenalty = 1
+        let sample = SampleParams(sp, vocab: t.vocabSize)
+        let prompt: [Int32] = (0..<16).map { Int32(2000 + $0 * 53) }
+        _ = try t.prefill(prompt, offset: 0, sample: sample)
+        for i in 0..<16 {
+            _ = try t.finish(try t.beginDecodeStep(offset: prompt.count + i, sample: sample))
+            #expect(t.sieveLastRows > 0 && t.sieveLastRows <= info.rows)
+        }
+    }
+}
+
+/// What Sieve changes in real generations, observed, for the model named by `MLXR_SIEVE_OBSERVE`
+/// (opt-in: it needs the GPU to itself and prints its result):
+///
+///     MLXR_SIEVE_OBSERVE=mlx-community/Qwen3-0.6B-4bit swift test -c release -Xswiftc -enable-testing --filter SieveObserved
+///
+/// Each test-split prompt is answered dense and with Sieve from the same seeds, greedy and with the
+/// app's default sampler. A pair of answers is compared up to its first different token: that token
+/// counts as one change among the tokens generated so far, and nothing after it is compared.
+@Suite("SieveObserved", .serialized, .enabled(if: ProcessInfo.processInfo.environment["MLXR_SIEVE_OBSERVE"] != nil))
+struct SieveObservedTests {
+    @Test func generationsAgainstDense() throws {
+        guard let repo = ProcessInfo.processInfo.environment["MLXR_SIEVE_OBSERVE"], let dir = installedModel(repo) else {
+            print("SIEVE-OBSERVED: model not installed"); return
+        }
+        let length = 96, seeds: [UInt64] = [1, 2, 3]
+        let tok = try Tokenizer(directory: dir)
+        var greedy = SamplingParameters()
+        greedy.temperature = 0; greedy.repetitionPenalty = 1
+        let modes = [("greedy", greedy, [UInt64(1)]), ("sampled", SamplingParameters(), seeds)]
+
+        /// Every answer of one transformer, by mode: [mode][prompt × seed] → tokens.
+        func answers(sieve: SieveProfile?) throws -> [[[Int]]] {
+            let t = try Transformer(directory: dir, contextLength: 1024, sparse: nil, sieve: sieve)
+            if sieve != nil, t.sieveInfo == nil { throw EngineError.unsupported(t.sieveOffReason ?? "no sidecar") }
+            let tpl = ChatTemplate(template: tok.chatTemplate, modelType: t.config.modelType, bosToken: tok.bosToken, toolTemplate: tok.toolUseTemplate)
+            var stops = Set(t.config.eosTokenIds)
+            if let e = tok.eosToken, let id = tok.tokenId(e) { stops.insert(id) }
+            for s in tpl.stopTokens { if let id = tok.tokenId(s) { stops.insert(id) } }
+            var out: [[[Int]]] = []
+            for (_, params, seeds) in modes {
+                let sample = SampleParams(params, vocab: min(tok.vocabularySize, t.vocabSize))
+                var runs: [[Int]] = []
+                for (i, prompt) in SieveImporter.seedPrompts.enumerated() where SieveImporter.split(prompt: i) == .test {
+                    let r = tpl.renderMarked([ChatMessage(role: .user, content: prompt)], enableThinking: false)
+                    let ids = tok.encode(r.text, plainRanges: r.content).map(Int32.init)
+                    for seed in seeds {
+                        t.seedSampler(seed &+ UInt64(i) &* 104729)
+                        var tokens = [try t.prefill(ids, offset: 0, sample: sample)]
+                        while tokens.count < length, !stops.contains(tokens.last!) {
+                            tokens.append(try t.finish(try t.beginDecodeStep(offset: ids.count + tokens.count - 1, sample: sample)))
+                        }
+                        runs.append(tokens)
+                    }
+                }
+                out.append(runs)
+            }
+            return out
+        }
+        let dense = try answers(sieve: nil)
+        let again = try answers(sieve: nil)
+        let sieve = try answers(sieve: .balanced)
+        for (m, mode) in modes.enumerated() {
+            func compare(_ a: [[Int]], _ b: [[Int]]) -> (same: Int, changed: Int, compared: Int) {
+                var same = 0, changed = 0, compared = 0
+                for (x, y) in zip(a, b) {
+                    let common = zip(x, y).prefix { $0 == $1 }.count
+                    if common == x.count, common == y.count { same += 1; compared += common } else { changed += 1; compared += common + 1 }
+                }
+                return (same, changed, compared)
+            }
+            let s = compare(dense[m], sieve[m]), control = compare(dense[m], again[m])
+            print(String(format: "SIEVE-OBSERVED %@ %@: %d of %d answers identical to dense over up to %d tokens; first change after %d of %d compared tokens (%.2f%% per token); dense against itself: %d of %d identical",
+                         repo, mode.0, s.same, dense[m].count, length, s.changed, s.compared, 100 * Double(s.changed) / Double(max(s.compared, 1)),
+                         control.same, dense[m].count))
+            #expect(control.changed == 0, "dense generation is not reproducible, so the comparison means nothing")
+        }
     }
 }

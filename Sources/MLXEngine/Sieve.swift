@@ -86,17 +86,30 @@ final class SieveHead {
     /// Bytes held in Metal buffers.
     let byteCount: Int
 
-    /// Identifies the head a sidecar was fitted to: its shape, quantization and a hash of the first
-    /// and last 64 KB of its weights. A sidecar from another model never reaches a kernel.
+    /// Identifies the head a sidecar was fitted to: its shape and quantization, all of its scales and
+    /// biases, and 4 KB of its weights at each of 1,024 evenly spaced places (all of them when the
+    /// matrix is smaller). A sidecar from another model never reaches a kernel.
     static func fingerprint(of head: Linear) -> String {
         var h = SHA256()
-        let meta = "\(head.outDim)x\(head.inDim) \(head.description) \(head.weight.nbytes)"
+        let meta = "v2 \(head.outDim)x\(head.inDim) \(head.description) \(head.weight.nbytes)"
         h.update(data: Data(meta.utf8))
-        let n = head.weight.nbytes, part = min(n, 64 << 10)
-        if head.weight.offset >= 0, n <= head.weight.buffer.length - head.weight.offset {
-            let p = head.weight.buffer.contents() + head.weight.offset
-            h.update(bufferPointer: UnsafeRawBufferPointer(start: p, count: part))
-            h.update(bufferPointer: UnsafeRawBufferPointer(start: p + (n - part), count: part))
+        func whole(_ t: Tensor?) {
+            guard let t, t.offset >= 0, t.nbytes <= t.buffer.length - t.offset else { return }
+            h.update(bufferPointer: UnsafeRawBufferPointer(start: t.buffer.contents() + t.offset, count: t.nbytes))
+        }
+        whole(head.scales)
+        whole(head.biases)
+        let w = head.weight, n = w.nbytes, part = 4 << 10, places = 1024
+        if w.offset >= 0, n <= w.buffer.length - w.offset {
+            let p = w.buffer.contents() + w.offset
+            if n <= part * places {
+                h.update(bufferPointer: UnsafeRawBufferPointer(start: p, count: n))
+            } else {
+                for i in 0..<places {
+                    let at = Int(UInt64(i) * UInt64(n - part) / UInt64(places - 1))
+                    h.update(bufferPointer: UnsafeRawBufferPointer(start: p + at, count: part))
+                }
+            }
         }
         return h.finalize().map { String(format: "%02x", $0) }.joined()
     }
@@ -198,12 +211,15 @@ final class SieveHead {
     /// The last row's logits into `logits` ([V] floats): sketch values everywhere, the head's own for
     /// the `rows` best rows by sketch value (fewer when they lie further than `delta` below the best).
     /// `x` at `xOffset` is the final normalised state.
-    func encode(_ enc: MTLComputeCommandEncoder, head: Linear, x: MTLBuffer, xOffset: Int, logits: MTLBuffer) {
-        let V = head.outDim, d = head.inDim
+    /// `vocab` is how many rows the sampler considers (the tokenizer may have fewer tokens than the
+    /// head has rows): the screen scores and ranks those only, and leaves the others unwritten.
+    func encode(_ enc: MTLComputeCommandEncoder, head: Linear, x: MTLBuffer, xOffset: Int, logits: MTLBuffer, vocab: Int) {
+        let d = head.inDim
+        let V = max(1, min(vocab, head.outDim))
         let one = MTLSize(width: 1, height: 1, depth: 1)
-        let perBlock = MTLSize(width: blocks, height: 1, depth: 1), block = MTLSize(width: 256, height: 1, depth: 1)
+        let perBlock = MTLSize(width: (V + 255) / 256, height: 1, depth: 1), block = MTLSize(width: 256, height: 1, depth: 1)
         basis.encode(enc, x: x, xOffset: xOffset, xStride: d, y: xr, yStride: rank, T: 1)
-        let hp = HeadParams(V: Int32(V), delta: info.delta, rows: Int32(info.rows), K: Int32(rank))
+        let hp = HeadParams(V: Int32(V), delta: info.delta, rows: Int32(min(info.rows, V)), K: Int32(rank))
         enc.setComputePipelineState(sketchPSO)
         enc.set(sketchWeight, 0)
         enc.set(sketchScales, 1)
@@ -245,7 +261,7 @@ final class SieveHead {
         enc.set(head.biases!, 2)
         enc.set(x, xOffset, 3)
         enc.set(logits, 0, 4)
-        enc.params(MMParams(K: Int32(d), O: Int32(V), T: 1, gs: Int32(head.groupSize), xStride: Int32(d), yStride: Int32(V)), 5)
+        enc.params(MMParams(K: Int32(d), O: Int32(V), T: 1, gs: Int32(head.groupSize), xStride: Int32(d), yStride: Int32(head.outDim)), 5)
         enc.set(state, 8, 6)
         enc.set(list, 0, 7)
         enc.dispatchThreadgroups(MTLSize(width: (info.rows + 1) / 2, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))

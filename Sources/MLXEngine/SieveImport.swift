@@ -155,13 +155,22 @@ public enum SieveImporter {
         "Explain the Pythagorean theorem and prove it.",
     ]
 
-    /// Final normalised hidden states [n × d] with a held-out flag each: the model's answers to
-    /// `seedPrompts` (every fourth prompt held out), or 512-token chunks of the given files (every
-    /// fifth chunk held out).
+    /// What a calibration state is used for. The directions are fitted on `fit`, the margin and the
+    /// rank are chosen on `tune`, and the figures a sidecar reports are measured on `test`, which
+    /// nothing was chosen on.
+    enum Split: UInt8 { case fit, tune, test }
+
+    /// The split of seed prompt `i`: ten of forty to `test` (two of them not in English), five to `tune`.
+    static func split(prompt i: Int) -> Split { i % 4 == 2 ? .test : i % 8 == 3 ? .tune : .fit }
+    /// The split of chunk `c` of a text file: one in five to `test`, one in five to `tune`.
+    static func split(chunk c: Int) -> Split { c % 5 == 4 ? .test : c % 5 == 3 ? .tune : .fit }
+
+    /// Final normalised hidden states [n × d] with their split: the model's answers to `seedPrompts`,
+    /// or 512-token chunks of the given files.
     static func collect(_ t: Transformer, _ tok: Tokenizer, options o: SieveImportOptions,
-                        progress: (String) -> Void) throws -> (x: [Float], held: [Bool], source: String) {
+                        progress: (String) -> Void) throws -> (x: [Float], held: [Split], source: String) {
         let d = t.config.hiddenSize
-        var x: [Float] = [], held: [Bool] = []
+        var x: [Float] = [], held: [Split] = []
         if !o.textFiles.isEmpty {
             let T = 512, skip = 16
             let per = max(1, o.tokens / (T - skip) / o.textFiles.count)
@@ -174,7 +183,7 @@ public enum SieveImporter {
                     _ = try t.forward(Array(ids[(c * stride)..<(c * stride + T)]), offset: 0)
                     let rows = t.xn.contents().bindMemory(to: Float.self, capacity: T * d)
                     x.append(contentsOf: UnsafeBufferPointer(start: rows + skip * d, count: (T - skip) * d))
-                    held.append(contentsOf: [Bool](repeating: c % 5 == 4, count: T - skip))
+                    held.append(contentsOf: [Split](repeating: split(chunk: c), count: T - skip))
                 }
                 progress("read \(f.lastPathComponent): \(n) chunks")
             }
@@ -198,7 +207,7 @@ public enum SieveImporter {
             while n < per, !stops.contains(token), pos + 2 < t.maxSeq {
                 token = try t.finish(try t.beginDecodeStep(offset: pos, sample: sample))
                 x.append(contentsOf: UnsafeBufferPointer(start: t.xn.contents().bindMemory(to: Float.self, capacity: d), count: d))
-                held.append(i % 4 == 3)
+                held.append(split(prompt: i))
                 pos += 1; n += 1
             }
             if i % 8 == 7 { progress("calibration: \(held.count) states from \(i + 1) of \(Self.seedPrompts.count) prompts") }
@@ -277,7 +286,9 @@ public enum SieveImporter {
         let tok = try Tokenizer(directory: directory)
         let head = t.lmHead
         guard SieveHead.supports(head) else { throw EngineError.unsupported("Sieve Head needs a quantized output projection (\(head.description))") }
-        let d = head.inDim, V = head.outDim
+        let d = head.inDim, rowsV = head.outDim
+        // The sampler never sees head rows the tokenizer has no token for, and neither does the screen.
+        let V = min(tok.vocabularySize, rowsV)
         // Ranks to try, cheapest first: the first that meets the target is kept.
         func round64(_ x: Int) -> Int { min(d, max(64, (x + 63) / 64 * 64)) }
         var ranks = o.rank.map { [$0] } ?? [round64(d / 8), round64(d / 4), round64(d / 2)]
@@ -289,20 +300,22 @@ public enum SieveImporter {
         // 1. Hidden states.
         let c = try collect(t, tok, options: o, progress: progress)
         let n = c.held.count
-        var fitX: [Float] = [], testX: [Float] = []
-        c.x.withUnsafeBufferPointer { p in
-            for i in 0..<n {
-                let row = UnsafeBufferPointer(rebasing: p[(i * d)..<((i + 1) * d)])
-                if c.held[i] { testX.append(contentsOf: row) } else { fitX.append(contentsOf: row) }
-            }
+        /// The states of one split, at most `limit` of them, taken evenly so every prompt contributes.
+        func states(_ which: Split, limit: Int) -> [Float] {
+            let rows = (0..<n).filter { c.held[$0] == which }
+            let keep = rows.count <= limit ? rows : (0..<limit).map { rows[$0 * rows.count / limit] }
+            var out = [Float]()
+            out.reserveCapacity(keep.count * d)
+            c.x.withUnsafeBufferPointer { p in for i in keep { out.append(contentsOf: p[(i * d)..<((i + 1) * d)]) } }
+            return out
         }
-        let nFit = fitX.count / d
-        var nTest = testX.count / d
-        guard nFit >= 2 * ranks.max()!, nTest >= 256 else {
-            throw EngineError.invalidOutput("too few calibration states (\(nFit) fitted, \(nTest) held out) for rank \(ranks.max()!)")
+        var fitX = states(.fit, limit: .max)
+        let tuneX = states(.tune, limit: 1024), testX = states(.test, limit: 2048)
+        let nFit = fitX.count / d, nTune = tuneX.count / d, nTest = testX.count / d
+        guard nFit >= 2 * ranks.max()!, nTune >= 128, nTest >= 256 else {
+            throw EngineError.invalidOutput("too few calibration states (\(nFit) to fit, \(nTune) to tune, \(nTest) to test) for rank \(ranks.max()!)")
         }
-        if nTest > 2048 { nTest = 2048; testX.removeSubrange((nTest * d)...) }
-        progress("\(nFit) states to fit, \(nTest) held out")
+        progress("\(nFit) states to fit, \(nTune) to tune, \(nTest) to test")
         let allDirections = try basis(fitX, n: nFit, d: d, r: ranks.max()!)
         fitX = []
         let W = try dequantize(head)
@@ -310,21 +323,21 @@ public enum SieveImporter {
         let headRow = d * head.bits / 8 + groups * 2 * (head.scales?.dtype.size ?? 2)
         typealias Packed = (codes: Data, scales: Data, biases: Data)
 
-        func attempt(_ r: Int) -> (report: SieveImportReport, basis: Data, packed: Packed) {
+        func attempt(_ r: Int) -> (report: SieveImportReport, tuned: Bool, basis: Data, packed: Packed) {
         progress("fitting rank \(r)")
         // 2. The basis (rounded to f16, which is what the kernel reads) and the sketch S = W Qᵀ.
         var q = Array(allDirections[0..<(r * d)])
         let qBits = q.map(halfBits)
         for i in q.indices { q[i] = Tensor.halfToFloat(qBits[i]) }
-        let S = Matrix(V, r)
-        BLAS.sgemm(BLAS.rowMajor, BLAS.noTrans, BLAS.trans, Int32(V), Int32(r), Int32(d), 1, W.p, Int32(d), q, Int32(d), 0, S.p, Int32(r))
+        let S = Matrix(rowsV, r)
+        BLAS.sgemm(BLAS.rowMajor, BLAS.noTrans, BLAS.trans, Int32(rowsV), Int32(r), Int32(d), 1, W.p, Int32(d), q, Int32(d), 0, S.p, Int32(r))
         let packed = quantize4(S)
 
-        // 3. Held-out states: the rank of the dense argmax among the sketch values (rows above it),
+        // 3. The tuning states: the rank of the dense argmax among the sketch values (rows above it),
         //    and how far below the best sketch value the `budget`-th row sits.
         let B = 32
         var Z = [Float](repeating: 0, count: B * V), Zh = Z, XR = [Float](repeating: 0, count: B * r)
-        var rank = [Int](repeating: 0, count: nTest)
+        var rank = [Int](repeating: 0, count: nTune)
         var gk = [[Float]](repeating: [], count: budgets.count)
         let bins = SieveHead.bins
         func logits(_ x: UnsafePointer<Float>, _ b: Int) {
@@ -333,11 +346,11 @@ public enum SieveImporter {
             BLAS.sgemm(BLAS.rowMajor, BLAS.noTrans, BLAS.trans, Int32(b), Int32(V), Int32(d), 1, x, Int32(d), W.p, Int32(d), 0, &Z, Int32(V))
         }
         var hist = [Int](repeating: 0, count: bins)
-        testX.withUnsafeBufferPointer { xp in
+        tuneX.withUnsafeBufferPointer { xp in
             let width: Float = 1.0 / 16
             var s0 = 0
-            while s0 < nTest {
-                let b = min(B, nTest - s0)
+            while s0 < nTune {
+                let b = min(B, nTune - s0)
                 logits(xp.baseAddress! + s0 * d, b)
                 for s in 0..<b {
                     var arg = 0, best = -Float.infinity, top = -Float.infinity
@@ -371,7 +384,7 @@ public enum SieveImporter {
         for k in budgets.indices {
             let missed = rank.filter { $0 >= budgets[k] }.count
             // The margin: where the budget-th row sits in nine of ten states. Past it, fewer rows pass.
-            let delta = gk[k].sorted()[nTest * 9 / 10]
+            let delta = gk[k].sorted()[nTune * 9 / 10]
             report.budgets.append((budgets[k], delta, missed))
             if firstClean == nil, missed == 0 { firstClean = k }
         }
@@ -383,7 +396,9 @@ public enum SieveImporter {
         let delta = report.budgets[budgets.firstIndex(of: rowBudget) ?? chosen].delta
         progress("row budget \(rowBudget), margin \(delta); measuring")
 
-        // 4. The screen as the kernels run it (`head_hist`, `head_cut2`, `head_select`), on the held-out states.
+        // 4. The screen as the kernels run it (`head_hist`, `head_cut2`, `head_select`): on the tuning
+        //    states to choose the rank, and on the test states for the figures the sidecar reports.
+        func measure(_ testX: [Float], _ nTest: Int) -> (info: SieveHeadInfo, rowsMax: Int) {
         var rowsSum = 0, rowsMax = 0, tvSum = 0.0
         let K = 40
         var poolD = [Int](), poolS = [Int]()
@@ -473,19 +488,24 @@ public enum SieveImporter {
         info.klMedian = kls[nTest / 2]
         info.sampledChange = tvSum / Double(nTest)
         info.heldOutStates = nTest; info.fittedStates = nFit
-        info.denseBytes = V * headRow
+        info.denseBytes = rowsV * headRow
         info.touchedBytes = r * d * 2 + V * (r / 2 + r / 64 * 4) + V * 4 + Int(info.rowsMean.rounded()) * headRow
         info.calibration = c.source
         info.meetsTarget = info.agreement >= SieveHeadInfo.targetAgreement && info.sampledChange <= SieveHeadInfo.targetSampledChange
-        report.info = info
-        report.rowsMax = rowsMax
-        return (report, qBits.withUnsafeBufferPointer { Data(buffer: $0) }, packed)
+        return (info, rowsMax)
+        }
+        let tuned = measure(tuneX, nTune), tested = measure(testX, nTest)
+        report.info = tested.info
+        report.rowsMax = tested.rowsMax
+        return (report, tuned.info.meetsTarget, qBits.withUnsafeBufferPointer { Data(buffer: $0) }, packed)
         }
 
-        // The cheapest rank that meets the target, or the largest tried.
+        // The cheapest rank that meets the target on the tuning states and then on the test states, or
+        // the largest tried. A rank is only ever replaced by a higher one, and the figures reported
+        // are the test states' at the rank kept.
         var best = attempt(ranks[0])
         var tried = [best.report.info]
-        for r in ranks.dropFirst() where !best.report.info.meetsTarget {
+        for r in ranks.dropFirst() where !(best.tuned && best.report.info.meetsTarget) {
             best = attempt(r)
             tried.append(best.report.info)
         }
@@ -498,15 +518,15 @@ public enum SieveImporter {
             "format": SieveHead.format, "fingerprint": SieveHead.fingerprint(of: head),
             "rank": "\(r)", "delta": "\(info.delta)", "rows": "\(info.rows)", "rows_mean": "\(info.rowsMean)",
             "agreement": "\(info.agreement)", "kl": "\(info.kl)", "kl_median": "\(info.klMedian)", "sampled_change": "\(info.sampledChange)", "meets_target": info.meetsTarget ? "1" : "0",
-            "held_out_states": "\(nTest)", "fitted_states": "\(nFit)", "touched_bytes": "\(info.touchedBytes)",
+            "held_out_states": "\(nTest)", "fitted_states": "\(nFit)", "tuning_states": "\(nTune)", "touched_bytes": "\(info.touchedBytes)",
             "dense_bytes": "\(info.denseBytes)", "calibration": c.source,
         ]
         let url = SieveHead.url(in: directory)
         try SafeTensorWriter.write(to: url, tensors: [
             ("basis", .f16, [r, d], best.basis),
-            ("sketch.weight", .u32, [V, r / 8], best.packed.codes),
-            ("sketch.scales", .f16, [V, r / 64], best.packed.scales),
-            ("sketch.biases", .f16, [V, r / 64], best.packed.biases),
+            ("sketch.weight", .u32, [rowsV, r / 8], best.packed.codes),
+            ("sketch.scales", .f16, [rowsV, r / 64], best.packed.scales),
+            ("sketch.biases", .f16, [rowsV, r / 64], best.packed.biases),
         ], metadata: meta)
         report.url = url
         report.sidecarBytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0

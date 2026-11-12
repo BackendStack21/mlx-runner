@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.2.0
+
+Sieve: an opt-in screen of the output layer that makes decode up to 15% faster on fitted models. Nothing changes with it off.
+
+**New**
+
+- **Sieve** (off by default). The last layer of a model scores every token of the vocabulary on every step. With Sieve on, a small 4-bit approximation scores all of them and the real score is computed only for the likeliest rows (SVD-softmax, with directions fitted to the model's own hidden states). It changes output, so it is opt-in: the inspector's **Sieve** switch, `--sieve balanced` on `mlxr run` and `mlxr serve`, or `MLXR_SIEVE=balanced`.
+- **Each model is fitted once**: `mlxr sieve <model>`, or the inspector's **Fit** button (one to six minutes; it writes 9 to 58 MB next to the model). The fit measures itself on states it chose nothing on and reports the result; `mlxr sieve <model> --info` shows it and `--remove` deletes it. A model that is not fitted, a fit that belongs to other weights or one that missed its quality target is reported in the app and on the command line, and the model runs at its normal speed.
+- **Measured** on an M2 Pro, ten 4-bit models, greedy and sampled decode alike: 8–15% faster on models up to 4B with a large vocabulary (Gemma 3 1B 188 → 217 tok/s, Qwen3.5 0.8B 255 → 286, Gemma 4 E2B 73 → 82, Llama 3.2 1B 202 → 220, Qwen3 0.6B 288 → 312, Qwen3.5 4B 62 → 67), 4% on Qwen3 8B, and under 1% on Phi 3.5 mini and Mistral 7B, whose small vocabulary leaves little to save. The likeliest token is kept in 99.5–100% of test states; in generations with the default sampler, 0–0.3% of tokens differ from the dense answer before the first difference. Benchmark scores, other sampler settings and long contexts were not measured. Models over 8B could not be fitted on 16 GB. See [docs/sieve-head.md](docs/sieve-head.md).
+- Sieve is not used with a draft model (speculative decoding runs the full output layer), for tool calls forced to one name, or by `forward` and scoring.
+- `MLXR_BENCH_DECODE=1 mlxr bench` also reports decode speed with the default sampler ("sampled").
+
 ## 2.1.0
 
 A usability pass on the app. The engine, the server and the command line are unchanged, except that a model which fails to load no longer unloads the one before it.

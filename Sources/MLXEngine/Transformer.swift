@@ -1568,7 +1568,7 @@ public final class Transformer {
             if let softcapPSO { scale(enc, softcapPSO, logitsAll, T * lmHead.outDim, c.finalLogitSoftcap) }
         } else if computeLogits, sample != nil, let sieveHead {
             // Sampled on the GPU: only the top of the logits matters, so the head runs by rows.
-            sieveHead.encode(enc, head: lmHead, x: xn, xOffset: (T - 1) * H * 4, logits: logits)
+            sieveHead.encode(enc, head: lmHead, x: xn, xOffset: (T - 1) * H * 4, logits: logits, vocab: Int(sample!.V))
             if let softcapPSO { scale(enc, softcapPSO, logits, lmHead.outDim, c.finalLogitSoftcap) }
         } else if computeLogits {
             lmHead.encode(enc, x: xn, xOffset: (T - 1) * H * 4, xStride: H, y: logits, yStride: lmHead.outDim, T: 1)
