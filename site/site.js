@@ -1,4 +1,4 @@
-// mlx-runner.21no.de: live release data, the token-stream replay, the race, the terminal, tabs.
+// mlx-runner.21no.de: live release data, the token-stream replay, the terminal, the app tour.
 //
 // Nothing about a release is baked into the page: the latest release (version, file names, sizes,
 // SHA-256 digests) is read from GitHub's API here, and the last one seen is kept for repeat visits.
@@ -29,14 +29,13 @@
 
   // Reveal on scroll. Hidden only once JS has tagged them, so no-JS readers see everything.
   if (!reduced) {
-    for (const el of document.querySelectorAll(".race-card, .ceiling-copy, .gauge, .pipeline, .cards > li, .carousel, .term, .code-card, .dl-card, .steps > li")) {
+    for (const el of document.querySelectorAll(".meter, .pipeline, .carousel, .term, .server-grid, .dl-card")) {
       const r = el.getBoundingClientRect();
       if (r.top < innerHeight) continue; // already on screen: leave it alone
       el.classList.add("reveal");
       onVisible(el, () => el.classList.add("in"), 0.12);
     }
   }
-  onVisible(document.querySelector(".gauge"), () => document.querySelector(".gauge").classList.add("in"), 0.4);
 
   // ── 1. hero: stream an answer at each model's measured decode speed ──
   const MODELS = [
@@ -100,57 +99,7 @@
     play(0);
   }
 
-  // ── 2. the race: 512-token prompt + 256-token answer per model, on a 10 s axis ──
-  const lanes = [...document.querySelectorAll("#lanes li")];
-  if (lanes.length) {
-    const PROMPT = 512;
-    const ANSWER = 256;
-    const AXIS = 10;
-    const clock = $("race-clock");
-    const runBtn = $("race-run");
-    const spec = lanes.map((li) => {
-      const pf = PROMPT / Number(li.dataset.prefill);
-      const dc = ANSWER / Number(li.dataset.decode);
-      return { li, pf, dc, total: pf + dc, track: li.querySelector(".track"), label: li.querySelector(".lane-t") };
-    });
-    const longest = Math.max(...spec.map((s) => s.total));
-    let raf = 0;
-    function draw(t) {
-      for (const s of spec) {
-        const pf = Math.min(t, s.pf);
-        const dc = Math.max(0, Math.min(t, s.total) - s.pf);
-        s.track.style.setProperty("--pf", ((pf / AXIS) * 100).toFixed(3));
-        s.track.style.setProperty("--dc", ((dc / AXIS) * 100).toFixed(3));
-        const done = t >= s.total;
-        s.li.classList.toggle("done", done);
-        if (done) s.label.textContent = `${s.total.toFixed(2)} s`;
-        else if (t < s.pf) s.label.textContent = "prefill";
-        else s.label.textContent = `${Math.floor((t - s.pf) * Number(s.li.dataset.decode))} tok`;
-      }
-      clock.textContent = Math.min(t, longest).toFixed(2);
-    }
-    function race() {
-      cancelAnimationFrame(raf);
-      if (reduced) return draw(longest);
-      let t = 0;
-      let last = performance.now();
-      runBtn.textContent = "Racing…";
-      const step = (now) => {
-        t += Math.min(now - last, 100) / 1000;
-        last = now;
-        draw(t);
-        if (t < longest) raf = requestAnimationFrame(step);
-        else runBtn.textContent = "Run it again";
-      };
-      draw(0);
-      raf = requestAnimationFrame(step);
-    }
-    draw(longest); // the finished chart is the static state (no JS, reduced motion, snapshots)
-    runBtn.addEventListener("click", race);
-    if (!reduced) onVisible(document.querySelector(".race-card"), race, 0.5);
-  }
-
-  // ── 3. terminal: replay a captured session ──
+  // ── 2. terminal: replay a captured session ──
   const term = $("term");
   if (term && !reduced) {
     const code = term.querySelector("code");
@@ -215,25 +164,27 @@
     onVisible(term, replay, 0.4);
   }
 
-  // ── 4. tab lists (WAI-ARIA tabs with arrow keys). The app tour's tabs drive a scroll-snap carousel:
-  //      selecting one scrolls to its slide, and swiping or the arrows move the selection. ──
-  for (const list of document.querySelectorAll('[role="tablist"]')) {
-    const tabs = [...list.querySelectorAll('[role="tab"]')];
+  // ── 3. the app tour: WAI-ARIA tabs (arrow keys, Home, End) that drive a scroll-snap carousel.
+  //      Selecting a tab scrolls to its slide, and swiping or the arrows move the selection. ──
+  const carousel = document.querySelector(".carousel");
+  if (carousel) {
+    const tabs = [...carousel.querySelectorAll('[role="tab"]')];
     const panels = tabs.map((t) => $(t.getAttribute("aria-controls")));
-    const carousel = list.closest(".carousel");
-    const slides = carousel ? carousel.querySelector(".slides") : null;
+    const slides = carousel.querySelector(".slides");
     let current = Math.max(0, tabs.findIndex((t) => t.getAttribute("aria-selected") === "true"));
+    let target = -1; // the slide a click or key is scrolling to: the scroll handler leaves the selection alone until it arrives
+    const at = (i) => panels[i].offsetLeft - slides.offsetLeft;
     const mark = (i) => {
       current = i;
       tabs.forEach((t, j) => {
         t.setAttribute("aria-selected", String(i === j));
         t.tabIndex = i === j ? 0 : -1;
-        if (!slides) panels[j].hidden = i !== j;
       });
     };
     const select = (i, focus) => {
       mark(i);
-      if (slides) slides.scrollTo({ left: panels[i].offsetLeft - slides.offsetLeft, behavior: reduced ? "auto" : "smooth" });
+      target = Math.abs(slides.scrollLeft - at(i)) > 1 ? i : -1; // already there: no scroll will come to clear it
+      slides.scrollTo({ left: at(i), behavior: reduced ? "auto" : "smooth" });
       if (focus) tabs[i].focus();
     };
     tabs.forEach((t, i) => {
@@ -246,11 +197,12 @@
         if (d) select((i + d + tabs.length) % tabs.length, true);
         else if (e.key === "Home") select(0, true);
         else if (e.key === "End") select(tabs.length - 1, true);
+        else if (e.key === " ") select(i, true); // the tabs are links, which Space does not activate
         else return;
         e.preventDefault();
       });
     });
-    if (!slides) continue;
+    mark(current); // one tab stop: the inactive tabs carry no tabindex in the markup, so they work without JS
     let pending = false;
     slides.addEventListener(
       "scroll",
@@ -261,16 +213,25 @@
           pending = false;
           const x = slides.scrollLeft + slides.offsetLeft;
           const i = panels.findIndex((p) => Math.abs(p.offsetLeft - x) < p.offsetWidth / 2);
-          if (i >= 0 && i !== current) mark(i);
+          if (i < 0) return;
+          if (target >= 0) {
+            if (i === target) target = -1;
+            return;
+          }
+          if (i !== current) mark(i);
         });
       },
       { passive: true },
     );
+    // A swipe or a sideways wheel takes over from a scroll that a click started.
+    slides.addEventListener("touchstart", () => (target = -1), { passive: true });
+    slides.addEventListener("wheel", (e) => Math.abs(e.deltaX) > Math.abs(e.deltaY) && (target = -1), { passive: true });
+    slides.addEventListener("scrollend", () => (target = -1));
     carousel.querySelector(".car-btn.prev").addEventListener("click", () => select((current - 1 + panels.length) % panels.length));
     carousel.querySelector(".car-btn.next").addEventListener("click", () => select((current + 1) % panels.length));
   }
 
-  // ── 5. live release data ──
+  // ── 4. live release data ──
   // The release list is asked first: GitHub's /releases/latest has timed out or answered 504 for
   // minutes at a time while the list answered in under a second. Each request gives up after 8 s.
   // The last release seen is kept in localStorage: a repeat visit shows it at once, and it stands in
@@ -409,7 +370,7 @@
       .then((rel) => {
         if (!rel) {
           if (last) return;
-          $("release-status").textContent = "No release is published yet. Watch the repository on GitHub, or build it from source below.";
+          $("release-status").textContent = "No release is published yet. Watch the repository on GitHub, or build it from source.";
           for (const el of document.querySelectorAll("[data-needs]")) el.hidden = true;
           return;
         }
@@ -425,6 +386,16 @@
           : "Couldn't load the release details right now; the links open the latest release on GitHub.";
       });
   }
+
+  // ── verify: the commands are collapsed, and a link to #verify opens them ──
+  const steps = $("verify-steps");
+  const openVerify = () => {
+    if (steps && location.hash === "#verify") steps.open = true;
+  };
+  addEventListener("hashchange", openVerify);
+  // A link clicked while the hash is already #verify fires no hashchange.
+  for (const a of document.querySelectorAll('a[href="#verify"]')) a.addEventListener("click", () => steps && (steps.open = true));
+  openVerify();
 
   // ── copy buttons ──
   document.addEventListener("click", (e) => {

@@ -4,12 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MLX Runner: run MLX models on your Mac, natively and fast</title>
-<meta name="description" content="MLX Runner is a native macOS app to discover, download and chat with MLX models from Hugging Face. 100% Swift with zero third-party dependencies and its own Metal inference engine: 343 tok/s on Qwen2.5 0.5B and 41 tok/s on Mistral 7B on an M2 Pro. OpenAI-compatible local server with tool calling, and the mlxr CLI. Free and open source (MIT).">
+<meta name="description" content="MLX Runner is a native macOS app to discover, download and chat with MLX models from Hugging Face. 100% Swift with zero third-party dependencies and its own Metal inference engine: 343 tok/s on Qwen2.5 0.5B and 41 tok/s on Mistral 7B on an M2 Pro, and Sieve, an opt-in approximation of the output layer: up to 15% faster decode, with slightly different output. OpenAI-compatible local server with tool calling, and the mlxr CLI. Free and open source (MIT).">
 <meta name="robots" content="index, follow, max-image-preview:large">
 <meta name="author" content="21no.de">
-<meta name="color-scheme" content="dark light">
-<meta name="theme-color" content="#020208" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#f5f5fc" media="(prefers-color-scheme: light)">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#050507">
 <link rel="canonical" href="https://mlx-runner.21no.de/">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="assets/favicon-64.png" type="image/png" sizes="64x64">
@@ -24,31 +23,31 @@
 <meta property="og:image:type" content="image/png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="MLX Runner by 21no.de: LLMs at the speed of unified memory. 343 tok/s on Qwen2.5 0.5B, 41 tok/s on Mistral 7B, M2 Pro.">
+<meta property="og:image:alt" content="MLX Runner by 21no.de: LLMs at the speed of unified memory. Native macOS, 100% Swift, its own Metal engine, zero dependencies.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:site" content="@TwentyOneNode">
 <meta name="twitter:title" content="MLX Runner: LLMs at the speed of unified memory">
 <meta name="twitter:description" content="A native macOS app for MLX models from Hugging Face. 100% Swift, zero dependencies, its own Metal engine. Free and open source.">
 <meta name="twitter:image" content="https://mlx-runner.21no.de/assets/og.png">
-<meta name="twitter:image:alt" content="MLX Runner by 21no.de: LLMs at the speed of unified memory. 343 tok/s on Qwen2.5 0.5B, 41 tok/s on Mistral 7B, M2 Pro.">
+<meta name="twitter:image:alt" content="MLX Runner by 21no.de: LLMs at the speed of unified memory. Native macOS, 100% Swift, its own Metal engine, zero dependencies.">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"MLX Runner","alternateName":"mlxr","description":"A native macOS app to discover, download and chat with MLX models from Hugging Face, with its own Metal inference engine written in Swift. Zero third-party dependencies. Includes an OpenAI-compatible local server with tool calling and the mlxr command-line tool.","url":"https://mlx-runner.21no.de/","image":"https://mlx-runner.21no.de/assets/og.png","screenshot":"https://mlx-runner.21no.de/assets/screenshot-chat.jpg","applicationCategory":"DeveloperApplication","applicationSubCategory":"Machine learning","operatingSystem":"macOS 15 or later (Apple silicon)","processorRequirements":"Apple silicon (arm64)","license":"https://opensource.org/licenses/MIT","isAccessibleForFree":true,"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"downloadUrl":"https://github.com/BackendStack21/mlx-runner/releases/latest","codeRepository":"https://github.com/BackendStack21/mlx-runner","programmingLanguage":"Swift","author":{"@type":"Organization","name":"21no.de","url":"https://21no.de"},"publisher":{"@type":"Organization","name":"21no.de","url":"https://21no.de"}}</script>
 <link rel="preload" href="fonts/SpaceGrotesk.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="site.css?v=2">
+<link rel="stylesheet" href="site.css?v=3">
 <script type="application/json" id="release-config">{"repo":"BackendStack21/mlx-runner","assets":[{"id":"dmg","suffix":"-macos-arm64.dmg"},{"id":"cli","suffix":"-macos-arm64.tar.gz"},{"id":"sums","name":"SHA256SUMS"},{"id":"sig","name":"SHA256SUMS.sig"}]}</script>
-<script src="site.js?v=2" defer></script>
+<script src="site.js?v=3" defer></script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
+<div class="backdrop" aria-hidden="true"></div>
 
 <header class="nav">
   <a class="brand" href="#top"><img src="assets/favicon.svg" alt="" width="26" height="26"><span>MLX Runner</span></a>
   <nav aria-label="Sections">
-    <a href="#race">Speed</a>
+    <a href="#speed">Speed</a>
+    <a href="#sieve">Sieve</a>
     <a href="#engine">Engine</a>
     <a href="#app">App</a>
     <a href="#cli">CLI</a>
-    <a href="#security">Security</a>
     <a class="gh" href="https://github.com/BackendStack21/mlx-runner" aria-label="MLX Runner on GitHub"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.6 0 0 3.6 0 8c0 3.5 2.3 6.5 5.5 7.6.4.1.5-.2.5-.4v-1.4c-2.2.5-2.7-1-2.7-1-.4-.9-.9-1.2-.9-1.2-.7-.5.1-.5.1-.5.8.1 1.2.8 1.2.8.7 1.2 1.9.9 2.3.7.1-.5.3-.9.5-1.1-1.8-.2-3.6-.9-3.6-4 0-.9.3-1.6.8-2.1-.1-.2-.4-1 .1-2.1 0 0 .7-.2 2.2.8.6-.2 1.3-.3 2-.3s1.4.1 2 .3c1.5-1 2.2-.8 2.2-.8.4 1.1.2 1.9.1 2.1.5.6.8 1.3.8 2.1 0 3.1-1.9 3.7-3.6 3.9.3.3.6.8.6 1.5v2.2c0 .2.1.5.6.4C13.7 14.5 16 11.5 16 8c0-4.4-3.6-8-8-8z"/></svg><span>GitHub</span></a>
     <a class="nav-dl" href="#download">Download</a>
   </nav>
@@ -57,20 +56,20 @@
 <main id="main">
   <section class="hero" id="top">
     <div class="hero-copy">
-      <p class="eyebrow"><span class="pill">Free</span> MIT · 100% Swift · zero dependencies</p>
-      <h1>LLMs at the speed<br>of <span class="grad">unified memory.</span></h1>
+      <p class="label">Free · MIT · 100% Swift · zero dependencies</p>
+      <h1>LLMs at the speed<br>of <span class="hl">unified memory.</span></h1>
       <p class="lede">A native Mac app for MLX models from Hugging Face, with an inference engine written from scratch in Swift and Metal. No Python, no packages, nothing between unified memory and the GPU.</p>
       <div class="cta">
         <a class="btn primary" id="dl-primary" href="https://github.com/BackendStack21/mlx-runner/releases/latest">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8.5M4.5 7 8 10.5 11.5 7M3 13.5h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <span>Download for Mac</span>
         </a>
-        <a class="btn ghost" href="#race">Feel the speed</a>
+        <a class="btn" href="#speed">See the numbers</a>
       </div>
       <p class="meta" id="release-line">Apple silicon · macOS 15 or newer</p>
     </div>
 
-    <figure class="stream glass" id="stream">
+    <figure class="stream panel" id="stream">
       <div class="win-bar">
         <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
         <span class="win-title" id="stream-model">Qwen2.5 0.5B Instruct · 4-bit</span>
@@ -101,312 +100,291 @@
   <section class="facts" aria-label="At a glance">
     <ul>
       <li><b>343</b><span>tok/s decode, Qwen2.5 0.5B</span></li>
-      <li><b>4,270</b><span>tok/s prefill, Qwen2.5 0.5B</span></li>
-      <li><b>~85%</b><span>of memory bandwidth, Mistral 7B</span></li>
+      <li><b>41.0</b><span>tok/s on Mistral 7B, about 85% of the memory-bandwidth cap</span></li>
+      <li><b>8–15%</b><span>faster decode with Sieve on small models (opt-in, changes output)</span></li>
       <li><b>0</b><span>third-party dependencies</span></li>
     </ul>
   </section>
 
-  <section id="race" class="race">
-    <h2>Same prompt. Five models. <span class="grad">Real speeds.</span></h2>
-    <p class="sub">A 512-token prompt and a 256-token answer at measured rates. Cyan is prefill, the gradient is decode.</p>
-    <div class="race-card glass">
-      <div class="race-head">
-        <span class="clock" aria-hidden="true"><span id="race-clock">0.00</span> s</span>
-        <button class="btn small" type="button" id="race-run">Run the race</button>
-      </div>
-      <ol class="lanes" id="lanes">
-        <li data-prefill="4270" data-decode="343"><span class="lane-name">Qwen2.5 0.5B <small>278 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">0.87 s</span></li>
-        <li data-prefill="3020" data-decode="286"><span class="lane-name">Qwen3 0.6B <small>336 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">1.06 s</span></li>
-        <li data-prefill="1720" data-decode="202"><span class="lane-name">Llama 3.2 1B <small>695 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">1.57 s</span></li>
-        <li data-prefill="466" data-decode="70"><span class="lane-name">Phi-3.5 mini <small>2.15 GB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">4.76 s</span></li>
-        <li data-prefill="247" data-decode="41"><span class="lane-name">Mistral 7B v0.3 <small>4.08 GB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">8.32 s</span></li>
-        <li data-prefill="2070" data-decode="189"><span class="lane-name">Gemma 3 1B <small>732 MB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">1.60 s</span></li>
-        <li data-prefill="498" data-decode="67"><span class="lane-name">Gemma 3 4B <small>2.56 GB</small></span><span class="track"><i class="pf"></i><i class="dc"></i></span><span class="lane-t">4.85 s</span></li>
-      </ol>
-      <div class="axis" aria-hidden="true"><span>0 s</span><span>2.5 s</span><span>5 s</span><span>7.5 s</span><span>10 s</span></div>
-    </div>
-    <div class="table-wrap">
+  <section id="speed" class="speed">
+    <p class="label">Speed</p>
+    <h2>Nine models, measured.</h2>
+    <p class="sub">Tokens per second on an M2 Pro (16 GB), 4-bit models. Every rate here was measured with <code>mlxr bench</code>, which you can run on your own Mac.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Speed table">
       <table class="bench">
-        <caption><code>mlxr bench</code>, MLX Runner 1.3.0, M2 Pro (16 GB), 4-bit models.</caption>
-        <thead><tr><th scope="col">Model</th><th scope="col">Weights</th><th scope="col">Prefill (512 tok)</th><th scope="col">Decode @16</th><th scope="col">Decode @1K ctx</th></tr></thead>
+        <caption class="sr-only">Decode and prefill speed of nine 4-bit models</caption>
+        <thead><tr><th scope="col">Model</th><th scope="col">Decode, short context</th><th scope="col">Decode, 1K context</th><th scope="col">Prefill, 512 tokens</th><th scope="col">Weights</th></tr></thead>
         <tbody>
-          <tr><th scope="row">Qwen2.5 0.5B Instruct</th><td>278 MB</td><td>4,270 tok/s</td><td>343 tok/s</td><td>278 tok/s</td></tr>
-          <tr><th scope="row">Qwen3 0.6B</th><td>336 MB</td><td>3,020 tok/s</td><td>286 tok/s</td><td>234 tok/s</td></tr>
-          <tr><th scope="row">Llama 3.2 1B Instruct</th><td>695 MB</td><td>1,720 tok/s</td><td>202 tok/s</td><td>185 tok/s</td></tr>
-          <tr><th scope="row">Phi-3.5 mini</th><td>2.15 GB</td><td>466 tok/s</td><td>70 tok/s</td><td>61 tok/s</td></tr>
-          <tr><th scope="row">Mistral 7B v0.3</th><td>4.08 GB</td><td>247 tok/s</td><td>41.0 tok/s</td><td>39.3 tok/s</td></tr>
-          <tr><th scope="row">Gemma 3 1B (QAT)</th><td>732 MB</td><td>2,070 tok/s</td><td>189 tok/s</td><td>173 tok/s</td></tr>
-          <tr><th scope="row">Gemma 3 4B</th><td>2.56 GB</td><td>498 tok/s</td><td>67 tok/s</td><td>62 tok/s</td></tr>
+          <tr><th scope="row">Qwen2.5 0.5B Instruct</th><td><div class="gain"><span>343 tok/s</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="95.3" height="6"/></svg></div></td><td>278 tok/s</td><td>4,270 tok/s</td><td>278 MB</td></tr>
+          <tr><th scope="row">Qwen3 0.6B</th><td><div class="gain"><span>286 tok/s</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="79.4" height="6"/></svg></div></td><td>234 tok/s</td><td>3,020 tok/s</td><td>336 MB</td></tr>
+          <tr><th scope="row">Qwen3.5 0.8B</th><td><div class="gain"><span>271 tok/s</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="75.3" height="6"/></svg></div></td><td>260 tok/s</td><td>2,780 tok/s</td><td>424 MB</td></tr>
+          <tr><th scope="row">Llama 3.2 1B Instruct</th><td><div class="gain"><span>202 tok/s</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="56.1" height="6"/></svg></div></td><td>185 tok/s</td><td>1,720 tok/s</td><td>695 MB</td></tr>
+          <tr><th scope="row">Gemma 3 1B (QAT)</th><td><div class="gain"><span>189 tok/s</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="52.5" height="6"/></svg></div></td><td>173 tok/s</td><td>2,070 tok/s</td><td>732 MB</td></tr>
+          <tr><th scope="row">Qwen3.5 2B</th><td><div class="gain"><span>133 tok/s</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="36.9" height="6"/></svg></div></td><td>130 tok/s</td><td>1,158 tok/s</td><td>1.06 GB</td></tr>
+          <tr><th scope="row">Phi-3.5 mini</th><td><div class="gain"><span>70 tok/s</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="19.4" height="6"/></svg></div></td><td>61 tok/s</td><td>466 tok/s</td><td>2.15 GB</td></tr>
+          <tr><th scope="row">Gemma 3 4B</th><td><div class="gain"><span>67 tok/s</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="18.6" height="6"/></svg></div></td><td>62 tok/s</td><td>498 tok/s</td><td>2.56 GB</td></tr>
+          <tr><th scope="row">Mistral 7B v0.3</th><td><div class="gain"><span>41.0 tok/s</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="11.4" height="6"/></svg></div></td><td>39.3 tok/s</td><td>247 tok/s</td><td>4.08 GB</td></tr>
         </tbody>
       </table>
     </div>
+    <p class="cap">Greedy decode, Sieve off; the rows were measured for different releases. Against mlx-lm on the same files (one run each), decode is 6–16% faster on the sub-1B Qwen models and Phi-3.5, between 4% faster and 5% slower on most others, and 17% slower on Gemma 2. Prefill at 512 tokens ranges from 29% faster to 19% slower, and mlx-lm prefills faster on short and very long prompts. <a href="https://github.com/BackendStack21/mlx-runner#performance">The full comparison with mlx-lm and Ollama</a>.</p>
+
+    <div class="ceiling">
+      <div>
+        <h3>The 7B ceiling: every token reads every weight, once.</h3>
+        <p>So memory bandwidth sets the limit, not compute. This M2 Pro reads <b>197 GB/s</b>, which caps a 4.08 GB model at about <b>48 tok/s</b>.</p>
+      </div>
+      <figure class="meter panel">
+        <figcaption class="meter-top"><b>41.0</b> of ≈ 48 tok/s, Mistral 7B <span>~85%</span></figcaption>
+        <svg class="meter-bar" viewBox="0 0 100 10" preserveAspectRatio="none" aria-hidden="true"><rect width="85" height="10"/></svg>
+      </figure>
+    </div>
   </section>
 
-  <section id="ceiling" class="ceiling">
-    <div class="ceiling-copy">
-      <p class="kicker">The 7B ceiling</p>
-      <h2>Every token reads every weight. <span class="grad">Once.</span></h2>
-      <p>Decoding one token streams the whole model through the GPU, so memory bandwidth sets the limit, not compute. This M2 Pro reads <b>197 GB/s</b>, which caps a 4.08 GB model at about <b>48 tok/s</b>.</p>
-      <p>MLX Runner decodes Mistral 7B at <b>41.0 tok/s</b>, about 85% of that cap. Faster means more bandwidth (an M-series Max: about 400 GB/s), fewer bits, or speculative decoding (exact, but on this GPU it still costs more than it saves).</p>
+  <section id="sieve" class="sieve">
+    <p class="label">New in 2.2 · opt-in</p>
+    <h2>Sieve: up to 15% faster decode, by approximating the output layer.</h2>
+    <p class="sub">A model's last layer scores every token in the vocabulary on every step, though the sampler uses only a handful of those scores. With Sieve on, a small 4-bit approximation scores them all, and the exact score is computed only for the likeliest (up to 16,384). Output can differ, so it is off by default. Each model is fitted once, in one to six minutes.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Sieve table">
+      <table class="bench">
+        <caption class="sr-only">Decode speed with Sieve off and on, and how often answers changed, on nine 4-bit models</caption>
+        <thead><tr><th scope="col">Model</th><th scope="col">Gain</th><th scope="col">Answers changed</th><th scope="col">Sieve off</th><th scope="col">Sieve on</th><th scope="col">Likeliest token kept</th><th scope="col">Vocabulary</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Gemma 3 1B (QAT)</th><td><div class="gain"><span>+15.1%</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="94.4" height="6"/></svg></div></td><td>6 of 30</td><td>188.1 tok/s</td><td>216.5 tok/s</td><td>99.51%</td><td>262K</td></tr>
+          <tr><th scope="row">Qwen3.5 0.8B</th><td><div class="gain"><span>+12.4%</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="77.5" height="6"/></svg></div></td><td>7 of 30</td><td>254.8 tok/s</td><td>286.3 tok/s</td><td>99.61%</td><td>248K</td></tr>
+          <tr><th scope="row">Gemma 4 E2B OptiQ</th><td><div class="gain"><span>+12.1%</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="75.6" height="6"/></svg></div></td><td>2 of 30</td><td>73.3 tok/s</td><td>82.2 tok/s</td><td>99.90%</td><td>262K</td></tr>
+          <tr><th scope="row">Llama 3.2 1B</th><td><div class="gain"><span>+8.5%</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="53.1" height="6"/></svg></div></td><td>5 of 30</td><td>202.4 tok/s</td><td>219.6 tok/s</td><td>99.95%</td><td>128K</td></tr>
+          <tr><th scope="row">Qwen3 0.6B</th><td><div class="gain"><span>+8.2%</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="51.2" height="6"/></svg></div></td><td>5 of 30</td><td>287.9 tok/s</td><td>311.6 tok/s</td><td>100.00%</td><td>152K</td></tr>
+          <tr><th scope="row">Qwen3.5 4B</th><td><div class="gain"><span>+8.1%</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="50.6" height="6"/></svg></div></td><td>2 of 30</td><td>61.8 tok/s</td><td>66.8 tok/s</td><td>99.85%</td><td>248K</td></tr>
+          <tr><th scope="row">Qwen3 8B</th><td><div class="gain"><span>+3.9%</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="24.4" height="6"/></svg></div></td><td>0 of 30</td><td>38.3 tok/s</td><td>39.8 tok/s</td><td>100.00%</td><td>152K</td></tr>
+          <tr><th scope="row">Phi-3.5 mini</th><td><div class="gain"><span>+0.9%</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="5.6" height="6"/></svg></div></td><td>4 of 30</td><td>70.2 tok/s</td><td>70.8 tok/s</td><td>99.71%</td><td>32K</td></tr>
+          <tr><th scope="row">Mistral 7B v0.3</th><td><div class="gain"><span>+0.7%</span><svg class="gbar" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect width="4.4" height="6"/></svg></div></td><td>0 of 30</td><td>41.1 tok/s</td><td>41.4 tok/s</td><td>100.00%</td><td>33K</td></tr>
+        </tbody>
+      </table>
     </div>
-    <figure class="gauge glass">
-      <svg viewBox="0 0 240 140" role="img" aria-labelledby="gauge-t">
-        <title id="gauge-t">Mistral 7B decode uses about 85% of the measured 197 GB/s memory bandwidth.</title>
-        <defs>
-          <linearGradient id="gg" x1="0" x2="1"><stop offset="0" stop-color="#21bafa"/><stop offset=".6" stop-color="#6b5cff"/><stop offset="1" stop-color="#fa5a9e"/></linearGradient>
-        </defs>
-        <path class="g-track" d="M20 120a100 100 0 0 1 200 0" pathLength="100"/>
-        <path class="g-fill" d="M20 120a100 100 0 0 1 200 0" pathLength="100" stroke="url(#gg)"/>
-        <g class="g-ticks"><path d="M20 120h10M210 120h10M120 20v10M49.3 49.3l7 7M190.7 49.3l-7 7"/></g>
-        <text class="g-big" x="120" y="104" text-anchor="middle">~85%</text>
-        <text class="g-small" x="120" y="126" text-anchor="middle">of measured bandwidth</text>
-      </svg>
-      <dl class="gauge-stats">
-        <div><dt>Read bandwidth</dt><dd>197 GB/s</dd></div>
-        <div><dt>Ceiling, 4.08 GB</dt><dd>≈ 48 tok/s</dd></div>
-        <div><dt>MLX Runner</dt><dd class="hl">41.0 tok/s</dd></div>
-      </dl>
-    </figure>
+    <p class="cap">Greedy decode at 16 tokens of context, median of three alternating runs, M2 Pro (16 GB), 2026-11-12. At 1,024 tokens the gains are within 2 points of these, lower on most models. This table and the one above were measured for different releases, so a model's rate can differ between them (Qwen3.5 0.8B: 271 there, 255 here); compare within a table. <b>Answers changed:</b> ten prompts answered with Sieve off and on under three seeds with the default sampler, up to 96 tokens each; how many of the 30 answers differ anywhere. <b>Likeliest token kept:</b> measured by the fit on up to 2,048 held-out states; the fit raises its rank until this reaches 99.5%.</p>
+    <ul class="notes">
+      <li><h3>It changes output</h3><p>The approximation is not exact, so some answers diverge; the table counts them. Off, it costs nothing and output is unchanged. A model that has not been fitted runs at its normal speed.</p></li>
+      <li><h3>Where it pays</h3><p>The gain follows the output layer's share of a step: 8–15% on models up to 4B with a large vocabulary, 4% on Qwen3 8B, and not worth turning on for Phi-3.5 mini or Mistral 7B.</p></li>
+      <li><h3>Not measured</h3><p>Benchmark scores, perplexity, long contexts, tool calls, thinking, and sampler settings other than greedy and the default. The fit and its test use the model's own short answers. Models over 8B could not be fitted on 16 GB.</p></li>
+    </ul>
+    <div class="sieve-use">
+      <div class="cmd"><pre><code>mlxr sieve mlx-community/Qwen3-0.6B-4bit   <span class="c"># fit once</span>
+mlxr run mlx-community/Qwen3-0.6B-4bit "Explain RoPE" --sieve balanced</code></pre>
+      <button class="copy" type="button" aria-label="Copy the Sieve commands" data-copy="mlxr sieve mlx-community/Qwen3-0.6B-4bit
+mlxr run mlx-community/Qwen3-0.6B-4bit &quot;Explain RoPE&quot; --sieve balanced"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div>
+      <div>
+        <p>In the app: the <b>Sieve</b> switch and <b>Fit</b> button in the chat inspector. Also <code>--sieve balanced</code> on <code>mlxr serve</code>.</p>
+        <a class="more" href="https://github.com/BackendStack21/mlx-runner/blob/main/docs/sieve-head.md">Method, full tables and limits</a>
+      </div>
+    </div>
   </section>
 
   <section id="engine" class="engine">
-    <h2>An engine written from scratch, <span class="grad">for Metal.</span></h2>
+    <p class="label">Engine</p>
+    <h2>Written from scratch, for Metal.</h2>
     <p class="sub">No <code>mlx-swift</code>: MLX Runner runs MLX <em>models</em> on its own kernels, from the same files <code>mlx-lm</code> reads. Any compatible <code>mlx-community</code> repo works without conversion.</p>
 
-    <figure class="pipeline glass">
-      <figcaption>One decode step, one command buffer. The next step is queued before this one is read back.</figcaption>
+    <figure class="pipeline">
+      <figcaption>One decode step is one command buffer, and the next step is queued before this one is read back.</figcaption>
       <ol>
-        <li><b>Unified memory</b><span>safetensors <code>mmap</code>ed into Metal buffers, no copy</span></li>
+        <li><b>Unified memory</b><span>one copy of the weights, in page-aligned Metal buffers</span></li>
         <li><b>q · k · v</b><span>one fused 4-bit matvec over three matrices</span></li>
         <li><b>Norm · RoPE · KV</b><span>RMSNorm, RoPE and the KV-cache append in one kernel</span></li>
-        <li><b>Attention</b><span>online softmax; each K/V row read once per query group</span></li>
-        <li><b>gate · up · down</b><span>fused matvecs; the residual add folds into the norm</span></li>
-        <li class="out"><b>Next token</b><span>picked on the GPU: penalty, top-k, min-p, top-p and the draw</span></li>
+        <li><b>Attention</b><span>online softmax across simdgroups</span></li>
+        <li><b>gate · up · down</b><span>gate and up in one fused matvec; the residual add folds into the norm</span></li>
+        <li><b>Next token</b><span>picked on the GPU: penalty, top-k, min-p, top-p and the draw</span></li>
       </ol>
     </figure>
 
-    <ul class="cards four">
-      <li class="glass"><h3>Prefill on tensor tiles</h3><p>Quantized GEMMs on <code>simdgroup_matrix</code> tiles and flash attention. Short follow-ups get an 8- or 16-token tile.</p></li>
-      <li class="glass"><h3>KV-cache prefix reuse</h3><p>Prompt tokens shared with the previous request are skipped, so follow-ups start almost instantly.</p></li>
-      <li class="glass"><h3>Sparse attention at long contexts</h3><p>Past 5K tokens each new token reads the first and latest keys plus the 2,048 that score highest: decode 1.4–2.4× faster than <code>mlx-lm</code> at 30K, with a small change in output.</p></li>
-      <li class="glass"><h3>Nothing else</h3><p>Swift plus Apple frameworks. No SwiftPM packages, no vendored code, no Python.</p></li>
+    <ul class="notes">
+      <li><h3>Prefill on tensor tiles</h3><p>Quantized GEMMs on <code>simdgroup_matrix</code> tiles, each weight tile dequantized once and shared by 32 tokens, and flash attention.</p></li>
+      <li><h3>KV-cache prefix reuse</h3><p>Prompt tokens shared with the previous request are skipped, so follow-ups start almost instantly.</p></li>
+      <li><h3>Sparse attention, on by default</h3><p>From 5,128 tokens of context each new token attends to the first and latest tokens plus the 2,048 that score highest. Decode at 30K is 1.4–3× faster than dense, and output changes: perplexity rises by about 3% or less on most models measured, 8% on Gemma 4 E2B. <a href="https://github.com/BackendStack21/mlx-runner/blob/main/docs/sparse-decode-attention.md">Speed and quality per model</a>.</p></li>
     </ul>
 
     <div class="archs">
-      <p class="kicker">Runs today</p>
+      <p class="label">Runs today</p>
       <ul>
-        <li><code>qwen3</code><span>thinking toggle</span></li>
-        <li><code>qwen2</code><span>q/k/v biases</span></li>
-        <li><code>llama</code><span>Llama 3 RoPE scaling</span></li>
-        <li><code>mistral</code><span>SentencePiece BPE</span></li>
-        <li><code>phi3</code><span>LongRoPE</span></li>
-        <li><code>gemma</code><span>1, 2, 3 and 4: sliding windows, soft-capping, KV sharing</span></li>
+        <li><code>qwen3</code></li>
+        <li><code>qwen3_5</code></li>
+        <li><code>qwen2</code></li>
+        <li><code>llama</code></li>
+        <li><code>mistral</code></li>
+        <li><code>phi3</code></li>
+        <li><code>gemma 1–4</code></li>
       </ul>
-      <p class="muted">Each verified end to end. Not yet: mixture-of-experts and vision models.</p>
+      <p class="muted">Each type is tested on at least one checkpoint: generation, and prefill matching token-by-token decode. Not yet: mixture-of-experts, vision and audio. <a href="https://github.com/BackendStack21/mlx-runner#supported-models">Verified checkpoints</a>.</p>
     </div>
   </section>
 
   <section id="app" class="app">
-    <h2>A Mac app, <span class="grad">not a wrapper.</span></h2>
-    <p class="sub">SwiftUI with Liquid Glass on macOS 26. Search the Hub, download with verified checksums, chat, and serve the loaded model to your tools.</p>
+    <p class="label">App</p>
+    <h2>A Mac app, not a wrapper.</h2>
+    <p class="sub">SwiftUI with Liquid Glass on macOS 26. Search the Hub, download, chat, and serve the loaded model to your tools.</p>
     <div class="carousel">
+      <div class="car-head">
       <div class="tabs" role="tablist" aria-label="App screens">
         <a role="tab" id="tab-chat" href="#panel-chat" aria-controls="panel-chat" aria-selected="true">Chat</a>
-        <a role="tab" id="tab-thinking" href="#panel-thinking" aria-controls="panel-thinking" aria-selected="false" tabindex="-1">Thinking</a>
-        <a role="tab" id="tab-discover" href="#panel-discover" aria-controls="panel-discover" aria-selected="false" tabindex="-1">Discover</a>
-        <a role="tab" id="tab-models" href="#panel-models" aria-controls="panel-models" aria-selected="false" tabindex="-1">My Models</a>
-        <a role="tab" id="tab-server" href="#panel-server" aria-controls="panel-server" aria-selected="false" tabindex="-1">Local Server</a>
+        <a role="tab" id="tab-thinking" href="#panel-thinking" aria-controls="panel-thinking" aria-selected="false">Thinking</a>
+        <a role="tab" id="tab-discover" href="#panel-discover" aria-controls="panel-discover" aria-selected="false">Discover</a>
+        <a role="tab" id="tab-models" href="#panel-models" aria-controls="panel-models" aria-selected="false">My Models</a>
+        <a role="tab" id="tab-server" href="#panel-server" aria-controls="panel-server" aria-selected="false">Local Server</a>
       </div>
-      <ul class="slides" id="slides">
-        <li class="slide" role="tabpanel" id="panel-chat" aria-labelledby="tab-chat">
+      <button class="car-btn prev" type="button" aria-label="Previous screen"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <button class="car-btn next" type="button" aria-label="Next screen"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      </div>
+      <div class="slides" id="slides">
+        <div class="slide" role="tabpanel" id="panel-chat" aria-labelledby="tab-chat">
           <div class="window"><img src="assets/screenshot-chat.jpg" width="1568" height="1054" alt="MLX Runner chat: a streamed reply with a Markdown table and highlighted Swift code, its tok/s, token count and time to first token, next to the sampling inspector."></div>
           <div class="shot-copy">
-            <h3>Chat</h3>
             <ul>
-              <li>Streaming Markdown and highlighted code, with live tok/s and time to first token on every reply.</li>
+              <li>Streaming Markdown and highlighted code, with tok/s and time to first token on every reply.</li>
               <li>Edit and resend, regenerate, a per-chat system prompt and searchable history.</li>
-              <li>Inspector for temperature, top-p, top-k, min-p, repeat penalty, context length and sparse attention.</li>
+              <li>An inspector for sampling, context length, sparse attention and Sieve.</li>
             </ul>
           </div>
-        </li>
-        <li class="slide" role="tabpanel" id="panel-thinking" aria-labelledby="tab-thinking">
+        </div>
+        <div class="slide" role="tabpanel" id="panel-thinking" aria-labelledby="tab-thinking">
           <div class="window"><img src="assets/screenshot-thinking.jpg" width="1568" height="1054" alt="MLX Runner chat with Qwen3 reasoning streaming into an open thinking block above the answer." loading="lazy"></div>
           <div class="shot-copy">
-            <h3>Thinking</h3>
             <ul>
-              <li>Qwen3 reasoning streams into a collapsible block above the answer.</li>
+              <li>Qwen3 and Qwen 3.5 reasoning streams into a collapsible block above the answer.</li>
               <li>One toggle turns it off for quick replies.</li>
             </ul>
           </div>
-        </li>
-        <li class="slide" role="tabpanel" id="panel-discover" aria-labelledby="tab-discover">
+        </div>
+        <div class="slide" role="tabpanel" id="panel-discover" aria-labelledby="tab-discover">
           <div class="window"><img src="assets/screenshot-discover.jpg" width="1568" height="1054" alt="MLX Runner Discover: Hugging Face search for MLX models with architecture and quantization badges, recommended models for this Mac, and a model card." loading="lazy"></div>
           <div class="shot-copy">
-            <h3>Discover</h3>
             <ul>
-              <li>Search the Hub by downloads, likes, trending or recency, with the exact architecture and quantization on every result.</li>
-              <li>"Runnable only" hides what the engine can't run.</li>
+              <li>Search the Hub with the exact architecture and quantization on every result; "Runnable only" hides what the engine can't run.</li>
               <li>Recommended picks that fit your Mac's memory.</li>
             </ul>
           </div>
-        </li>
-        <li class="slide" role="tabpanel" id="panel-models" aria-labelledby="tab-models">
+        </div>
+        <div class="slide" role="tabpanel" id="panel-models" aria-labelledby="tab-models">
           <div class="window"><img src="assets/screenshot-models.jpg" width="1568" height="1054" alt="MLX Runner My Models: a grid of installed models with architecture, quantization, size and load controls." loading="lazy"></div>
           <div class="shot-copy">
-            <h3>My Models</h3>
             <ul>
-              <li>Background downloads that resume, with every LFS file checked against the SHA-256 the Hub publishes.</li>
+              <li>Background downloads that resume after an interruption.</li>
               <li>Models already in <code>~/.cache/huggingface/hub</code> show up automatically.</li>
               <li>A memory guard refuses models that won't fit.</li>
             </ul>
           </div>
-        </li>
-        <li class="slide" role="tabpanel" id="panel-server" aria-labelledby="tab-server">
+        </div>
+        <div class="slide" role="tabpanel" id="panel-server" aria-labelledby="tab-server">
           <div class="window"><img src="assets/screenshot-server.jpg" width="1568" height="1054" alt="MLX Runner Local Server running: port, local-network and API-key settings, allowed browser origins, the endpoints and a live request log." loading="lazy"></div>
           <div class="shot-copy">
-            <h3>Local Server</h3>
             <ul>
-              <li>OpenAI-compatible: Responses, Chat Completions, Completions and <code>/v1/models</code>, with tool calling.</li>
-              <li>Localhost by default; API key optional there, required on the LAN.</li>
-              <li>Browser origin allowlist and a live request log.</li>
+              <li>OpenAI-compatible: Responses, Chat Completions, Completions and <code>/v1/models</code>.</li>
+              <li>A browser origin allowlist and a live request log.</li>
             </ul>
           </div>
-        </li>
-      </ul>
-      <button class="car-btn prev" type="button" aria-label="Previous screen"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
-      <button class="car-btn next" type="button" aria-label="Next screen"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        </div>
+      </div>
     </div>
   </section>
 
   <section id="cli" class="cli">
     <div class="cli-copy">
-      <p class="kicker">Command line</p>
-      <h2><code class="grad">mlxr</code>, the same engine in your terminal.</h2>
-      <p>Ollama-style commands on the app's model library: pull, run (or chat interactively), list, show, serve and bench. Every number on this page came from <code>mlxr bench</code>.</p>
+      <p class="label">Command line</p>
+      <h2><code>mlxr</code>, the same engine in your terminal.</h2>
+      <p>Ollama-style commands on the app's model library: pull, run or chat, serve, fit Sieve and benchmark.</p>
       <ul class="cmds">
         <li><code>mlxr pull mlx-community/Qwen3-4B-4bit</code></li>
         <li><code>mlxr run mlx-community/Qwen3-4B-4bit "Explain RoPE" --no-think</code></li>
-        <li><code>mlxr list</code>, <code>mlxr show &lt;model&gt;</code></li>
         <li><code>mlxr serve &lt;model&gt; --port 1234</code></li>
+        <li><code>mlxr sieve &lt;model&gt;</code></li>
         <li><code>mlxr bench &lt;model&gt;</code></li>
       </ul>
-      <p class="cli-get">No app needed: <a href="#cli-install">install only the CLI</a>.</p>
+      <p class="cli-get"><a href="https://github.com/BackendStack21/mlx-runner#command-line-mlxr">Every command</a> · no app needed: <a href="#cli-install">install only the CLI</a>.</p>
     </div>
     <figure class="term">
       <div class="win-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="win-title">zsh · M2 Pro</span><button class="replay" type="button" id="term-replay" aria-label="Replay the terminal session"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
-<pre id="term" tabindex="0" aria-label="Terminal session"><code><span class="p">$</span> mlxr run mlx-community/Llama-3.2-1B-Instruct-4bit "Write a haiku about Metal shaders." --temp 0 --seed 42 --max 256
-<span class="o">Loaded Llama-3.2-1B-Instruct-4bit [llama, q4g64, 16 layers, llama3] in 0.96s
-sparse attention off: the context length (4096) is below 5128 tokens, where it starts</span>
-Metal's dark delight
-Glowing shards of fiery
-Beauty in the dark
+<pre id="term" tabindex="0" role="region" aria-label="Terminal session"><code><span class="p">$</span> mlxr run mlx-community/gemma-3-1b-it-qat-4bit "Write a haiku about Metal shaders." --sieve balanced --temp 0 --repeat-penalty 1 --seed 42 --max 256
+<span class="o">Loaded gemma-3-1b-it-qat-4bit [gemma3_text, q4g64, 26 layers, gemma] in 1.24s
+sparse attention off: the context length (4096) is below 5128 tokens, where it starts
+sieve: balanced (head by rows: rank 192, 15723 exact rows per token, 24% of the head's bytes; on 2048 held-out states the dense argmax is kept in 99.51%, 0.60% of sampled tokens change (top-k 40), KL mean 0.1170 (median 0.00000))</span>
+Dark metal glows bright,
+Reflecting skies, a cool hue,
+Worlds of color bloom.
 
-<span class="p">$</span> mlxr bench mlx-community/Qwen2.5-0.5B-Instruct-4bit
-<span class="c"># … kernel and sampler micro-benchmarks …</span>
-<span class="o">prefill   512 tokens:  2991.8 tok/s</span>
-<span class="hl">decode @  16:  360.0 tok/s</span><span class="o">  (wall 2.78 ms, gpu 2.77 ms per token)</span>
-<span class="hl">decode @1024:  295.3 tok/s</span><span class="o">  (wall 3.39 ms, gpu 3.38 ms per token)</span>
-<span class="o">sampled @  16:  345.5 tok/s  (wall 2.89 ms, gpu 2.89 ms per token)
-sampled @1024:  290.3 tok/s  (wall 3.44 ms, gpu 3.44 ms per token)</span></code></pre>
-      <figcaption>Real output on an M2 Pro (16 GB): the run is from 2.0.0 (the two notes above the haiku go to stderr), the bench is from 1.1.1. "sampled" is the app's default sampler, on the GPU too.</figcaption>
+<span class="p">$</span> MLXR_BENCH_DECODE=1 mlxr bench mlx-community/gemma-3-1b-it-qat-4bit
+<span class="c"># …</span>
+<span class="o">decode @  16:  198.2 tok/s  (wall 5.05 ms, gpu 5.04 ms per token)
+decode @1024:  177.7 tok/s  (wall 5.63 ms, gpu 5.62 ms per token)</span>
+<span class="c"># …</span>
+
+<span class="p">$</span> MLXR_SIEVE=balanced MLXR_BENCH_DECODE=1 mlxr bench mlx-community/gemma-3-1b-it-qat-4bit
+<span class="c"># …</span>
+<span class="hl">decode @  16:  227.7 tok/s</span><span class="o">  (wall 4.39 ms, gpu 4.39 ms per token)</span>
+<span class="hl">decode @1024:  204.2 tok/s</span><span class="o">  (wall 4.90 ms, gpu 4.89 ms per token)</span>
+<span class="c"># …</span></code></pre>
+      <figcaption>Real output from 2.2.0 on an M2 Pro (16 GB) with a fitted Gemma 3 1B; lines marked … are left out. One run each, so the rates differ from the tables' medians. The 0.60% in the sieve line is the fit's estimate at temperature 1, not the table's count of changed answers.</figcaption>
     </figure>
   </section>
 
   <section id="server" class="server">
+    <p class="label">Local server</p>
     <h2>Your tools already speak its API.</h2>
-    <p class="sub">OpenAI-compatible: the Responses API with typed streaming events, Chat Completions and function tools. Point any OpenAI SDK at it. These exchanges are real, captured from Qwen3 0.6B.</p>
+    <p class="sub">OpenAI-compatible: the Responses API with typed streaming events, Chat Completions and function tools. Point any OpenAI SDK at <code>http://localhost:1234/v1</code>. This exchange is real, captured from Qwen3 0.6B.</p>
     <div class="server-grid">
-      <div class="examples">
-        <div class="code-tabs" role="tablist" aria-label="API examples">
-          <button role="tab" id="ex-chat-t" aria-controls="ex-chat" aria-selected="true">chat completions + tools</button>
-          <button role="tab" id="ex-py-t" aria-controls="ex-py" aria-selected="false" tabindex="-1">openai sdk</button>
-          <button role="tab" id="ex-resp-t" aria-controls="ex-resp" aria-selected="false" tabindex="-1">responses api</button>
-        </div>
-        <div class="cmd code-card glass" role="tabpanel" id="ex-chat" aria-labelledby="ex-chat-t"><pre><code><span class="c"># Chat Completions with a function tool</span>
-curl http://localhost:1234/v1/chat/completions \
+      <div class="cmd"><pre><code>curl http://localhost:1234/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "Qwen3-0.6B-4bit",
-       "messages": [{"role": "user",
-                     "content": "What is the weather in Berlin right now?"}],
-       "tools": [{"type": "function", "function": {"name": "get_weather",
-                   "parameters": {"type": "object",
-                                  "properties": {"city": {"type": "string"}},
-                                  "required": ["city"]}}}]}'
+    "messages": [{"role": "user",
+      "content": "What is the weather in Berlin right now?"}],
+    "tools": [{"type": "function", "function": {
+      "name": "get_weather",
+      "parameters": {"type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]}}}]}'
 
 <span class="c"># The model calls it. Reply with a "tool" message and it finishes the turn.</span>
 <span class="r">"finish_reason": "tool_calls",
 "message": {"role": "assistant", "content": null,
-            "tool_calls": [{"id": "call_d450Vb67…", "type": "function",
-                            "function": {"name": "get_weather",
-                                         "arguments": "{\"city\":\"Berlin\"}"}}]}</span></code></pre><button class="copy" type="button" aria-label="Copy the curl command" data-copy="curl http://localhost:1234/v1/chat/completions -H &quot;Content-Type: application/json&quot; -d '{&quot;model&quot;: &quot;Qwen3-0.6B-4bit&quot;, &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;What is the weather in Berlin right now?&quot;}], &quot;tools&quot;: [{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: &quot;get_weather&quot;, &quot;parameters&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;city&quot;: {&quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;city&quot;]}}}]}'"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div>
-        <div class="cmd code-card glass" role="tabpanel" id="ex-py" aria-labelledby="ex-py-t" hidden><pre><code><span class="k">from</span> openai <span class="k">import</span> OpenAI
-client = OpenAI(base_url="http://localhost:1234/v1",
-                api_key="not-needed-on-localhost")
-
-tools = [{"type": "function", "function": {"name": "get_weather",
-          "parameters": {"type": "object",
-                         "properties": {"city": {"type": "string"}},
-                         "required": ["city"]}}}]
-r = client.chat.completions.create(
-    model="Qwen3-0.6B-4bit", tools=tools,
-    messages=[{"role": "user",
-               "content": "What is the weather in Berlin right now?"}])
-call = r.choices[0].message.tool_calls[0]
-print(call.function.name, call.function.arguments)  <span class="c"># get_weather {"city":"Berlin"}</span></code></pre><button class="copy" type="button" aria-label="Copy the Python example" data-copy="from openai import OpenAI
-client = OpenAI(base_url=&quot;http://localhost:1234/v1&quot;, api_key=&quot;not-needed-on-localhost&quot;)
-
-tools = [{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: &quot;get_weather&quot;,
-          &quot;parameters&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;city&quot;: {&quot;type&quot;: &quot;string&quot;}},
-                         &quot;required&quot;: [&quot;city&quot;]}}}]
-r = client.chat.completions.create(model=&quot;Qwen3-0.6B-4bit&quot;, tools=tools,
-        messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;What is the weather in Berlin right now?&quot;}])
-call = r.choices[0].message.tool_calls[0]
-print(call.function.name, call.function.arguments)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div>
-        <div class="cmd code-card glass" role="tabpanel" id="ex-resp" aria-labelledby="ex-resp-t" hidden><pre><code><span class="c"># Responses API, streamed, same tool</span>
-curl http://localhost:1234/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-0.6B-4bit", "stream": true,
-       "input": "What is the weather in Berlin right now?",
-       "tools": [{"type": "function", "name": "get_weather",
-                  "parameters": {"type": "object",
-                                 "properties": {"city": {"type": "string"}},
-                                 "required": ["city"]}}]}'
-
-<span class="c"># Typed events deliver a reasoning item (Qwen3), then the call</span>
-<span class="r">{"type": "function_call", "call_id": "call_lptFNQuX…",
- "name": "get_weather", "arguments": "{\"city\":\"Berlin\"}",
- "status": "completed"}</span></code></pre><button class="copy" type="button" aria-label="Copy the curl command" data-copy="curl http://localhost:1234/v1/responses -H &quot;Content-Type: application/json&quot; -d '{&quot;model&quot;: &quot;Qwen3-0.6B-4bit&quot;, &quot;stream&quot;: true, &quot;input&quot;: &quot;What is the weather in Berlin right now?&quot;, &quot;tools&quot;: [{&quot;type&quot;: &quot;function&quot;, &quot;name&quot;: &quot;get_weather&quot;, &quot;parameters&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;city&quot;: {&quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;city&quot;]}}]}'"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div>
+  "tool_calls": [{"id": "call_d450Vb67…", "type": "function",
+    "function": {"name": "get_weather",
+      "arguments": "{\"city\":\"Berlin\"}"}}]}</span></code></pre>
+      <button class="copy" type="button" aria-label="Copy the curl command" data-copy="curl http://localhost:1234/v1/chat/completions -H &quot;Content-Type: application/json&quot; -d '{&quot;model&quot;: &quot;Qwen3-0.6B-4bit&quot;, &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;What is the weather in Berlin right now?&quot;}], &quot;tools&quot;: [{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: &quot;get_weather&quot;, &quot;parameters&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;city&quot;: {&quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;city&quot;]}}}]}'"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div>
+      <div>
+        <ul class="checks">
+          <li><b>Tool calling</b> on Qwen, Llama 3.1+ and Mistral v0.3 models (Gemma and Phi-3.5 have no tool format): <code>tool_choice</code>, parallel calls and the full call → result → answer loop.</li>
+          <li><b>Safe by default.</b> Localhost only; other <code>Host</code> headers and unknown browser <code>Origin</code>s are refused. An API key is required on the LAN.</li>
+          <li><b>Reasoning included.</b> Qwen3 and Qwen 3.5 thinking comes back as <code>reasoning_content</code> or a <code>reasoning</code> item.</li>
+        </ul>
+        <a class="more" href="https://github.com/BackendStack21/mlx-runner#features">Endpoints, and what is rejected</a>
       </div>
-      <ul class="checks">
-        <li><b>Tool calling.</b> <code>tool_choice</code> auto, none, required or a named function, parallel calls, and the full call → result → answer loop. Prompts use each model's native format, byte-identical to the official templates.</li>
-        <li><b>Safe by default.</b> Localhost only; other <code>Host</code> headers and unknown browser <code>Origin</code>s refused; JSON bodies, timeouts and size limits. An API key is required on the LAN.</li>
-        <li><b>Reasoning included.</b> Qwen3 thinking comes back as <code>reasoning_content</code> or a <code>reasoning</code> item.</li>
-      </ul>
     </div>
   </section>
 
   <section id="security" class="security">
-    <h2>Model files are <span class="grad">untrusted input.</span></h2>
-    <p class="sub">It runs files from the internet on your GPU and can open a port. It is built like it knows that.</p>
-    <ul class="cards four">
-      <li class="glass"><h3>Validated before the GPU</h3><p>safetensors headers, tensor offsets, config dimensions, token ids and every weight shape are checked first.</p></li>
-      <li class="glass"><h3>Verified downloads</h3><p>Every LFS file is checked against its SHA-256 from the Hub. Your Hugging Face token lives in the Keychain.</p></li>
-      <li class="glass"><h3>Signed updates</h3><p>An update installs only if its Ed25519-signed <code>SHA256SUMS</code>, its checksum and the code signature all verify, then swaps in atomically.</p></li>
-      <li class="glass"><h3>Collects nothing</h3><p>Prompts and replies never leave your Mac. The only network calls are Hugging Face for models and GitHub for updates.</p></li>
+    <p class="label">Security</p>
+    <h2>Model files are untrusted input.</h2>
+    <p class="sub">MLX Runner runs files from the internet on your GPU and can open a port, so everything it reads is checked first. <a href="https://github.com/BackendStack21/mlx-runner/blob/main/SECURITY.md">Security policy</a>.</p>
+    <ul class="notes four">
+      <li><h3>Validated before the GPU</h3><p>safetensors headers, tensor offsets, config dimensions, token ids and every weight shape are checked first.</p></li>
+      <li><h3>Verified downloads</h3><p>Every LFS file is checked against its SHA-256 from the Hub. Your Hugging Face token lives in the Keychain.</p></li>
+      <li><h3>Signed updates</h3><p>An update installs only if its Ed25519-signed <code>SHA256SUMS</code>, its checksum and the code signature all verify.</p></li>
+      <li><h3>Collects nothing</h3><p>Prompts and replies never leave your Mac. The only network calls are Hugging Face for models and GitHub for updates.</p></li>
     </ul>
   </section>
 
   <section id="download" class="download">
-    <div class="dl-card glass">
-      <img class="dl-icon" src="assets/icon-256.png" width="112" height="112" alt="">
-      <h2>Get MLX Runner</h2>
-      <p class="dl-sub" id="dl-version">For Apple silicon Macs running macOS 15 or newer. Free and open source, MIT licensed.</p>
+    <div class="dl-card panel">
+      <div class="dl-head">
+        <img class="dl-icon" src="assets/icon-256.png" width="72" height="72" alt="">
+        <div>
+          <h2>Get MLX Runner</h2>
+          <p class="dl-sub" id="dl-version">For Apple silicon Macs running macOS 15 or newer. Free and open source, MIT licensed.</p>
+        </div>
+      </div>
       <div class="cta">
         <a class="btn primary" id="dl-dmg" href="https://github.com/BackendStack21/mlx-runner/releases/latest"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8.5M4.5 7 8 10.5 11.5 7M3 13.5h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Download the app (.dmg)</span></a>
-        <a class="btn ghost" id="dl-cli" href="#cli-install">Install only the CLI</a>
+        <a class="btn" id="dl-cli" href="#cli-install">Install only the CLI</a>
       </div>
-      <div class="table-wrap">
+      <div class="table-wrap" tabindex="0" role="region" aria-label="Release files">
         <table class="assets">
           <caption class="sr-only">Release files</caption>
           <thead><tr><th scope="col">File</th><th scope="col">Size</th><th scope="col">SHA-256</th></tr></thead>
@@ -441,13 +419,16 @@ tar -xzf mlxr-&lt;version&gt;-macos-arm64.tar.gz
 sudo mkdir -p /usr/local/bin
 sudo install -m 755 mlxr-&lt;version&gt;-macos-arm64/mlxr /usr/local/bin/mlxr
 mlxr   # prints help"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div>
-      <p>Use <code>curl</code> as shown: macOS quarantines an archive downloaded in a browser, and the binary won't start until you run <code>xattr -d com.apple.quarantine /usr/local/bin/mlxr</code>. It uses the same model library as the app. To update, run <code>mlxr upgrade</code> (<code>sudo mlxr upgrade</code> when it is in <code>/usr/local/bin</code>); it checks the signature before it replaces anything. 1.x has no upgrade command, so run the commands above once to get 2.0. To check the archive first, see <a href="#verify">Verify</a>.</p>
+      <p>Use <code>curl</code> as shown: macOS quarantines an archive downloaded in a browser, and the binary then won't start. To update, run <code>mlxr upgrade</code> (<code>sudo mlxr upgrade</code> when it is in <code>/usr/local/bin</code>); 1.x has no upgrade command, so run these commands once. To check the archive first, see <a href="#verify">Verify</a>.</p>
     </div>
   </section>
 
   <section id="verify" class="verify">
-    <h2>Verify before you run it</h2>
-    <p class="sub">Every release is built by <a href="https://github.com/BackendStack21/mlx-runner/blob/main/.github/workflows/release.yml">GitHub Actions</a> from a tagged commit. Three independent checks prove the file you have is that build.</p>
+    <p class="label">Verify</p>
+    <h2>Verify before you run it.</h2>
+    <p class="sub">Every release is built by <a href="https://github.com/BackendStack21/mlx-runner/blob/main/.github/workflows/release.yml">GitHub Actions</a> from a tagged commit. Its checksum, the release signature and the build provenance tie the file you have to that build.</p>
+    <details id="verify-steps">
+    <summary>Show the commands</summary>
     <ol class="steps">
       <li><h3>Download the app, the checksum list and its signature</h3><div class="cmd" data-template="curl -LO {url:dmg}
 curl -LO {url:sums}
@@ -464,6 +445,7 @@ openssl pkeyutl -verify -pubin -inkey mlx-runner.pub -rawin -in SHA256SUMS -sigf
 gh attestation verify {name:dmg} --repo BackendStack21/mlx-runner"><pre><code><span class="c"># GitHub CLI: https://cli.github.com</span>
 gh attestation verify MLX-Runner-&lt;version&gt;-macos-arm64.dmg --repo BackendStack21/mlx-runner</code></pre><button class="copy" type="button" aria-label="Copy command" data-copy="gh attestation verify MLX-Runner-&lt;version&gt;-macos-arm64.dmg --repo BackendStack21/mlx-runner"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button></div><p class="note">Sigstore provenance in a public transparency log, tied to this repository's release workflow and commit.</p></li>
     </ol>
+    </details>
   </section>
 </main>
 
@@ -475,7 +457,10 @@ gh attestation verify MLX-Runner-&lt;version&gt;-macos-arm64.dmg --repo BackendS
   <nav aria-label="Footer">
     <a href="https://github.com/BackendStack21/mlx-runner">Source</a>
     <a href="https://github.com/BackendStack21/mlx-runner/releases">Releases</a>
-    <a href="https://github.com/BackendStack21/mlx-runner/blob/main/SECURITY.md">Security policy</a>
+    <a href="https://github.com/BackendStack21/mlx-runner/blob/main/CHANGELOG.md">Changelog</a>
+    <a href="https://github.com/BackendStack21/mlx-runner/blob/main/docs/sieve-head.md">Sieve</a>
+    <a href="https://github.com/BackendStack21/mlx-runner/blob/main/docs/sparse-decode-attention.md">Sparse attention</a>
+    <a href="https://github.com/BackendStack21/mlx-runner/blob/main/SECURITY.md">Security</a>
     <a href="https://codeviewer.21no.de">Codeviewer</a>
     <a href="https://21no.de">21no.de</a>
   </nav>
