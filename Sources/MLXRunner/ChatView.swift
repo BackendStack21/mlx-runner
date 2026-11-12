@@ -1150,6 +1150,11 @@ struct InspectorView: View {
             }
             Section("Sieve") {
                 Toggle("Sieve", isOn: $state.sieve)
+                if state.sieve, state.sieveFitStatus == nil, let info = state.loadedInfo, let warning = Self.sieveWarning(info) {
+                    Label(warning, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if let status = state.sieveFitStatus {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
@@ -1197,6 +1202,19 @@ struct InspectorView: View {
             return "Every token attends to the whole context. Applies when the model is (re)loaded."
         }
         return "From \(s.minContext) tokens of context on, each new token attends to the first and latest tokens and the \(s.topK) earlier ones that score highest, not the whole context: faster at long contexts, with a small change in output. Applies when the model is (re)loaded."
+    }
+
+    /// Why Sieve does nothing for the loaded model although it is switched on (nil: it is active).
+    /// A model loaded before the switch was turned on has no head either: it has to be fitted, or
+    /// reloaded, before the switch takes effect.
+    static func sieveWarning(_ info: LoadedModelInfo) -> String? {
+        guard info.sieveHead == nil else { return nil }
+        let sidecar = info.directory.appendingPathComponent("sieve/head.safetensors")
+        guard FileManager.default.fileExists(atPath: sidecar.path) else {
+            return "Sieve is not active: \(info.name) has not been fitted yet, so it runs at its normal speed. Fit it below to turn Sieve on."
+        }
+        guard let note = info.sieveNote else { return nil }   // fitted, loaded before the switch: the reload banner covers it
+        return "Sieve is not active for \(info.name): \(note)."
     }
 
     static func sieveStatus(_ info: LoadedModelInfo) -> String {
