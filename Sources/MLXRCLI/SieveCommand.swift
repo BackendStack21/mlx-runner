@@ -13,7 +13,11 @@ extension CLI {
 
     /// One line on what a load did with the Sieve profile it was asked for.
     static func sieveSummary(_ info: LoadedModelInfo) -> String? {
-        if let h = info.sieveHead { return "sieve: balanced (" + sieveLine(h) + ")" }
+        if let h = info.sieveHead {
+            // Speculative decoding verifies drafts with the dense head, so nothing goes through the screen.
+            if info.draftName != nil { return "sieve: fitted, but not used with a draft model (speculative decoding runs the dense head)" }
+            return "sieve: balanced (" + sieveLine(h) + ")" + (h.meetsTarget ? "" : "\n" + sieveMissLine)
+        }
         if let why = info.sieveNote { return "sieve: off (\(why))" }
         return nil
     }
@@ -23,6 +27,9 @@ extension CLI {
                h.rank, h.rowsMean, 100 * Double(h.touchedBytes) / Double(max(h.denseBytes, 1)), h.heldOutStates, 100 * h.agreement, 100 * h.sampledChange, h.kl, h.klMedian)
     }
 
+    static let sieveMissLine = String(format: "This fit misses the target (argmax kept in %.1f%%, at most %.0f%% of sampled tokens changed): expect a visible change in output.",
+                                      100 * SieveHeadInfo.targetAgreement, 100 * SieveHeadInfo.targetSampledChange)
+
     /// `mlxr sieve MODEL`: fits the model's Sieve sidecar, or shows or removes it.
     static func sieveCommand() -> Command {
         Command(name: "sieve", summary: "Fit a model's Sieve sidecar (faster decode, changed output)", args: [Arg("MODEL", kind: .model)],
@@ -30,9 +37,9 @@ extension CLI {
                     Opt(long: "info", help: "show the sidecar's measurements"),
                     Opt(long: "remove", help: "delete the sidecar"),
                     Opt(long: "text", value: .text, repeatable: true, help: "calibration text file (default: the model writes its own)"),
-                    Opt(long: "tokens", value: .int(2000...200_000), defaultText: "12000", help: "calibration states to collect"),
-                    Opt(long: "rows", value: .int(64...65536), help: "rows that get the head's own logit per token (default: fitted)"),
-                    Opt(long: "rank", value: .int(64...8192), help: "rank of the head sketch (default: an eighth of the hidden size)"),
+                    Opt(long: "tokens", value: .int(2000...60_000), defaultText: "12000", help: "calibration states to collect"),
+                    Opt(long: "rows", value: .int(512...16384), help: "rows that get the head's own logit per token: 512, 1024, ... 16384 (default: 16384, or 8192 for a vocabulary under 65,536)"),
+                    Opt(long: "rank", value: .int(64...8192), help: "rank of the head sketch (default: the lowest of 1/8, 1/4 and 1/2 of the hidden size that meets the target)"),
                 ],
                 examples: ["  mlxr sieve mlx-community/Qwen3-0.6B-4bit", "  mlxr run mlx-community/Qwen3-0.6B-4bit --sieve balanced -p \"Hello\""],
                 group: "Developer", run: { inv, console in
@@ -40,12 +47,16 @@ extension CLI {
                     let url = dir.appendingPathComponent("sieve").appendingPathComponent("head.safetensors")
                     if inv.bool("remove") {
                         guard FileManager.default.fileExists(atPath: url.path) else { console.out("no Sieve sidecar\n"); return }
-                        try FileManager.default.removeItem(at: url.deletingLastPathComponent())
+                        try FileManager.default.removeItem(at: url)
+                        // The directory too, when the sidecar was all it held.
+                        if (try? FileManager.default.contentsOfDirectory(atPath: url.deletingLastPathComponent().path))?.isEmpty == true {
+                            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+                        }
                         console.out("removed \(url.path)\n"); return
                     }
                     if inv.bool("info") {
                         guard let h = SieveImporter.sidecarInfo(directory: dir) else { console.out("no Sieve sidecar (run: mlxr sieve \(inv.positionals[0]))\n"); return }
-                        console.out(sieveLine(h) + "\ncalibration: \(h.calibration)\n"); return
+                        console.out(sieveLine(h) + "\n" + (h.meetsTarget ? "" : sieveMissLine + "\n") + "calibration: \(h.calibration)\n"); return
                     }
                     var o = SieveImportOptions()
                     o.textFiles = inv.strings("text").map { URL(fileURLWithPath: $0) }
@@ -64,10 +75,7 @@ extension CLI {
                         console.out(String(format: "rank %d misses the target (argmax kept in %.2f%%, %.2f%% of sampled tokens change); trying a higher rank\n", t.rank, 100 * t.agreement, 100 * t.sampledChange))
                     }
                     console.out(sieveLine(report.info) + "\n")
-                    if !report.info.meetsTarget {
-                        console.out(String(format: "This misses the target (argmax kept in %.1f%%, at most %.0f%% of sampled tokens changed): expect a visible change in output.\n",
-                                           100 * SieveHeadInfo.targetAgreement, 100 * SieveHeadInfo.targetSampledChange))
-                    }
+                    if !report.info.meetsTarget { console.out(sieveMissLine + "\n") }
                     console.out(String(format: "most rows in one step: %d. Sidecar: %@ (%@), fitted in %.0f s\n", report.rowsMax,
                                        url.path as NSString, formatBytes(report.sidecarBytes) as NSString, report.seconds))
                     console.out("Use it with --sieve balanced (it changes output; without the option nothing changes).\n")

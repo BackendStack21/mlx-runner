@@ -428,6 +428,7 @@ public final class ChatSession {
         do {
             settings.info = try await engine.load(directory: settings.directory, draftDirectory: settings.draftDirectory,
                                                   contextLength: contextLength, sparse: settings.sparse, sieve: settings.sieve)
+            if let line = CLI.sieveSummary(settings.info) { say(line) }
             settings.contextLength = contextLength
             return nil
         } catch {
@@ -487,6 +488,7 @@ public final class ChatSession {
         do {
             let info = try await engine.load(directory: dir, draftDirectory: settings.draftDirectory,
                                              contextLength: settings.contextLength, sparse: settings.sparse, sieve: settings.sieve)
+            if let line = CLI.sieveSummary(info) { say(line) }
             awaitInput()
             var next = settings
             next.model = name; next.repo = r.repo; next.directory = dir; next.info = info; next.preset = r.preset

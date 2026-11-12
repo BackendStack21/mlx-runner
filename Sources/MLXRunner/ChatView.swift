@@ -1166,7 +1166,7 @@ struct InspectorView: View {
                         .help("Unloads the model, measures it for a minute or more with the GPU to itself, then loads it again with Sieve on")
                 }
                 if let e = state.sieveFitError {
-                    Text("Couldn't fit: \(e)").font(.caption).foregroundStyle(.red)
+                    Text(e).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
                 }
                 Text("Reads a small sketch of the output layer to find the likely next tokens, and computes only those exactly: faster generation, with a small change in output. Each model has to be fitted once. Applies when the model is (re)loaded.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -1211,18 +1211,27 @@ struct InspectorView: View {
     /// A model loaded before the switch was turned on has no head either: it has to be fitted, or
     /// reloaded, before the switch takes effect.
     static func sieveWarning(_ info: LoadedModelInfo) -> String? {
-        guard info.sieveHead == nil else { return nil }
+        if let head = info.sieveHead {
+            if info.draftName != nil {
+                return "Sieve is not used while a draft model is set: speculative decoding runs the full output layer."
+            }
+            return head.meetsTarget ? nil : "The fit for \(info.name) missed its quality target: expect a visible change in output."
+        }
         let sidecar = info.directory.appendingPathComponent("sieve/head.safetensors")
         guard FileManager.default.fileExists(atPath: sidecar.path) else {
             return "Sieve is not active: \(info.name) has not been fitted yet, so it runs at its normal speed. Fit it below to turn Sieve on."
         }
         guard let note = info.sieveNote else { return nil }   // fitted, loaded before the switch: the reload banner covers it
+        if note == SieveHeadInfo.notFittedReason {
+            return "\(info.name) was fitted after it was loaded. Reload it to use Sieve."
+        }
         return "Sieve is not active for \(info.name): \(note)."
     }
 
     static func sieveStatus(_ info: LoadedModelInfo) -> String {
         if let h = info.sieveHead {
-            return String(format: "On: %d output rows per token, argmax kept in %.1f%% of test states", h.rows, 100 * h.agreement)
+            if info.draftName != nil { return "Fitted, not used with a draft model" }
+            return String(format: "On: up to %d output rows per token, likeliest token kept in %.1f%% of the fit's test states", h.rows, 100 * h.agreement)
         }
         return info.sieveNote.map { "Off: \($0)" } ?? "Off"
     }

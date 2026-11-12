@@ -290,13 +290,21 @@ public final class InferenceEngine: @unchecked Sendable {
                     let dirs = [directory] + (draftDirectory.map { [$0] } ?? [])
                     var sparse = requested
                     var sparseNote: String?
+                    var sieve = sieve
+                    var sieveMemoryNote: String?
                     do {
                         try Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: sparse, sieve: sieve)
-                    } catch where sparse != nil {
-                        // Without the index? (Dense decode not fitting either throws the usual error.)
-                        try Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: nil, sieve: sieve)
-                        sparse = nil
-                        sparseNote = "its index does not fit in memory at this context length"
+                    } catch where sparse != nil || sieve != nil {
+                        // Without the Sieve sidecar, then without the index? (Dense decode not fitting
+                        // either throws the usual error.)
+                        if sieve != nil, (try? Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: sparse, sieve: nil)) != nil {
+                            sieve = nil
+                            sieveMemoryNote = "its sidecar does not fit in memory at this context length"
+                        } else {
+                            try Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: nil, sieve: nil)
+                            if sieve != nil { sieve = nil; sieveMemoryNote = "its sidecar does not fit in memory at this context length" }
+                            if sparse != nil { sparse = nil; sparseNote = "its index does not fit in memory at this context length" }
+                        }
                     }
                     // From here on the new model is built: free the current one first.
                     self.model = nil
@@ -354,7 +362,7 @@ public final class InferenceEngine: @unchecked Sendable {
                         sparseNote: sparseNote, draftName: draftDirectory?.lastPathComponent,
                         toolCallSyntax: tpl.toolCallSyntax)
                     info.sieveHead = model.sieveInfo
-                    info.sieveNote = sieve != nil && model.sieveInfo == nil ? model.sieveOffReason ?? "unavailable" : nil
+                    info.sieveNote = sieveMemoryNote ?? (sieve != nil && model.sieveInfo == nil ? model.sieveOffReason ?? "unavailable" : nil)
                     self.info = info
                     cont.resume(returning: info)
                 } catch {

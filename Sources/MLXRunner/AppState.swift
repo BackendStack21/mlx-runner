@@ -383,17 +383,27 @@ final class AppState {
         loadedWith = nil
         Task {
             do {
-                _ = try await engine.fitSieve(directory: dir) { line in
+                let report = try await engine.fitSieve(directory: dir) { line in
                     Task { @MainActor in if self.sieveFitStatus != nil { self.sieveFitStatus = line } }
                 }
                 sieveFitStatus = nil
-                sieve = true
-                announce("Sieve fitted for \(model.name)")
+                // A fit that misses its quality target is kept on disk but not switched on for the user.
+                if report.info.meetsTarget {
+                    sieve = true
+                    announce("Sieve fitted for \(model.name)")
+                } else {
+                    sieve = false
+                    sieveFitError = String(format: "The fit for %@ missed its quality target (likeliest token kept in %.1f%% of test states, %.1f%% of sampled tokens changed), so Sieve was left off. Turning it on will visibly change this model's output.",
+                                           model.name, 100 * report.info.agreement, 100 * report.info.sampledChange)
+                    announce("Sieve fit for \(model.name) missed its quality target")
+                }
             } catch {
                 sieveFitStatus = nil
-                sieveFitError = error.localizedDescription
+                sieveFitError = "Couldn't fit \(model.name): \(error.localizedDescription)"
                 announce("Couldn't fit Sieve for \(model.name)")
             }
+            // Load it again, unless the user loaded or ejected something else while it was fitting.
+            guard loadState == .loading(model.name), loadedWith == nil else { return }
             loadState = .idle
             load(model)
         }

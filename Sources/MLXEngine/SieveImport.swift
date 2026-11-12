@@ -261,6 +261,18 @@ public enum SieveImporter {
     public static func importHead(directory: URL, options o: SieveImportOptions = SieveImportOptions(),
                                   progress: (String) -> Void = { _ in }) throws -> SieveImportReport {
         let start = Date()
+        if let rows = o.rows, !budgets.contains(rows) {
+            throw EngineError.unsupported("rows \(rows): expected one of \(budgets.map(String.init).joined(separator: ", "))")
+        }
+        // The fit holds the model and, on the CPU, the dequantized head and the sketch as floats.
+        let cfg = try ModelConfig(directory: directory)
+        let model = try InferenceEngine.memoryNeed(directory: directory, contextLength: 2048, sparse: nil).bytes
+        let need = UInt64(model) + 2 * UInt64(cfg.vocabSize) * UInt64(cfg.hiddenSize) * 4
+        let budget = GPU.shared.device.recommendedMaxWorkingSetSize
+        guard need < budget else {
+            let f = ByteCountFormatter()
+            throw EngineError.unsupported("fitting needs about \(f.string(fromByteCount: Int64(need))) but about \(f.string(fromByteCount: Int64(budget))) can be used")
+        }
         let t = try Transformer(directory: directory, contextLength: 2048, sparse: nil)
         let tok = try Tokenizer(directory: directory)
         let head = t.lmHead
@@ -339,7 +351,9 @@ public enum SieveImporter {
                     for i in 0..<V {
                         let v = Zh[s * V + i]
                         if v > own { above += 1 }
-                        hist[min(bins - 1, Int((top - v) / width))] += 1
+                        // A non-finite logit has no bin (and no defined integer value under -Ounchecked).
+                        let b = (top - v) / width
+                        if b >= 0 { hist[b < Float(bins - 1) ? Int(b) : bins - 1] += 1 }
                     }
                     rank[s0 + s] = above
                     var cum = 0, bi = 0

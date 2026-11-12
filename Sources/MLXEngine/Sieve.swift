@@ -32,6 +32,8 @@ public enum SieveProfile: String, Sendable, Hashable, Codable, CaseIterable {
 
 /// What `mlxr sieve MODEL` measured, stored in the sidecar and shown by `mlxr sieve MODEL --info`.
 public struct SieveHeadInfo: Sendable, Hashable {
+    /// Why a model without a sidecar loads with Sieve off.
+    public static let notFittedReason = "this model has not been fitted yet (mlxr sieve MODEL)"
     public var rank = 0
     public var delta: Float = 0
     /// Row budget: about this many rows get the head's own logit per step (fewer when the sketch is peaked).
@@ -101,7 +103,9 @@ final class SieveHead {
 
     /// Whether Head can serve this head at all (a quantized projection with scales the row kernel reads).
     static func supports(_ head: Linear) -> Bool {
-        head.bits > 0 && head.scales?.dtype.suffix != nil && head.bias == nil && head.inDim % 64 == 0
+        // `head_exact` reads the scales and the biases as one type.
+        head.bits > 0 && head.scales?.dtype.suffix != nil && head.biases?.dtype == head.scales?.dtype
+            && head.bias == nil && head.inDim % 64 == 0
     }
 
     /// The `__metadata__` strings of a safetensors file (untrusted: sizes are checked).
@@ -131,7 +135,8 @@ final class SieveHead {
         i.fittedStates = Int(m["fitted_states"] ?? "") ?? 0
         i.touchedBytes = Int(m["touched_bytes"] ?? "") ?? 0
         i.denseBytes = Int(m["dense_bytes"] ?? "") ?? 0
-        i.calibration = m["calibration"] ?? ""
+        // Free text from a file that may come with a downloaded model: printable, and short.
+        i.calibration = String((m["calibration"] ?? "").unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7f && !(0x80...0x9f).contains($0.value) }.prefix(200).map(Character.init))
         i.meetsTarget = m["meets_target"] == "1"
         return i
     }
@@ -141,7 +146,7 @@ final class SieveHead {
     init(directory: URL, head: Linear) throws {
         let url = Self.url(in: directory)
         guard FileManager.default.fileExists(atPath: url.path) else {
-            throw EngineError.unsupported("this model has not been fitted yet (mlxr sieve MODEL)")
+            throw EngineError.unsupported(SieveHeadInfo.notFittedReason)
         }
         guard Self.supports(head) else { throw EngineError.unsupported("Sieve Head needs a quantized output projection") }
         let meta = try Self.metadata(of: url)
@@ -190,8 +195,6 @@ final class SieveHead {
         byteCount = f.byteCount + (r + blocks + V + Self.bins) * 4 + 32
     }
 
-    /// The last row's logits into `logits` ([V] floats): sketch values everywhere, the head's own for
-    /// about `rows` best rows by sketch value (those within `delta` of the best). `x` at `xOffset` is the final normalised state.
     /// The last row's logits into `logits` ([V] floats): sketch values everywhere, the head's own for
     /// the `rows` best rows by sketch value (fewer when they lie further than `delta` below the best).
     /// `x` at `xOffset` is the final normalised state.
@@ -268,14 +271,17 @@ enum SafeTensorWriter {
         var len = UInt64(json.count)
         withUnsafeBytes(of: &len) { out.append(contentsOf: $0) }
         out.append(json)
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let tmp = url.appendingPathExtension("partial")
-        FileManager.default.createFile(atPath: tmp.path, contents: out)
-        let fh = try FileHandle(forWritingTo: tmp)
-        try fh.seekToEnd()
-        for t in tensors { try fh.write(contentsOf: t.data) }
-        try fh.close()
-        _ = try? FileManager.default.removeItem(at: url)
-        try FileManager.default.moveItem(at: tmp, to: url)
+        for t in tensors { out.append(t.data) }
+        // Into a real directory and over a regular file only: a link planted in a model directory
+        // must not redirect the write. The write itself goes to a temporary file and is renamed.
+        let fm = FileManager.default, dir = url.deletingLastPathComponent()
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        guard (try fm.attributesOfItem(atPath: dir.path))[.type] as? FileAttributeType == .typeDirectory else {
+            throw EngineError.invalidFile("\(dir.lastPathComponent) is not a directory")
+        }
+        if let existing = try? fm.attributesOfItem(atPath: url.path), existing[.type] as? FileAttributeType != .typeRegular {
+            throw EngineError.invalidFile("\(url.lastPathComponent) exists and is not a regular file")
+        }
+        try out.write(to: url, options: .atomic)
     }
 }
