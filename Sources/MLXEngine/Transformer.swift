@@ -647,6 +647,13 @@ public final class Transformer {
     let layers: [TransformerLayer]
     let norm: RMSNorm
     let lmHead: Linear
+    /// Sieve Head (nil: the dense head on every step).
+    let sieveHead: SieveHead?
+    /// Why Sieve is off although it was asked for.
+    public private(set) var sieveOffReason: String?
+    public var sieveInfo: SieveHeadInfo? { sieveHead?.info }
+    /// Rows that got the head's own logit in the last completed sampled step (0 when Sieve is off).
+    public var sieveLastRows: Int { sieveHead?.lastRowCount ?? 0 }
     let quantDescription: String
 
     // Scratch buffers sized for `maxBatch` tokens.
@@ -841,7 +848,11 @@ public final class Transformer {
 
     /// `sparse` (by default from `MLXR_SPARSE_ATTN`: on unless it is 0) loads the model with sparse
     /// decode attention: see `SparseAttention`.
-    public init(directory: URL, contextLength: Int, sparse: SparseAttention? = SparseAttention.fromEnvironment) throws {
+    /// `sieve` (off by default) loads the model's Sieve sidecar: GPU-sampled steps then evaluate the
+    /// output projection by rows (`SieveHead`), which changes output. Without a usable sidecar the
+    /// model loads dense and `sieveOffReason` says why.
+    public init(directory: URL, contextLength: Int, sparse: SparseAttention? = SparseAttention.fromEnvironment,
+                sieve: SieveProfile? = nil) throws {
         let gpu = GPU.shared
         var c = try ModelConfig(directory: directory)
         let seq = max(256, min(contextLength, max(c.maxPositionEmbeddings, 256)))
@@ -869,6 +880,14 @@ public final class Transformer {
             lmHead = try Linear(store, "lm_head", inDim: c.hiddenSize)
         } else {
             lmHead = embed
+        }
+        if sieve != nil {
+            do { sieveHead = try SieveHead(directory: directory, head: lmHead) } catch {
+                sieveHead = nil
+                sieveOffReason = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            }
+        } else {
+            sieveHead = nil
         }
         quantDescription = layers.first?.down.description ?? ""
         if Transformer.usesPairs(c) {
@@ -1547,6 +1566,10 @@ public final class Transformer {
         } else if computeLogits && allLogits {
             lmHead.encode(enc, x: xn, xStride: H, y: logitsAll, yStride: lmHead.outDim, T: T)
             if let softcapPSO { scale(enc, softcapPSO, logitsAll, T * lmHead.outDim, c.finalLogitSoftcap) }
+        } else if computeLogits, sample != nil, let sieveHead {
+            // Sampled on the GPU: only the top of the logits matters, so the head runs by rows.
+            sieveHead.encode(enc, head: lmHead, x: xn, xOffset: (T - 1) * H * 4, logits: logits, vocab: Int(sample!.V))
+            if let softcapPSO { scale(enc, softcapPSO, logits, lmHead.outDim, c.finalLogitSoftcap) }
         } else if computeLogits {
             lmHead.encode(enc, x: xn, xOffset: (T - 1) * H * 4, xStride: H, y: logits, yStride: lmHead.outDim, T: 1)
             if let softcapPSO { scale(enc, softcapPSO, logits, lmHead.outDim, c.finalLogitSoftcap) }

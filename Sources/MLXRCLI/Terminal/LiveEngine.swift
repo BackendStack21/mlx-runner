@@ -9,6 +9,10 @@ public struct LiveGenerationEngine: GenerationEngine {
     public func load(directory: URL, draftDirectory: URL?, contextLength: Int, sparse: SparseAttention?) async throws -> LoadedModelInfo {
         try await engine.load(directory: directory, draftDirectory: draftDirectory, contextLength: contextLength, sparse: sparse)
     }
+    public func load(directory: URL, draftDirectory: URL?, contextLength: Int, sparse: SparseAttention?,
+                     sieve: SieveProfile?) async throws -> LoadedModelInfo {
+        try await engine.load(directory: directory, draftDirectory: draftDirectory, contextLength: contextLength, sparse: sparse, sieve: sieve)
+    }
 
     public func chat(_ messages: [ChatMessage], parameters: SamplingParameters, enableThinking: Bool?,
                      token: CancelToken) -> AsyncThrowingStream<GenerationEvent, Error> {

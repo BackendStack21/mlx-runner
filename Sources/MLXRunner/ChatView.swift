@@ -1148,6 +1148,31 @@ struct InspectorView: View {
                 Link("Based on Latent Sparse Attention (arXiv 2610.42147)", destination: Self.sparsePaper)
                     .font(.caption)
             }
+            Section("Sieve") {
+                Toggle("Sieve", isOn: $state.sieve)
+                if state.sieve, state.sieveFitStatus == nil, let info = state.loadedInfo, let warning = Self.sieveWarning(info) {
+                    Label(warning, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let status = state.sieveFitStatus {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Fitting: \(status)").font(.caption).foregroundStyle(.secondary)
+                    }
+                } else if let info = state.loadedInfo {
+                    Button(info.sieveHead == nil ? "Fit for \(info.name)" : "Fit again") { state.fitSieve() }
+                        .disabled(state.isGenerating)
+                        .help("Unloads the model, measures it for a minute or more with the GPU to itself, then loads it again with Sieve on")
+                }
+                if let e = state.sieveFitError {
+                    Text(e).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                }
+                Text("Reads a small sketch of the output layer to find the likely next tokens, and computes only those exactly: faster generation, with a small change in output. Each model has to be fitted once. Applies when the model is (re)loaded.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Link("How Sieve works and what was measured", destination: Self.sieveDoc)
+                    .font(.caption)
+            }
             if let info = state.loadedInfo {
                 Section("Model") {
                     LabeledContent("Architecture", value: info.modelType)
@@ -1157,6 +1182,7 @@ struct InspectorView: View {
                     LabeledContent("Context", value: "\(info.contextLength)")
                     if let d = info.draftName { LabeledContent("Draft model", value: d) }
                     LabeledContent("Sparse attention", value: Self.sparseStatus(info))
+                    LabeledContent("Sieve", value: Self.sieveStatus(info))
                     LabeledContent("Prompt format", value: info.chatFormat)
                     LabeledContent("Load time", value: String(format: "%.2fs", info.loadSeconds))
                 }
@@ -1167,6 +1193,7 @@ struct InspectorView: View {
 
     /// Kubicek et al., "Latent Sparse Attention: Towards Subquadratic Ultra-Long Context Attention".
     static let sparsePaper = URL(string: "https://arxiv.org/abs/2610.42147")!
+    static let sieveDoc = URL(string: "https://github.com/BackendStack21/mlx-runner/blob/main/docs/sieve-head.md")!
 
     /// Long-range key budgets offered (plus a saved value that is not one of them).
     static func sparseKeyChoices(including current: Int) -> [Int] {
@@ -1178,6 +1205,35 @@ struct InspectorView: View {
             return "Every token attends to the whole context. Applies when the model is (re)loaded."
         }
         return "From \(s.minContext) tokens of context on, each new token attends to the first and latest tokens and the \(s.topK) earlier ones that score highest, not the whole context: faster at long contexts, with a small change in output. Applies when the model is (re)loaded."
+    }
+
+    /// Why Sieve does nothing for the loaded model although it is switched on (nil: it is active).
+    /// A model loaded before the switch was turned on has no head either: it has to be fitted, or
+    /// reloaded, before the switch takes effect.
+    static func sieveWarning(_ info: LoadedModelInfo) -> String? {
+        if let head = info.sieveHead {
+            if info.draftName != nil {
+                return "Sieve is not used while a draft model is set: speculative decoding runs the full output layer."
+            }
+            return head.meetsTarget ? nil : "The fit for \(info.name) missed its quality target: expect a visible change in output."
+        }
+        let sidecar = info.directory.appendingPathComponent("sieve/head.safetensors")
+        guard FileManager.default.fileExists(atPath: sidecar.path) else {
+            return "Sieve is not active: \(info.name) has not been fitted yet, so it runs at its normal speed. Fit it below to turn Sieve on."
+        }
+        guard let note = info.sieveNote else { return nil }   // fitted, loaded before the switch: the reload banner covers it
+        if note == SieveHeadInfo.notFittedReason {
+            return "\(info.name) was fitted after it was loaded. Reload it to use Sieve."
+        }
+        return "Sieve is not active for \(info.name): \(note)."
+    }
+
+    static func sieveStatus(_ info: LoadedModelInfo) -> String {
+        if let h = info.sieveHead {
+            if info.draftName != nil { return "Fitted, not used with a draft model" }
+            return String(format: "On: up to %d output rows per token, likeliest token kept in %.1f%% of the fit's test states", h.rows, 100 * h.agreement)
+        }
+        return info.sieveNote.map { "Off: \($0)" } ?? "Off"
     }
 
     static func sparseStatus(_ info: LoadedModelInfo) -> String {

@@ -75,6 +75,7 @@ extension CLI {
         if inv.has("keepalive") { console.err("warning: --keepalive \(note)\n") }
         if inv.bool("insecure") { console.err("warning: --insecure has no effect: mlxr always verifies Hugging Face downloads\n") }
         let sparse = try sparseSetting(inv.string("sparse"))
+        let sieve = try sieveSetting(inv.string("sieve"))
         let words = Array(inv.positionals.dropFirst())
         let stdin = console.stdinIsTTY ? "" : console.readAllStdin()
         let input = try assembleRunInput(stdin: stdin, words: words, promptFlag: inv.string("prompt"),
@@ -108,15 +109,16 @@ extension CLI {
         }
 
         interrupts.enter(.loading)
-        let info = try await engine.load(directory: dir, draftDirectory: draftDir, contextLength: inv.int("ctx") ?? 4096, sparse: sparse)
+        let info = try await engine.load(directory: dir, draftDirectory: draftDir, contextLength: inv.int("ctx") ?? 4096, sparse: sparse, sieve: sieve)
         if interrupts.wasInterrupted { throw CLIError.interrupted }
         console.err("Loaded \(info.name) [\(info.modelType), \(info.quantization), \(info.layers) layers, \(info.chatFormat)]"
                     + "\(info.draftName.map { " + draft \($0)" } ?? "") in \(String(format: "%.2f", info.loadSeconds))s\n")
         if let requested = inv.int("ctx"), let note = contextNote(requested: requested, info: info) { console.err(note + "\n") }
         console.err(sparseSummary(info) + "\n")
+        if let line = sieveSummary(info) { console.err(line + "\n") }
         let thinking: Bool? = inv.bool("no-think") ? false : inv.has("think") ? inv.string("think") != "false" : nil
         guard let prompt = oneShotPrompt else {
-            try await runChat(inv, console, deps, dir: dir, info: info, params: params, thinking: thinking, sparse: sparse, draftDir: draftDir)
+            try await runChat(inv, console, deps, dir: dir, info: info, params: params, thinking: thinking, sparse: sparse, sieve: sieve, draftDir: draftDir)
             return
         }
         if prompt.isEmpty { interrupts.enter(.idle); return }
@@ -167,7 +169,7 @@ extension CLI {
     /// `mlxr run MODEL` without a prompt on a terminal: the interactive chat.
     fileprivate static func runChat(_ inv: Invocation, _ console: Console, _ deps: RunDependencies, dir: URL,
                                     info: LoadedModelInfo, params: SamplingParameters, thinking: Bool?,
-                                    sparse: SparseAttention?, draftDir: URL?) async throws {
+                                    sparse: SparseAttention?, sieve: SieveProfile?, draftDir: URL?) async throws {
         let name = inv.positionals[0]
         let resolution = try? deps.resolver.resolve(name)
         var s = ChatSettings(model: name, repo: resolution?.repo, directory: dir, info: info, preset: resolution?.preset)
@@ -180,6 +182,7 @@ extension CLI {
         s.contextLength = inv.int("ctx") ?? 4096
         s.draftDirectory = draftDir
         s.sparse = sparse
+        s.sieve = sieve
         for (k, v) in resolution?.preset?.parameters.sorted(by: { $0.key < $1.key }) ?? [] {
             var p = s.parameters
             if (try? ChatParameter.apply(k, v, to: &p)) == .set { s.parameters = p; s.userParameters[k] = v }

@@ -113,6 +113,7 @@ public struct ChatSettings {
     public var contextLength = 4096
     public var draftDirectory: URL?
     public var sparse: SparseAttention?
+    public var sieve: SieveProfile?
 
     public init(model: String, repo: String?, directory: URL, info: LoadedModelInfo, preset: Preset? = nil) {
         self.model = model; self.repo = repo; self.directory = directory; self.info = info; self.preset = preset
@@ -426,7 +427,8 @@ public final class ChatSession {
         defer { awaitInput() }
         do {
             settings.info = try await engine.load(directory: settings.directory, draftDirectory: settings.draftDirectory,
-                                                  contextLength: contextLength, sparse: settings.sparse)
+                                                  contextLength: contextLength, sparse: settings.sparse, sieve: settings.sieve)
+            if let line = CLI.sieveSummary(settings.info) { say(line) }
             settings.contextLength = contextLength
             return nil
         } catch {
@@ -485,7 +487,8 @@ public final class ChatSession {
         interrupts.enter(.loading)
         do {
             let info = try await engine.load(directory: dir, draftDirectory: settings.draftDirectory,
-                                             contextLength: settings.contextLength, sparse: settings.sparse)
+                                             contextLength: settings.contextLength, sparse: settings.sparse, sieve: settings.sieve)
+            if let line = CLI.sieveSummary(info) { say(line) }
             awaitInput()
             var next = settings
             next.model = name; next.repo = r.repo; next.directory = dir; next.info = info; next.preset = r.preset

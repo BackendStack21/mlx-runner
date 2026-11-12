@@ -6,6 +6,9 @@ import MLXEngine
 /// `stats.stopReason == "cancelled"`.
 public protocol GenerationEngine: Sendable {
     func load(directory: URL, draftDirectory: URL?, contextLength: Int, sparse: SparseAttention?) async throws -> LoadedModelInfo
+    /// The same with a Sieve profile (nil: off). Engines that know nothing of Sieve load dense.
+    func load(directory: URL, draftDirectory: URL?, contextLength: Int, sparse: SparseAttention?,
+              sieve: SieveProfile?) async throws -> LoadedModelInfo
     func chat(_ messages: [ChatMessage], parameters: SamplingParameters, enableThinking: Bool?,
               token: CancelToken) -> AsyncThrowingStream<GenerationEvent, Error>
     func complete(_ prompt: String, parameters: SamplingParameters,
@@ -14,4 +17,11 @@ public protocol GenerationEngine: Sendable {
     func encode(_ text: String) -> [Int]
     /// The installed model that pairs with `target` as a draft model, if any (`--draft auto`).
     func autoDraft(for target: URL) -> LocalModel?
+}
+
+extension GenerationEngine {
+    public func load(directory: URL, draftDirectory: URL?, contextLength: Int, sparse: SparseAttention?,
+                     sieve: SieveProfile?) async throws -> LoadedModelInfo {
+        try await load(directory: directory, draftDirectory: draftDirectory, contextLength: contextLength, sparse: sparse)
+    }
 }

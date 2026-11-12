@@ -38,6 +38,7 @@ extension CLI {
                         Opt(long: "ids", help: "print the prompt token ids"),
                         Opt(long: "draft", value: .model, help: draftHelp),
                         Opt(long: "sparse", value: .text, help: sparseHelp),
+                        Opt(long: "sieve", value: .choice(["off", "balanced"]), help: sieveHelp),
                         Opt(long: "spec", help: "speculative decoding with n-gram drafts"),
                         Opt(long: "verbose", help: "print timing statistics to stderr"),
                         Opt(long: "hidethinking", help: "do not show the model's thinking"),
@@ -55,7 +56,8 @@ extension CLI {
                         Opt(long: "frequency-penalty", value: .text, help: "not supported by the engine"),
                     ],
                     examples: ["  mlxr run mlx-community/Qwen3-4B-4bit -p \"Hello\" --temp 0"],
-                    environment: [("MLXR_SPARSE_ATTN", "sparse decode attention default (0 turns it off)")],
+                    environment: [("MLXR_SPARSE_ATTN", "sparse decode attention default (0 turns it off)"),
+                                  ("MLXR_SIEVE", "Sieve profile when --sieve is not given (default: off)")],
                     run: { inv, console in try await executeRun(inv, console, runDeps) }),
             Command(name: "serve", aliases: ["start"], summary: "Start the OpenAI-compatible server", args: [Arg("MODEL", kind: .model, optional: true)],
                     options: [
@@ -65,15 +67,17 @@ extension CLI {
                         Opt(long: "api-key", value: .text, help: "API key clients must send"),
                         Opt(long: "draft", value: .model, help: draftHelp),
                         Opt(long: "sparse", value: .text, help: sparseHelp),
+                        Opt(long: "sieve", value: .choice(["off", "balanced"]), help: sieveHelp),
                     ],
-                    environment: [("MLXR_API_KEY", "API key, when --api-key is not given")],
+                    environment: [("MLXR_API_KEY", "API key, when --api-key is not given"),
+                                  ("MLXR_SIEVE", "Sieve profile when --sieve is not given (default: off)")],
                     run: { inv, _ in
                         guard let model = inv.positionals.first else {
                             throw CLIError.failure("serve needs a model for now: mlxr serve MODEL (serving without a model comes with the background server in a later release)")
                         }
                         try await legacyServe(model: model, port: UInt16(inv.int("port") ?? 1234),
                                               ctx: inv.int("ctx"), lan: inv.bool("lan"), apiKey: inv.string("api-key"),
-                                              draft: inv.string("draft"), sparse: inv.string("sparse"), interrupts: interrupts)
+                                              draft: inv.string("draft"), sparse: inv.string("sparse"), sieve: inv.string("sieve"), interrupts: interrupts)
                     }),
             pullCommand(library: library, presets: presets, catalog: catalog, hub: hub, interrupts: interrupts),
             showCommand(library: library, presets: presets, catalog: catalog),
@@ -102,6 +106,7 @@ extension CLI {
                     group: "Developer", run: { inv, console in
                         try await services.bench(BenchOptions(model: inv.positionals[0], decodeOnly: inv.bool("decode"), contexts: inv.string("ctx")), console)
                     }),
+            sieveCommand(),
         ] + modelCommands(library: library, presets: presets, catalog: catalog, now: now, interrupts: interrupts) + [upgradeCommand(updater: updater, interrupts: interrupts)]
         return table + [completionCommand(table: table)]
     }

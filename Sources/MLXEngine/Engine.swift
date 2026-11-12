@@ -70,6 +70,10 @@ public struct LoadedModelInfo: Sendable, Hashable {
     public var sparseMinContext: Int = 0
     /// Why sparse attention is off although it was asked for (nil when it is on or was not asked for).
     public var sparseNote: String? = nil
+    /// Sieve Head's measurements when the model runs with a Sieve profile (nil: dense).
+    public var sieveHead: SieveHeadInfo? = nil
+    /// Why Sieve is off although it was asked for (nil when it is on or was not asked for).
+    public var sieveNote: String? = nil
     /// The draft model used for speculative decoding (nil = none).
     public var draftName: String? = nil
 
@@ -268,7 +272,8 @@ public final class InferenceEngine: @unchecked Sendable {
     /// `sparse`: sparse decode attention for long contexts (on by default; nil for dense decode).
     /// When its index would not fit in memory the model loads with dense decode instead.
     public func load(directory: URL, draftDirectory: URL? = nil, contextLength: Int = 8192,
-                     sparse requested: SparseAttention? = SparseAttention.fromEnvironment) async throws -> LoadedModelInfo {
+                     sparse requested: SparseAttention? = SparseAttention.fromEnvironment,
+                     sieve: SieveProfile? = nil) async throws -> LoadedModelInfo {
         try await withCheckedThrowingContinuation { cont in
             queue.async {
                 do {
@@ -285,13 +290,21 @@ public final class InferenceEngine: @unchecked Sendable {
                     let dirs = [directory] + (draftDirectory.map { [$0] } ?? [])
                     var sparse = requested
                     var sparseNote: String?
+                    var sieve = sieve
+                    var sieveMemoryNote: String?
                     do {
-                        try Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: sparse)
-                    } catch where sparse != nil {
-                        // Without the index? (Dense decode not fitting either throws the usual error.)
-                        try Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: nil)
-                        sparse = nil
-                        sparseNote = "its index does not fit in memory at this context length"
+                        try Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: sparse, sieve: sieve)
+                    } catch where sparse != nil || sieve != nil {
+                        // Without the Sieve sidecar, then without the index? (Dense decode not fitting
+                        // either throws the usual error.)
+                        if sieve != nil, (try? Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: sparse, sieve: nil)) != nil {
+                            sieve = nil
+                            sieveMemoryNote = "its sidecar does not fit in memory at this context length"
+                        } else {
+                            try Self.checkMemory(directories: dirs, contextLength: contextLength, sparse: nil, sieve: nil)
+                            if sieve != nil { sieve = nil; sieveMemoryNote = "its sidecar does not fit in memory at this context length" }
+                            if sparse != nil { sparse = nil; sparseNote = "its index does not fit in memory at this context length" }
+                        }
                     }
                     // From here on the new model is built: free the current one first.
                     self.model = nil
@@ -302,7 +315,7 @@ public final class InferenceEngine: @unchecked Sendable {
                     self.draftCached = []
                     self.trimState = [:]
                     self.tokenTexts = nil
-                    let model = try Transformer(directory: directory, contextLength: contextLength, sparse: sparse)
+                    let model = try Transformer(directory: directory, contextLength: contextLength, sparse: sparse, sieve: sieve)
                     if sparse != nil, !model.sparseAvailable { sparseNote = model.sparseOffReason ?? "unavailable" }
                     var draft: Transformer?
                     if let draftDirectory {
@@ -335,7 +348,7 @@ public final class InferenceEngine: @unchecked Sendable {
                     self.tokenizer = tok
                     self.template = tpl
                     self.stopIds = stops
-                    let info = LoadedModelInfo(
+                    var info = LoadedModelInfo(
                         name: directory.lastPathComponent, directory: directory,
                         modelType: model.config.modelType, quantization: model.quantDescription,
                         parameterBytes: model.weightBytes, contextLength: model.maxSeq,
@@ -348,11 +361,36 @@ public final class InferenceEngine: @unchecked Sendable {
                         sparseMinContext: model.sparseAvailable ? sparse?.minContext ?? 0 : 0,
                         sparseNote: sparseNote, draftName: draftDirectory?.lastPathComponent,
                         toolCallSyntax: tpl.toolCallSyntax)
+                    info.sieveHead = model.sieveInfo
+                    info.sieveNote = sieveMemoryNote ?? (sieve != nil && model.sieveInfo == nil ? model.sieveOffReason ?? "unavailable" : nil)
                     self.info = info
                     cont.resume(returning: info)
                 } catch {
                     cont.resume(throwing: error)
                 }
+            }
+        }
+    }
+
+    /// Fits the Sieve sidecar of the model in `directory` (see `SieveImporter`). The fit needs the GPU
+    /// to itself, so whatever is loaded is unloaded first and requests queue behind it; load the
+    /// model again afterwards.
+    public func fitSieve(directory: URL, options: SieveImportOptions = SieveImportOptions(),
+                         progress: @escaping @Sendable (String) -> Void = { _ in }) async throws -> SieveImportReport {
+        cancel()
+        return try await withCheckedThrowingContinuation { cont in
+            queue.async {
+                self.model = nil
+                self.draftModel = nil
+                self.tokenizer = nil
+                self.template = nil
+                self.info = nil
+                self.cachedTokens = []
+                self.draftCached = []
+                self.trimState = [:]
+                self.tokenTexts = nil
+                do { cont.resume(returning: try SieveImporter.importHead(directory: directory, options: options, progress: progress)) }
+                catch { cont.resume(throwing: error) }
             }
         }
     }
@@ -811,7 +849,8 @@ extension InferenceEngine {
     }
 
     /// Weights + KV cache + scratch of one model at a context length (and the context it gets).
-    static func memoryNeed(directory: URL, contextLength: Int, sparse: SparseAttention? = SparseAttention.fromEnvironment) throws -> (bytes: Int, context: Int) {
+    static func memoryNeed(directory: URL, contextLength: Int, sparse: SparseAttention? = SparseAttention.fromEnvironment,
+                           sieve: SieveProfile? = nil) throws -> (bytes: Int, context: Int) {
         let fm = FileManager.default
         var weights = 0
         for f in (try? WeightStore.shardFiles(in: directory)) ?? [] {
@@ -825,18 +864,24 @@ extension InferenceEngine {
         let index = sparse.map { ctx >= $0.minContext } == true ? Transformer.sparseBytes(config: cfg, context: ctx) : 0
         // Interleaved quantization pairs (hybrid models) repeat the scales and biases: 1/9 of 4-bit g64 weights.
         let pairs = Transformer.usesPairs(cfg) ? weights / 9 : 0
-        return (weights + pairs + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg) + index, ctx)
+        // A Sieve sidecar, when asked for and present, plus its row list.
+        var sidecar = 0
+        if sieve != nil, let n = try? fm.attributesOfItem(atPath: SieveHead.url(in: directory).path)[.size] as? Int {
+            sidecar = n + cfg.vocabSize * 4
+        }
+        return (weights + pairs + cfg.kvCacheBytes(context: ctx) + Transformer.scratchBytes(config: cfg) + index + sidecar, ctx)
     }
 
     /// Refuses to load models (a target and its draft) whose weights plus KV caches would not fit
     /// in GPU-addressable memory together.
     static func checkMemory(directories: [URL], contextLength: Int, sparse: SparseAttention? = SparseAttention.fromEnvironment,
+                            sieve: SieveProfile? = nil,
                             budget: UInt64 = GPU.shared.device.recommendedMaxWorkingSetSize) throws {
         var need: UInt64 = 0
         var ctx = contextLength
         for (i, d) in directories.enumerated() {
             // Only the target loads with sparse attention (the draft is created with `sparse: nil`).
-            let n = try memoryNeed(directory: d, contextLength: contextLength, sparse: i == 0 ? sparse : nil)
+            let n = try memoryNeed(directory: d, contextLength: contextLength, sparse: i == 0 ? sparse : nil, sieve: i == 0 ? sieve : nil)
             need += UInt64(n.bytes)
             if i == 0 { ctx = n.context }
         }

@@ -2618,6 +2618,174 @@ kernel void sample_token(device float*          logits [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sieve Head (docs/sieve-head.md): the output projection by rows. `head_sketch`
+// writes every row's sketch logit (a low-rank, 4-bit copy of the head) into `logits`. `head_cut`
+// finds their maximum, `head_hist` and `head_cut2` how far below it at most `rows` rows sit (never
+// further than `delta`), `head_select` lists those rows, and `head_exact` replaces their values by
+// the head's own. The other rows keep the sketch value. Not exact: a row the sketch ranks below
+// the cut is missed.
+// ---------------------------------------------------------------------------
+struct HeadParams { int V; float delta; int rows; int K; };
+#define HEAD_NSG 2      // simdgroups (rows) per threadgroup of head_exact
+#define HEAD_BINS 1024  // histogram bins over (maximum - delta, maximum]
+
+// Distance of a sketch logit below the maximum, in histogram bins. One expression for the
+// histogram and the selection, so they agree on every row.
+inline float head_bin(float top, float v, float delta) { return (top - v) * (float(HEAD_BINS) / delta); }
+
+// y[row] = sketch[row] · x, one thread per row (rows are K / 2 bytes: too short to share among a
+// simdgroup), and the maximum of each block of SMP_BLK rows. 4-bit codes, groups of 64, f16 scales.
+kernel void head_sketch(device const uint*   w      [[buffer(0)]],
+                        device const half*   scales [[buffer(1)]],
+                        device const half*   biases [[buffer(2)]],
+                        device const float*  x      [[buffer(3)]],
+                        device float*        y      [[buffer(4)]],
+                        constant HeadParams& p      [[buffer(5)]],
+                        device float*        bmax   [[buffer(6)]],
+                        uint tg   [[threadgroup_position_in_grid]],
+                        uint tid  [[thread_index_in_threadgroup]],
+                        uint sg   [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tmax[SMP_BLK / 32];
+    const int row = int(tg) * SMP_BLK + int(tid);
+    float v = -INFINITY;
+    if (row < p.V) {
+        const int groups = p.K / 64;
+        device const uint* wr = w + ulong(row) * ulong(p.K / 8);
+        device const half* sr = scales + ulong(row) * ulong(groups);
+        device const half* br = biases + ulong(row) * ulong(groups);
+        float acc = 0.0f;
+        for (int g = 0; g < groups; g++) {
+            device const float4* xp = (device const float4*)(x + g * 64);
+            float4 dq = float4(0.0f), xs = float4(0.0f);
+            for (int c = 0; c < 8; c++) {
+                const uint q = wr[g * 8 + c];
+                const float4 qa = float4(float(q & 0xF), float((q >> 4) & 0xF), float((q >> 8) & 0xF), float((q >> 12) & 0xF));
+                const float4 qb = float4(float((q >> 16) & 0xF), float((q >> 20) & 0xF), float((q >> 24) & 0xF), float(q >> 28));
+                const float4 xa = xp[2 * c], xb = xp[2 * c + 1];
+                dq += qa * xa + qb * xb;
+                xs += xa + xb;
+            }
+            acc += float(sr[g]) * dot(dq, float4(1.0f)) + float(br[g]) * dot(xs, float4(1.0f));
+        }
+        v = acc;
+        y[row] = v;
+    }
+    const float m = simd_max(v);
+    if (lane == 0) tmax[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float mm = tmax[0];
+        for (int i = 1; i < SMP_BLK / 32; i++) mm = max(mm, tmax[i]);
+        bmax[tg] = mm;
+    }
+}
+
+// One simdgroup: state[0] = the largest sketch logit; the histogram cleared.
+kernel void head_cut(device const float*  bmax  [[buffer(0)]],
+                     constant HeadParams& p     [[buffer(1)]],
+                     device float*        state [[buffer(2)]],
+                     device uint*         hist  [[buffer(3)]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+    const int nb = (p.V + SMP_BLK - 1) / SMP_BLK;
+    float m = -INFINITY;
+    for (int b = int(lane); b < nb; b += 32) m = max(m, bmax[b]);
+    m = simd_max(m);
+    for (int b = int(lane); b < HEAD_BINS; b += 32) hist[b] = 0u;
+    if (lane == 0) state[0] = m;
+}
+
+// Counts the rows within delta of the maximum by their distance from it.
+kernel void head_hist(device const float*  logits [[buffer(0)]],
+                      constant HeadParams& p      [[buffer(1)]],
+                      device const float*  bmax   [[buffer(2)]],
+                      device const float*  state  [[buffer(3)]],
+                      device atomic_uint*  hist   [[buffer(4)]],
+                      uint i [[thread_position_in_grid]]) {
+    if (int(i) >= p.V) return;
+    const float top = state[0];
+    if (!(head_bin(top, bmax[i / SMP_BLK], p.delta) < float(HEAD_BINS))) return;
+    const float b = head_bin(top, logits[i], p.delta);
+    if (b >= 0.0f && b < float(HEAD_BINS)) atomic_fetch_add_explicit(hist + int(b), 1u, memory_order_relaxed);
+}
+
+// One simdgroup (32 bins per lane): state[1] = n, the number of leading bins that together hold
+// at most `rows` rows; state[2] = 0 (the list's length, an atomic counter for head_select). The
+// rows selected are exactly those counted in bins below n, so the list never exceeds `rows`.
+kernel void head_cut2(constant HeadParams& p     [[buffer(1)]],
+                      device float*        state [[buffer(2)]],
+                      device const uint*   hist  [[buffer(3)]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    uint own = 0u;
+    for (int j = 0; j < HEAD_BINS / 32; j++) own += hist[int(lane) * (HEAD_BINS / 32) + j];
+    uint cum = simd_prefix_exclusive_sum(own);
+    uint n = 0u;
+    for (int j = 0; j < HEAD_BINS / 32; j++) {
+        cum += hist[int(lane) * (HEAD_BINS / 32) + j];
+        if (cum > uint(p.rows)) break;
+        n++;
+    }
+    n = simd_sum(n);
+    if (lane == 0) { state[1] = float(n); ((device uint*)state)[2] = 0u; }
+}
+
+// Appends every row in the bins below n to `list`. The order of the list is not deterministic;
+// what is computed from it is (each row's logit goes to its own slot).
+kernel void head_select(device const float*  logits [[buffer(0)]],
+                        constant HeadParams& p      [[buffer(1)]],
+                        device const float*  bmax   [[buffer(2)]],
+                        device const float*  state  [[buffer(3)]],
+                        device atomic_uint*  count  [[buffer(4)]],
+                        device int*          list   [[buffer(5)]],
+                        uint i [[thread_position_in_grid]]) {
+    if (int(i) >= p.V) return;
+    const float top = state[0], n = state[1];
+    if (!(head_bin(top, bmax[i / SMP_BLK], p.delta) < n)) return;
+    const float b = head_bin(top, logits[i], p.delta);
+    if (b >= 0.0f && b < n) {
+        const uint e = atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);
+        list[e] = int(i);
+    }
+}
+
+// y[row] = W[row] · x for each listed row, one simdgroup per row (qmm's arithmetic for one row).
+template <int BITS, typename T>
+kernel void head_exact(device const uchar* w      [[buffer(0)]],
+                       device const T*     scales [[buffer(1)]],
+                       device const T*     biases [[buffer(2)]],
+                       device const float* x      [[buffer(3)]],
+                       device float*       y      [[buffer(4)]],
+                       constant MMParams&  p      [[buffer(5)]],
+                       device const uint*  count  [[buffer(6)]],
+                       device const int*   list   [[buffer(7)]],
+                       uint3 tgid [[threadgroup_position_in_grid]],
+                       uint  sgid [[simdgroup_index_in_threadgroup]],
+                       uint  lane [[thread_index_in_simdgroup]]) {
+    const uint e = tgid.x * HEAD_NSG + sgid;
+    if (e >= count[0]) return;
+    const int row = list[e];
+    if (row < 0 || row >= p.O) return;
+    const int chunks = p.K / 8;
+    const ulong rowBytes = ulong(p.K) * BITS / 8;
+    const int gpr = p.K / p.gs;
+    device const uchar* wbase = w + ulong(row) * rowBytes;
+    device const T* sbase = scales + ulong(row) * gpr;
+    device const T* bbase = biases + ulong(row) * gpr;
+    float acc = 0.0f;
+    for (int c = int(lane); c < chunks; c += 32) {
+        const int k = c * 8;
+        const int g = k / p.gs;
+        device const float4* xp = (device const float4*)(x + k);
+        const float4 xa = xp[0], xb = xp[1];
+        float4 qa, qb;
+        unpack8<BITS>(wbase + ulong(c) * BITS, qa, qb);
+        acc += float(sbase[g]) * (dot(qa, xa) + dot(qb, xb)) + float(bbase[g]) * dot(xa + xb, float4(1.0f));
+    }
+    const float v = simd_sum(acc);
+    if (lane == 0) y[row] = v;
+}
+
 // Explicit instantiations ----------------------------------------------------
 #define INST_QMM(B, T, TN, TT) \
   template [[host_name("qmm_" #B "_" #TN "_" #TT)]] kernel void qmm<B, T, TT>( \
@@ -2657,6 +2825,12 @@ INST_QMM_ALL(4)
 INST_QMM_ALL(5)
 INST_QMM_ALL(6)
 INST_QMM_ALL(8)
+
+#define INST_HEAD(B) \
+  template [[host_name("head_exact_" #B "_f16")]] kernel void head_exact<B, half>(device const uchar*, device const half*, device const half*, device const float*, device float*, constant MMParams&, device const uint*, device const int*, uint3, uint, uint); \
+  template [[host_name("head_exact_" #B "_bf16")]] kernel void head_exact<B, bfloat>(device const uchar*, device const bfloat*, device const bfloat*, device const float*, device float*, constant MMParams&, device const uint*, device const int*, uint3, uint, uint); \
+  template [[host_name("head_exact_" #B "_f32")]] kernel void head_exact<B, float>(device const uchar*, device const float*, device const float*, device const float*, device float*, constant MMParams&, device const uint*, device const int*, uint3, uint, uint);
+INST_HEAD(2) INST_HEAD(3) INST_HEAD(4) INST_HEAD(5) INST_HEAD(6) INST_HEAD(8)
 
 #define INST_QMVX(T, TN) \
   template [[host_name("qmvx4_" #TN)]] kernel void qmvx4<T>(device const uchar*, device const T*, device const T*, device const float*, device float*, constant MMParams&, device const uchar*, device const T*, device const T*, device const uchar*, device const T*, device const T*, device const T*, device const T*, device const T*, uint2, uint, uint, uint);
