@@ -1,8 +1,7 @@
 # Sieve Head: the output layer by rows
 
 Status: built, opt-in, off by default. Measured on a MacBook Pro M2 Pro (16-core GPU, 16 GB),
-macOS 27.2, on 2026-11-11. It is the first, and so far the only, part of
-[Sieve](sieve-architecture.md) in the engine.
+macOS 27.2, on 2026-11-11.
 
 **It changes output.** Without `--sieve`, nothing in the engine changes: there is no Sieve buffer and
 no Sieve dispatch, and greedy output is byte-identical to the build before it.
@@ -23,8 +22,8 @@ With Sieve on, a step that samples on the GPU does this instead, in the same com
 
 The other rows keep their sketch value. The sampler runs unchanged on the result.
 
-Phase 0 showed that no certificate can make this exact
-([sieve-phase0-results.md](sieve-phase0-results.md)), so it is fitted and measured per model.
+The screen is not exact: a row the sketch ranks below the cut keeps its sketch value even when the
+head would have ranked it higher. So it is fitted and measured per model.
 
 Passes that hand logits to the CPU use the dense head as before: `forward`, speculative
 verification, scoring, tool-call sampling over a constrained set.
@@ -47,8 +46,7 @@ mlxr sieve mlx-community/Qwen3-0.6B-4bit --remove
   model, fits it and loads it again with Sieve on.
 - A model that has not been fitted, or whose sidecar was fitted to other weights, loads dense and
   says so.
-- `balanced` is the only profile. `exact` does not exist; `fast` and `max` need Experts and Pyramid,
-  which are not built.
+- `balanced` is the only profile.
 
 ## The fit
 
@@ -96,15 +94,15 @@ What the numbers do not show:
 
 ## Why it is 8% and not more
 
-The specification projected the head at a quarter of its bytes. Measured on Qwen3 0.6B, where the
-dense head costs about 0.5 ms of a 3.4 ms step (timed by leaving stages out of the full step):
+The head is 12 to 20% of a step, and the screen recovers about half of that. Measured on Qwen3 0.6B,
+where the dense head costs about 0.5 ms of a 3.4 ms step (timed by leaving stages out of the full
+step):
 
 - A sketch narrow enough to be cheap has rows of 64 to 160 bytes. No existing kernel reads such rows
   efficiently: the decode matvec ran the rank-256 sketch at 73 GB/s. `head_sketch` (one thread per
   row) reaches about 115 GB/s, against about 190 GB/s for the dense head.
-- Lower ranks are faster and less accurate. Rank d/8 is the lowest that meets the target on any
-  model, and three of four models needed more rows or a higher rank than phase 0's 700 to 1,800 rows
-  suggested.
+- Lower ranks are faster and less accurate. An eighth of the hidden size is the lowest rank the fit
+  tries, and Qwen3.5 0.8B needed a quarter.
 - The cut needs four small dispatches (about 0.04 ms), and the exact rows about 0.05 ms.
 
 A faster sketch kernel is the remaining lever: at the dense head's byte rate the gain would be

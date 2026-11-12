@@ -2,17 +2,15 @@ import CryptoKit
 import Foundation
 import Metal
 
-/// Sieve (docs/sieve-architecture.md): opt-in modes that read fewer weights per token and change
-/// the output. Off unless asked for; off means no Sieve buffer and no Sieve dispatch.
+/// Sieve Head (docs/sieve-head.md): an opt-in mode that evaluates the output projection by rows,
+/// reads less of it per token and changes the output. Off unless asked for; off means no Sieve
+/// buffer and no Sieve dispatch.
 ///
-/// One mechanism exists so far, **Head**: the output projection evaluated by rows. A low-rank,
-/// 4-bit sketch of the head scores every vocabulary row, and only the rows within a fitted margin
-/// of the best score get the head's own logit. The others keep the sketch's value. It is not
-/// exact (phase 0 showed no certificate is tight enough): `mlxr sieve import` fits it per model
-/// and reports how often the dense argmax survives.
+/// A low-rank, 4-bit sketch of the head scores every vocabulary row, and only the best-scoring
+/// rows (a fixed budget, within a fitted margin of the best score) get the head's own logit. The
+/// others keep the sketch's value. It is not exact: `mlxr sieve MODEL` fits it per model and
+/// reports how often the dense argmax survives.
 public enum SieveProfile: String, Sendable, Hashable, Codable, CaseIterable {
-    /// Head. The profiles `fast` and `max` of the specification need Experts and Pyramid, which
-    /// are not built; `exact` does not exist (gate H1 failed).
     case balanced
 
     /// Parses a `--sieve` / `MLXR_SIEVE` value: nil for off. Throws for a profile that does not exist.
@@ -21,10 +19,6 @@ public enum SieveProfile: String, Sendable, Hashable, Codable, CaseIterable {
         switch s {
         case "", "0", "off", "false", "no": return nil
         case "1", "on", "true", "yes", "balanced": return .balanced
-        case "exact":
-            throw EngineError.unsupported("sieve profile 'exact': no lossless Sieve mode exists (see docs/sieve-phase0-results.md); use 'balanced' or 'off'")
-        case "fast", "max":
-            throw EngineError.unsupported("sieve profile '\(s)' is not built yet; use 'balanced' or 'off'")
         default:
             throw EngineError.unsupported("sieve profile '\(s)' (expected off or balanced)")
         }
@@ -36,7 +30,7 @@ public enum SieveProfile: String, Sendable, Hashable, Codable, CaseIterable {
     }
 }
 
-/// What `mlxr sieve import` measured, stored in the sidecar and shown by `mlxr sieve info`.
+/// What `mlxr sieve MODEL` measured, stored in the sidecar and shown by `mlxr sieve MODEL --info`.
 public struct SieveHeadInfo: Sendable, Hashable {
     public var rank = 0
     public var delta: Float = 0
