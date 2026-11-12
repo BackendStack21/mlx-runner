@@ -58,7 +58,13 @@ mlxr sieve mlx-community/Qwen3-0.6B-4bit --remove
   measurement made on this machine.
 - `MLXR_SIEVE=balanced` is the same as `--sieve balanced`, and also applies to `mlxr bench`.
 - A model that has not been fitted, or whose fit belongs to other weights, loads without Sieve and
-  says so.
+  says so. So does one whose sidecar does not fit in memory at the requested context length.
+- `mlxr run` and `mlxr serve` print what the load did with the profile, with the fit's figures.
+
+**In code:** `InferenceEngine.load(directory:draftDirectory:contextLength:sparse:sieve:)` takes a
+`SieveProfile?`; nil means the dense head. `LoadedModelInfo.sieveHead` holds the fit's figures when
+Sieve is active, and `LoadedModelInfo.sieveNote` says why when it was asked for and is not.
+`InferenceEngine.fitSieve(directory:options:progress:)` runs the fit.
 
 ## Fitting a model
 
@@ -104,6 +110,15 @@ the first that meets the target on both the tune and the test states:
 The test states take part in that one decision: a rank that fails on them is replaced by a higher
 one, never by a lower one. Apart from that, the reported figures are on states nothing was chosen
 on.
+
+Options of `mlxr sieve`, for experiments (the defaults are what was measured below):
+
+| Option | Meaning | Default |
+|---|---|---|
+| `--text FILE` | calibration text, repeatable | the model's answers to the built-in prompts |
+| `--tokens N` | hidden states to collect, 2,000 to 60,000 | 12,000 |
+| `--rank N` | one rank for the sketch, 64 to 8,192, with no search | the lowest of 1/8, 1/4 and 1/2 of the hidden size that meets the target |
+| `--rows N` | row budget: 512, 1,024, ... 16,384 | the largest that is at most a quarter of the vocabulary |
 
 A fit that misses the target at every rank is still written. The command, `--info` and every load
 say that it missed, and the app leaves the Sieve switch off after such a fit.
@@ -260,3 +275,22 @@ softcap branch.
 
 The list of selected rows is built with an atomic counter, so its order varies between runs. Each
 row's logit goes to its own slot, so the logits do not.
+
+## Files
+
+- `Sources/MLXEngine/Sieve.swift`: `SieveProfile`, `SieveHeadInfo` with the quality target, the
+  sidecar's format and loader, and the fingerprint.
+- `Sources/MLXEngine/SieveImport.swift`: the fit (`SieveImporter`, `SieveImportOptions`,
+  `SieveImportReport`): calibration, directions, the quantized sketch, the row budget and margin,
+  the measurements and the writer.
+- `Sources/MLXEngine/Kernels.swift`: `head_sketch`, `head_cut`, `head_hist`, `head_cut2`,
+  `head_select` and `head_exact`.
+- `Sources/MLXEngine/Transformer.swift`: the Sieve buffers and the screened branch of the sampled
+  step; `sieveInfo` / `sieveOffReason`.
+- `Sources/MLXEngine/Engine.swift`: `load(..., sieve:)`, the memory check with its fallback to the
+  dense head, `fitSieve`, and the Sieve fields of `LoadedModelInfo`.
+- `Sources/MLXRCLI/SieveCommand.swift`: `mlxr sieve` and the load summary. `Commands.swift`:
+  `--sieve` on `run` and `serve`.
+- `Sources/MLXRunner/AppState.swift`, `ChatView.swift`: the Sieve setting, the fit and the
+  inspector's Sieve section.
+- `Tests/MLXEngineTests/SieveTests.swift`: the tests above.

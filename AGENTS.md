@@ -19,6 +19,12 @@ How to work on MLX Runner (a native macOS app by 21no.de).
   with a budget covering the whole context (`sparseDecodeWithFullBudgetIsBitIdentical`). Check a change
   to it with the long-context bench (`MLXR_BENCH_CTX` with `MLXR_BENCH_TEXT`: KL, text NLL, agreement);
   `MLXR_SPARSE_ATTN=0` turns it off. See docs/sparse-decode-attention.md.
+- **Sieve is opt-in and changes output when on.** Off (the default) it allocates and dispatches
+  nothing, so every gate above holds unchanged; on, `forward` and scoring still use the dense head
+  (`fittedModelKeepsDensePathsAndIsDeterministic`). Check a change to it with `SieveTests`, with
+  `MLXR_BENCH_DECODE=1 mlxr bench <model>` against the same with `MLXR_SIEVE=balanced` on a fitted
+  model (`mlxr sieve <model>`), and with the generation comparison
+  (`MLXR_SIEVE_OBSERVE=<repo> swift test --filter SieveObserved`). See docs/sieve-head.md.
 - **Untrusted input:** anything read from a model directory, the network or the local server is
   validated before use. MLXEngine builds with `-Ounchecked`, so overflow and bounds traps are not a
   safety net: check sizes explicitly.
@@ -28,7 +34,11 @@ How to work on MLX Runner (a native macOS app by 21no.de).
 - `Sources/MLXEngine/` — engine (kernels, model, tokenizer, templates, sampler), Hub client, local
   server, updater. `Version.swift` holds the release version; `UpdateKey.swift` is generated.
 - `Sources/MLXRunner/` — SwiftUI app. `MLXRUNNER_SNAPSHOT=<dir>` renders screens headlessly.
-- `Sources/mlxr/` — CLI.
+- `Sources/MLXRCLI/` — the `mlxr` command line (command table, parser, chat, pull, upgrade);
+  `Sources/mlxr/main.swift` is its entry point.
+- `Tests/` — `MLXEngineTests` (kernels, models, server, updater) and `MLXRCLITests` (the command line,
+  and every `mlxr` command line in README.md, docs/ and site/index.html parsed against the command table).
+- `docs/` — design notes with their measurements: `sparse-decode-attention.md`, `sieve-head.md`.
 - `site/` — landing page (mlx-runner.21no.de, Cloudflare Workers static assets via `wrangler.jsonc`).
 - `scripts/` — `bundle.sh` (app/DMG/CLI/SHA256SUMS), `sign.swift`, `release-key.swift`, `make-icon.swift`,
   `bench-compare.swift` (generation speed against Ollama and mlx-lm on one model).

@@ -38,7 +38,7 @@ extension CLI {
                     Opt(long: "remove", help: "delete the sidecar"),
                     Opt(long: "text", value: .text, repeatable: true, help: "calibration text file (default: the model writes its own)"),
                     Opt(long: "tokens", value: .int(2000...60_000), defaultText: "12000", help: "calibration states to collect"),
-                    Opt(long: "rows", value: .int(512...16384), help: "rows that get the head's own logit per token: 512, 1024, ... 16384 (default: 16384, or 8192 for a vocabulary under 65,536)"),
+                    Opt(long: "rows", value: .int(512...16384), help: "rows that get the head's own logit per token: 512, 1024, ... 16384 (default: the largest that is at most a quarter of the vocabulary)"),
                     Opt(long: "rank", value: .int(64...8192), help: "rank of the head sketch (default: the lowest of 1/8, 1/4 and 1/2 of the hidden size that meets the target)"),
                 ],
                 examples: ["  mlxr sieve mlx-community/Qwen3-0.6B-4bit", "  mlxr run mlx-community/Qwen3-0.6B-4bit --sieve balanced -p \"Hello\""],

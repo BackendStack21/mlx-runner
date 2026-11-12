@@ -49,7 +49,7 @@ mlxr serve <model> --sparse 4096 ...
 The sink is 4 keys and the long-range budget defaults to 2,048 keys (512 blocks of 4). With the
 default budget a step attends to 2,564 keys whatever the context length.
 
-**In code:** `InferenceEngine.load(directory:draftDirectory:contextLength:sparse:)` takes a
+**In code:** `InferenceEngine.load(directory:draftDirectory:contextLength:sparse:sieve:)` takes a
 `SparseAttention?`; nil means dense. If the index would not fit in memory at the requested context
 length, the model loads with dense decode and `LoadedModelInfo.sparseNote` says why. A
 `Transformer` set up with sparse attention can switch per step through `Transformer.sparse`. One
@@ -440,7 +440,7 @@ Roughly by expected value.
 - `Sources/MLXEngine/Kernels.swift`: `SparseParams`, `sparse_index`, `sparse_score`, `sparse_select`,
   `attention_sparse` and its instantiations.
 - `Sources/MLXEngine/Transformer.swift`:
-  - `init(directory:contextLength:sparse:)`, `sparseLayerCount`;
+  - `init(directory:contextLength:sparse:sieve:)`, `sparseLayerCount`;
   - the index, score and list buffers;
   - index maintenance after `qkv_post`;
   - the sparse branch of decode attention;
@@ -450,7 +450,8 @@ Roughly by expected value.
   and the sparse fields of `LoadedModelInfo`.
 - `Sources/MLXRunner/AppState.swift`, `ChatView.swift`: the app settings and the inspector's Long
   context section.
-- `Sources/mlxr/main.swift`: `--sparse`, `LongBench` and `benchLongContext` (the long-context bench section).
+- `Sources/MLXRCLI/Commands.swift`: `--sparse` on `run` and `serve`. `Sources/MLXRCLI/Legacy.swift`:
+  `LongBench` and `benchLongContext` (the long-context bench section).
 - `Tests/MLXEngineTests/SparseAttentionTests.swift`: kernel tests against CPU references.
 - `Tests/MLXEngineTests/ModelTests.swift`: end-to-end tests on installed models.
 - `Tests/MLXEngineTests/SparseTimingTests.swift`: opt-in kernel timing.

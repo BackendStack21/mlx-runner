@@ -8,13 +8,15 @@ A native macOS app for discovering, downloading and chatting with **MLX models f
 
 ![MLX Runner](site/assets/screenshot-chat.jpg)
 
-- **Zero third-party dependencies.** The project uses the Swift standard library and Apple's system frameworks only: SwiftUI, Foundation, Metal, Network and CryptoKit. It has no SwiftPM packages, no vendored code and no Python.
+- **Zero third-party dependencies.** The project uses the Swift standard library and Apple's system frameworks only: SwiftUI, AppKit, Foundation, Metal, Network, CryptoKit and Security. It has no SwiftPM packages, no vendored code and no Python.
 - **Native MLX format.** It reads MLX-community repos directly: `safetensors` plus MLX affine quantization at 2, 3, 4, 5, 6 or 8 bits, with group sizes of 32, 64 or 128.
 - **Fast.** Hand-written Metal kernels cover every layer:
   - fused decode matvecs
   - simdgroup-matrix GEMMs for prefill
   - flash attention
   - KV-cache prefix reuse across chat turns
+  - sparse decode attention at long contexts (on by default from 5,128 tokens)
+  - Sieve, an opt-in screen of the output layer: up to 15% faster decode on a fitted model
 - **Signed updates.** "Check for Updates…" installs a new release only after its Ed25519 signature, its SHA-256 and the app's code signature all verify, then swaps it in atomically and restarts.
 
 > **On "native MLX support" with "no external dependencies":** Apple's `mlx-swift` is a third-party package, so it is not used. MLX Runner runs MLX *models* with an engine written from scratch on Metal instead. It loads the same files `mlx-lm` uses, so any compatible `mlx-community` repo works without conversion.
@@ -43,7 +45,7 @@ A browser download is quarantined by macOS and the binary won't start until you 
 
 ```bash
 shasum -a 256 -c SHA256SUMS --ignore-missing                       # checksums
-gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx-runner   # build provenance
+gh attestation verify MLX-Runner-<version>-macos-arm64.dmg --repo BackendStack21/mlx-runner   # build provenance
 ```
 
 `SHA256SUMS.sig` is a raw Ed25519 signature of `SHA256SUMS` by the key in [`packaging/update-key.pub`](packaging/update-key.pub); the in-app updater refuses anything it doesn't verify.
@@ -73,12 +75,13 @@ gh attestation verify MLX-Runner-1.0.0-macos-arm64.dmg --repo BackendStack21/mlx
 - Sending with no model loaded loads the last one used. Optionally (Settings), the last model loads and the local server starts when the app opens.
 - Edit and resend, regenerate, copy, a per-chat system prompt, and searchable, persistent chat history grouped by day, with undo for a deleted chat.
 - Keyboard shortcuts for the common actions (⌘L load a model, ⌘R regenerate, ⇧⌘] / ⇧⌘[ switch chats), VoiceOver labels and actions throughout, and Reduce Motion support.
-- An inspector panel for temperature, top-p, top-k, min-p, repeat penalty, max tokens, context length, draft model and long-context sparse attention.
+- An inspector panel for temperature, top-p, top-k, min-p, repeat penalty, max tokens, context length, draft model, long-context sparse attention and Sieve.
+- Sieve (off by default): a switch in the inspector and a **Fit** button that fits the loaded model once. On a fitted model decode is up to 15% faster and output changes slightly; see [Performance](#performance).
 
 **Local Server**
 - OpenAI-compatible: the Responses API (`POST /v1/responses`, with typed streaming events), Chat Completions (`developer` role, content parts, `max_completion_tokens`, `stream_options.include_usage`), legacy Completions, and `/v1/models`.
 - Qwen3 and Qwen 3.5 thinking is returned as `reasoning_content` (Chat Completions) or a `reasoning` item (Responses). A request that doesn't set `enable_thinking`, `chat_template_kwargs.enable_thinking` or a reasoning effort gets the model template's default.
-- Tool calling (function tools) in both APIs, streaming and non-streaming, for Qwen2.5, Qwen3, Llama 3.1+ and Mistral v0.3 models. Prompts are rendered in each model's native tool format, checked byte for byte against the official chat templates and `mistral-common`. `tool_choice` supports `auto`, `none`, `required` (the function name is constrained to the tools you defined) and a named function. `parallel_tool_calls` and the full call → `tool` result → answer loop are supported. Models without a tool format (Phi-3.5) answer tool requests with a 400.
+- Tool calling (function tools) in both APIs, streaming and non-streaming, for Qwen2.5, Qwen3, Qwen 3.5, Llama 3.1+ and Mistral v0.3 models. Prompts are rendered in each model's native tool format, checked byte for byte against the official chat templates and `mistral-common`. `tool_choice` supports `auto`, `none`, `required` (the function name is constrained to the tools you defined) and a named function. `parallel_tool_calls` and the full call → `tool` result → answer loop are supported. Models without a tool format (Phi-3.5, Gemma) answer tool requests with a 400.
 - Features it can't honour (JSON mode, images, logprobs, built-in tools such as web search) are rejected with an OpenAI-style 400 instead of being silently ignored.
 - Safe by default: binds to localhost, rejects other `Host` headers (DNS rebinding) and unknown browser `Origin`s, accepts JSON bodies only, and enforces timeouts plus connection, queue and size limits. An API key is optional on localhost and required in LAN mode.
 - Includes a request log.
@@ -120,13 +123,13 @@ Each checkpoint above passes end-to-end generation and the prefill-versus-decode
 - **Prefill speed:** about 247 tok/s on a 7B model on an M2 Pro, against about 305 for mlx-lm on the same files. The 64×64 GEMM tile measures about 3.5 TFLOPS. Prompts shorter than about 128 tokens use the 32×32 tile and are further behind mlx-lm. Long prompts fall further behind, because prefill attention grows with the prompt: at 30K tokens mlx-lm prefills 1.4–2× faster (Mistral 7B: 107 against 202 tok/s, so 280 s against 149 s for the prompt). See [docs/sparse-decode-attention.md](docs/sparse-decode-attention.md#against-mlx-lm).
 - **Long-context decode against mlx-lm:** with sparse attention (the default) decode is level with mlx-lm at 8K on 7–14B models and 1.4–2.4× faster at 30K. Dense decode (`--sparse off`) is 3–11% behind mlx-lm on 7–14B models.
 - **Speculative decoding is opt-in and, for now, slower.** Prompt lookup (`mlxr run --spec`) and a draft model (`mlxr run --draft <model|auto>`, or the app's "Draft model" setting) both verify exactly, so greedy output is identical to a plain run. But verifying 3–8 drafted tokens costs about three decode steps on this GPU (the batched kernel is ALU-bound, see CHANGELOG 1.3.0), verifying 2 costs about 1.5, and Qwen3 0.6B's drafts for Qwen3 8B are accepted about 45% of the time on chat text: Qwen3 8B generates at 28 tok/s with the draft instead of 38. Both stay off by default until the verify kernel pays for them.
-- **Sieve is opt-in and changes output.** After `mlxr sieve <model>` has fitted a model once (one to six minutes), `--sieve balanced` (or the inspector's Sieve switch) screens the output layer with a low-rank sketch and computes exact scores for the likeliest rows only (SVD-softmax with a basis fitted to the model). Measured on ten models on an M2 Pro, greedy and sampled decode alike: 8–15% faster on models up to 4B with a large vocabulary (Gemma 3 1B 188 → 217 tok/s, Qwen3.5 0.8B 255 → 286, Qwen3 0.6B 288 → 312), 4% on Qwen3 8B, under 1% on Phi 3.5 mini and Mistral 7B. On test states the fit chose nothing on, the likeliest token is kept in 99.5–100% of them; in generations with the default sampler, 0–0.3% of tokens differ from the dense answer before the first difference. Benchmark scores, other sampler settings and long contexts were not measured. Off by default; without it nothing changes. See [docs/sieve-head.md](docs/sieve-head.md).
+- **Sieve is opt-in and changes output.** After `mlxr sieve <model>` has fitted a model once (one to six minutes), `--sieve balanced` (or the inspector's Sieve switch) screens the output layer with a low-rank sketch and computes exact scores for the likeliest rows only (SVD-softmax with a basis fitted to the model). Decode is 8–15% faster on models up to 4B with a large vocabulary, 4% on Qwen3 8B and under 1% on Phi 3.5 mini and Mistral 7B; the likeliest token is kept in 99.5–100% of test states (see [Sieve](#sieve) under Performance). Benchmark scores, perplexity, other sampler settings and long contexts were not measured. Models over 8B could not be fitted on 16 GB, and Sieve is not used with a draft model or prompt lookup. Off by default; without it nothing changes. See [docs/sieve-head.md](docs/sieve-head.md).
 - **Sparse decode attention changes output at long contexts.** It is on by default from 5,128 tokens of context, where each new token attends to the first and latest tokens and the 2,048 earlier ones that score highest. That makes decode 1.4–3× faster at 30K, but greedy output is no longer identical to dense decode: perplexity on real text rises by at most about 3% on every model measured except Gemma 4 E2B (+8% at 30K) and Gemma 1.1 (+3.6% at 7K). Turn it off in the inspector's Long context section, with `--sparse off`, or with `MLXR_SPARSE_ATTN=0`. See [docs/sparse-decode-attention.md](docs/sparse-decode-attention.md).
 - **Glass effects:** set `MLXRUNNER_NO_GLASS=1` to use plain materials instead of Liquid Glass.
 
 ## Performance
 
-Measured with `mlxr bench` on an **M2 Pro (16 GB)**. Decode is measured with greedy sampling, as generation runs it: the token is selected on the GPU and the next step is queued before the current one is read back, so these are also the rates the app and `mlxr run` reach.
+Measured with `mlxr bench` on an **M2 Pro (16 GB)**. Decode is measured with greedy sampling, as generation runs it: the token is selected on the GPU and the next step is queued before the current one is read back, so these are also the rates the app and `mlxr run` reach. Sieve is off in every table except the one under [Sieve](#sieve). The tables were measured for different releases, so a model's figure can differ between them by run-to-run variation (Qwen3.5 0.8B the most: 271 tok/s here, 255 in the Sieve session); compare within a table.
 
 | Model (4-bit) | Weights | Prefill (512 tok) | Decode @16 | Decode @1K ctx |
 |---|---|---|---|---|
@@ -171,6 +174,28 @@ MLX Runner decodes faster on the smallest Qwen models (Qwen3.5 0.8B by 6–7%) a
 
 Ollama's own `qwen3.5:4b` build uses nvfp4 weights (3.97 GB) and decodes at 45.9 tok/s on the same machine (`--ollama-model qwen3.5:4b`). Each tool reports its own figures.
 
+### Sieve
+
+Sieve is opt-in (2.2.0): a 4-bit low-rank sketch scores every vocabulary row, and the output layer's own score is computed only for the likeliest rows. Each model is fitted once with `mlxr sieve <model>` (one to six minutes, 9–58 MB next to the model). It changes output, so the table gives both sides: decode speed with `MLXR_BENCH_DECODE=1 mlxr bench` at 16 tokens of context (median of three alternating dense and Sieve runs, same M2 Pro, 2026-11-12), and what the fit and a generation comparison measured. A tenth model, a second quantization of Qwen3 0.6B, is in the doc.
+
+| Model (4-bit) | Vocabulary | Dense | Sieve | Gain | Gain, default sampler | Likeliest token kept | Tokens changed, default sampler |
+|---|---|---|---|---|---|---|---|
+| Gemma 3 1B (QAT) | 262K | 188.1 tok/s | 216.5 tok/s | +15.1% | +14.9% | 99.51% | 0.22% |
+| Qwen3.5 0.8B | 248K | 254.8 | 286.3 | +12.4% | +12.4% | 99.61% | 0.29% |
+| Gemma 4 E2B OptiQ | 262K | 73.3 | 82.2 | +12.1% | +12.2% | 99.90% | 0.07% |
+| Llama 3.2 1B | 128K | 202.4 | 219.6 | +8.5% | +8.3% | 99.95% | 0.19% |
+| Qwen3 0.6B | 152K | 287.9 | 311.6 | +8.2% | +7.9% | 100.00% | 0.20% |
+| Qwen3.5 4B | 248K | 61.8 | 66.8 | +8.1% | +8.1% | 99.85% | 0.07% |
+| Qwen3 8B | 152K | 38.3 | 39.8 | +3.9% | +3.9% | 100.00% | 0.00% |
+| Phi-3.5 mini | 32K | 70.2 | 70.8 | +0.9% | +0.7% | 99.71% | 0.15% |
+| Mistral 7B v0.3 | 33K | 41.1 | 41.4 | +0.7% | +0.2% | 100.00% | 0.00% |
+
+- **Dense, Sieve, Gain:** greedy decode (temperature 0, no repetition penalty). **Gain, default sampler:** the same comparison with the app's sampler (temperature 0.7, top-k 40, top-p 0.95, repetition penalty 1.05). At 1,024 tokens of context the gains are within 2 points of these, lower on most models (Gemma 3 1B +13.7%, Qwen3 0.6B +6.5%).
+- **Likeliest token kept:** computed by the fit on up to 2,048 test states it chose nothing on.
+- **Tokens changed:** ten prompts answered dense and with Sieve under three seeds, up to 96 tokens each; answers that changed, divided by the tokens compared up to each first change. Dense against itself was identical every time.
+
+The gain follows the output layer's share of a step: large on a small model with a large vocabulary, and not worth turning on for Phi-3.5 mini or Mistral 7B. No benchmark score, perplexity or long-context run was measured with Sieve on, and other sampler settings (higher temperatures, top-p or min-p without top-k) were not measured either. [docs/sieve-head.md](docs/sieve-head.md) has the full tables, the method and the limits.
+
 **The 7B ceiling.** Decoding one token reads every weight once, so speed is capped by memory bandwidth. This M2 Pro measures 197 GB/s with a plain read kernel, which caps a 4.08 GB model at about 48 tok/s. MLX Runner reaches 41.0 tok/s, about 85% of that cap. Reaching 50+ tok/s on a 4-bit 7B model therefore needs one of: a Mac with more bandwidth (M-series Max chips have about 400 GB/s), a 3-bit model (which would raise the ceiling to about 60 tok/s, but only 4-bit has an optimized decode kernel so far), or speculative decoding (see Limitations).
 
 Loading copies the weights once, in file order, into a page-aligned Metal buffer (MLX writes `safetensors` without the 16-byte alignment the kernels' vector loads need), then releases the file mapping, so the GPU holds exactly one copy: about 0.5 s for the small models, 3 s for Mistral 7B and 11 s for the 9 GB Gemma 4 12B from the page cache (25 s from disk). Those figures include a warm-up pass.
@@ -207,6 +232,8 @@ mlxr run mlx-community/Qwen3-4B-4bit "Explain RoPE" --max 300 [--temp 0.7] [--th
 mlxr rm mlx-community/Qwen3-4B-4bit         # remove a model; `cp` copies, `ps` and `stop` list and unload
 mlxr serve mlx-community/Qwen3-4B-4bit --port 1234     # OpenAI-compatible server (--lan prints an API key)
 mlxr run mlx-community/Qwen3-8B-4bit --draft mlx-community/Qwen3-0.6B-4bit   # speculative decoding (or --draft auto)
+mlxr sieve mlx-community/Qwen3-0.6B-4bit   # fit Sieve once for this model (--info shows the fit, --remove deletes it)
+mlxr run mlx-community/Qwen3-0.6B-4bit "Explain RoPE" --sieve balanced   # faster decode on a fitted model; changes output (also on serve)
 mlxr completion zsh                         # shell completions (zsh, bash)
 mlxr upgrade                                # update mlxr in place, verified against the signed SHA256SUMS (alias: update; --check only looks; `sudo mlxr upgrade` when installed in /usr/local/bin)
 ```
@@ -219,6 +246,8 @@ Developer commands:
 ```bash
 mlxr bench mlx-community/Qwen3-4B-4bit      # prefill/decode throughput, verification cost at short and 1,900-token contexts, kernel profile (MLXR_BENCH_NOPROFILE=1 skips it)
 mlxr tokenize <model> "some text"
+MLXR_BENCH_DECODE=1 mlxr bench <model>      # decode only: greedy ("decode") and the default sampler ("sampled")
+MLXR_SIEVE=balanced MLXR_BENCH_DECODE=1 mlxr bench <model>   # the same with Sieve, on a fitted model
 MLXR_BENCH_CTX=8192,30000 MLXR_BENCH_TEXT=book.txt mlxr bench <model>   # adds dense vs sparse decode after long prompts, with agreement on the text
 mlxr run <model> "Explain RoPE" --temp 0 --repeat-penalty 1 --seed 42 --max 256 --sparse off   # sparse decode attention is on from 5,128 tokens of context; off, on or a key budget (N)
 ```
@@ -236,6 +265,7 @@ How the engine works:
   - The residual add is fused with the next RMSNorm.
   - Attention uses online softmax across 16 to 32 simdgroups; long contexts split it across threadgroups.
   - From 5,128 tokens of context, full-attention layers attend sparsely: each KV head scores 4-key blocks by their mean key and attends to the sink, the 2,048 best long-range keys and a 512-key window ([docs/sparse-decode-attention.md](docs/sparse-decode-attention.md)).
+  - With Sieve on and the model fitted, the output layer is screened: a 4-bit low-rank sketch scores every vocabulary row, and the layer's own logit is computed for the likeliest rows only, up to 16,384 ([docs/sieve-head.md](docs/sieve-head.md)).
   - The token is selected on the GPU at the end of the same command buffer (repetition penalty, exact top-k, min-p, top-p, one seeded draw) and written to a token-history buffer that the next step's embedding lookup reads. The next step is therefore committed before the current one is read back, and the GPU never waits for sampling or detokenization.
 - **Prefill:**
   - Quantized GEMMs on `simdgroup_matrix` tiles; each weight tile is dequantized once and shared by 32 tokens.
@@ -254,11 +284,22 @@ How the engine works:
   - Prefill and token-by-token decode produce the same next-token distribution, for every architecture.
   - Qwen 3.5's Gated DeltaNet kernels: token-by-token decode and batches split at any offset give bit-identical outputs and state, matching a float64 reference, for key/value head ratios 1, 2 and 4. The recurrent state only moves forward (a rewind is refused, a restart at 0 starts clean).
   - Sparse decode attention with a budget covering the whole context is bit-identical to dense decode on every architecture, and each sparse kernel is checked against a CPU reference.
+  - Sieve: the screen kernels against a CPU reference; a sidecar that is malformed or belongs to other weights is refused; with Sieve on, `forward` stays bit-identical and the screened path gives the same tokens twice.
   - KV-cache reuse works on follow-up turns.
   - Long conversations are trimmed to fit.
   - Cancelling one request leaves others untouched.
 
-Tests that need a model are skipped when it isn't installed. Download a model with `mlxr download <repo>`.
+The command line has its own suite (`MLXRCLITests`): parsing, help, errors, chat, pull and upgrade against fixtures, and a check that every `mlxr` command line in this README, [docs/](docs) and the landing page parses against the real command table.
+
+Tests that need a model are skipped when it isn't installed. Download a model with `mlxr pull <repo>`. One Sieve test also needs the model fitted (`mlxr sieve <repo>`), and the Qwen3 14B cases run only with `MLXR_TEST_LARGE=1`.
+
+## Documentation
+
+- [docs/sparse-decode-attention.md](docs/sparse-decode-attention.md): sparse decode attention at long contexts. How it works, speed and quality on every architecture, and how to measure it.
+- [docs/sieve-head.md](docs/sieve-head.md): Sieve. Fitting a model, how a step runs, speed and quality on ten models, and what was not measured.
+- [CHANGELOG.md](CHANGELOG.md): what changed in each release, with the measurements behind performance changes.
+- [SECURITY.md](SECURITY.md): reporting a vulnerability, privacy, and how model files, downloads, the server and updates are checked.
+- [AGENTS.md](AGENTS.md): rules for working on the code.
 
 ## Releasing
 

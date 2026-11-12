@@ -24,6 +24,14 @@ token ids must fit the embedding table and every weight's shape must match the c
 text is tokenized as plain text, so a message cannot inject control tokens. Model-card links open only
 for https (confirmed for hosts other than huggingface.co) and mailto.
 
+A Sieve sidecar (`sieve/head.safetensors` in a model's directory) is loaded only when Sieve is turned on,
+and is validated the same way: an unknown format, a wrong rank, a row budget above the vocabulary, a
+non-finite margin or a truncated file is refused, and so is a sidecar whose fingerprint does not match
+the model's output layer. The fingerprint guards against
+a wrong or stale file, not a forged one, and the quality figures a sidecar reports are that file's
+claim: a sidecar that came with a downloaded model can change output more than it says. Text from its
+metadata is cut to printable characters before it is shown.
+
 ## Downloads and tokens
 
 Downloads come from huggingface.co over https; LFS files are checked against the SHA-256 the Hub
