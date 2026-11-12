@@ -191,7 +191,7 @@ Sieve is opt-in (2.2.0): a 4-bit low-rank sketch scores every vocabulary row, an
 | Mistral 7B v0.3 | 33K | 41.1 | 41.4 | +0.7% | +0.2% | 100.00% | 0.00% |
 
 - **Dense, Sieve, Gain:** greedy decode (temperature 0, no repetition penalty). **Gain, default sampler:** the same comparison with the app's sampler (temperature 0.7, top-k 40, top-p 0.95, repetition penalty 1.05). At 1,024 tokens of context the gains are within 2 points of these, lower on most models (Gemma 3 1B +13.7%, Qwen3 0.6B +6.5%).
-- **Likeliest token kept:** computed by the fit on up to 2,048 test states it chose nothing on.
+- **Likeliest token kept:** measured by the fit on up to 2,048 held-out test states. The fit raises its rank until this reaches 99.5%, so those states take part in that one choice and in nothing else.
 - **Tokens changed:** ten prompts answered dense and with Sieve under three seeds, up to 96 tokens each; answers that changed, divided by the tokens compared up to each first change. Dense against itself was identical every time.
 
 The gain follows the output layer's share of a step: large on a small model with a large vocabulary, and not worth turning on for Phi-3.5 mini or Mistral 7B. No benchmark score, perplexity or long-context run was measured with Sieve on, and other sampler settings (higher temperatures, top-p or min-p without top-k) were not measured either. [docs/sieve-head.md](docs/sieve-head.md) has the full tables, the method and the limits.

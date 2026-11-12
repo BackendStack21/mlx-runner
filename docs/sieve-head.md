@@ -17,8 +17,8 @@ Status:
   alike. The gain follows the head's share of the model: 8 to 15% on models up to 4B with a large
   vocabulary, 4% on Qwen3 8B, and under 1% on Phi 3.5 mini and Mistral 7B, whose vocabulary is
   small.
-- **Quality:** on test states that the fit chose nothing on, the likeliest token is kept in 99.51
-  to 100% of them. In real generations with the default sampler, 0 to 0.3% of tokens differ from
+- **Quality:** on held-out test states, which take part only in the choice of rank, the likeliest
+  token is kept in 99.51 to 100% of them. In real generations with the default sampler, 0 to 0.3% of tokens differ from
   the dense answer before the first difference. See "Measured" for how these were obtained and
   what was not measured.
 - **Only fitted models.** A model that has not been fitted runs at its normal speed.
